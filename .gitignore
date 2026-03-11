@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# Virtual environments
+backend/venv/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Runtime data
+backend/uploads/
+backend/outputs/
+backend/logs/
+backend/models/
+
+# Build outputs
+build_artifacts/
+release/
+release-macos/
+release-linux/
+release_layout_pdf/
+release_ocr_pdf/
+release_updated/
+
+# Environment files
+.env
+backend/.env
+
+# Test caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log

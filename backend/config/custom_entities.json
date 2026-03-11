@@ -1,0 +1,63 @@
+{
+  "patterns": [
+    {
+      "name": "PROJECT_CODE",
+      "description": "项目代号",
+      "regex": "PROJ-\\d{4}-\\d{3}",
+      "score": 0.9,
+      "context": [
+        "项目",
+        "代号",
+        "编号"
+      ]
+    },
+    {
+      "name": "CONTRACT_NO",
+      "description": "合同编号",
+      "regex": "HT-\\d{4}-\\d{3}",
+      "score": 0.9,
+      "context": [
+        "合同",
+        "编号"
+      ]
+    }
+  ],
+  "keywords": {
+    "COMPANY_NAME": {
+      "description": "特定公司名称（需要脱敏的公司）",
+      "keywords": [
+        "XX科技有限公司",
+        "XX贸易有限公司",
+        "XX投资有限公司"
+      ],
+      "score": 0.95
+    },
+    "PERSON_NAME": {
+      "description": "特定人名（需要脱敏的人名）",
+      "keywords": [
+        "张三",
+        "李四",
+        "王五"
+      ],
+      "score": 0.95
+    },
+    "SENSITIVE_TERM": {
+      "description": "敏感术语",
+      "keywords": [
+        "机密",
+        "内部资料",
+        "商业秘密",
+        "保密协议"
+      ],
+      "score": 0.9
+    },
+    "PRODUCT_NAME": {
+      "description": "产品名称",
+      "keywords": [
+        "产品A",
+        "产品B"
+      ],
+      "score": 0.85
+    }
+  }
+}
