@@ -59,6 +59,7 @@ CASE_NUMBER_VALUE_PATTERNS: tuple[str, ...] = (
 
 CASE_NUMBER_VALUE_PATTERN = "|".join(f"(?:{pattern})" for pattern in CASE_NUMBER_VALUE_PATTERNS)
 _CASE_NUMBER_REGEXES = [re.compile(rf"^(?:{pattern})$") for pattern in CASE_NUMBER_VALUE_PATTERNS]
+_CASE_NUMBER_SEARCH_REGEXES = [re.compile(pattern) for pattern in CASE_NUMBER_VALUE_PATTERNS]
 
 
 def compact_text(value: str | None) -> str:
@@ -90,6 +91,52 @@ def looks_like_case_number(value: str | None) -> bool:
     if not normalized:
         return False
     return any(regex.fullmatch(normalized) for regex in _CASE_NUMBER_REGEXES)
+
+
+def extract_case_number(value: str | None) -> str:
+    candidate = str(value or "")
+    if not candidate.strip():
+        return ""
+
+    compact_candidate = compact_text(candidate)
+    for regex in _CASE_NUMBER_SEARCH_REGEXES:
+        compact_match = regex.search(compact_candidate)
+        if compact_match is None:
+            continue
+        matched_compact = compact_match.group(0)
+        normalized = compact_text(matched_compact)
+        if not normalized:
+            continue
+
+        start = 0
+        compact_progress = 0
+        for index, char in enumerate(candidate):
+            if char.isspace():
+                continue
+            if compact_progress >= len(compact_candidate):
+                break
+            if compact_progress == compact_match.start():
+                start = index
+                break
+            compact_progress += 1
+
+        end = len(candidate)
+        compact_progress = 0
+        start_recorded = False
+        for index, char in enumerate(candidate):
+            if char.isspace():
+                continue
+            if compact_progress == compact_match.start() and not start_recorded:
+                start = index
+                start_recorded = True
+            compact_progress += 1
+            if compact_progress == compact_match.end():
+                end = index + 1
+                break
+
+        return candidate[start:end].strip()
+
+    return ""
 
 
 def mask_case_number_digits_only(value: str | None) -> str:

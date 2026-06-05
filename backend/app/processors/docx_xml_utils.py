@@ -73,6 +73,16 @@ def list_docx_text_parts(names: Iterable[str]) -> List[str]:
     return matched
 
 
+def docx_contains_tracked_changes(file_path: str | Path) -> bool:
+    """Quick check for tracked-change nodes inside a DOCX package."""
+    with zipfile.ZipFile(file_path) as archive:
+        for part_name in list_docx_text_parts(archive.namelist()):
+            xml_bytes = archive.read(part_name)
+            if b"<w:ins" in xml_bytes or b"<w:del" in xml_bytes or b"<w:delText" in xml_bytes:
+                return True
+    return False
+
+
 def extract_docx_text(file_path: str | Path) -> Tuple[str, Dict[str, int | bool]]:
     """Extract visible text from a DOCX package, including tracked insertions/deletions."""
     text_parts: List[str] = []
@@ -107,6 +117,29 @@ def extract_docx_text(file_path: str | Path) -> Tuple[str, Dict[str, int | bool]
 def extract_paragraph_text(paragraph: ET.Element) -> str:
     """Collect text content from a paragraph while skipping nested paragraphs."""
     return "".join(_iter_paragraph_text_fragments(paragraph))
+
+
+def count_paragraph_page_breaks(paragraph: ET.Element) -> int:
+    """Count explicit page-break markers inside a paragraph."""
+    count = 0
+    for node in paragraph.iter():
+        if node.tag == f"{{{WORD_NAMESPACE}}}br" and node.attrib.get(f"{{{WORD_NAMESPACE}}}type") == "page":
+            count += 1
+        elif node.tag == f"{{{WORD_NAMESPACE}}}lastRenderedPageBreak":
+            count += 1
+    return count
+
+
+def count_paragraph_section_page_breaks(paragraph: ET.Element) -> int:
+    """Count non-continuous section breaks attached to a paragraph."""
+    count = 0
+    for section in paragraph.iter(f"{{{WORD_NAMESPACE}}}sectPr"):
+        type_node = section.find("w:type", NAMESPACES)
+        section_type = str(type_node.attrib.get(f"{{{WORD_NAMESPACE}}}val") if type_node is not None else "").strip().lower()
+        if section_type == "continuous":
+            continue
+        count += 1
+    return count
 
 
 def _iter_paragraph_text_fragments(node: ET.Element) -> Iterator[str]:
@@ -194,21 +227,25 @@ def replace_text_in_paragraph_xml(
     paragraph: ET.Element,
     replacements: Sequence[Tuple[str, str]],
 ) -> bool:
-    """Apply replacements across text-bearing XML nodes inside a paragraph."""
+    """Apply replacements conservatively inside existing text nodes only."""
     text_nodes = [node for node in _iter_paragraph_text_nodes(paragraph) if node.text]
     if not text_nodes:
         return False
 
-    fragment_texts = [node.text or "" for node in text_nodes]
-    updated_texts = apply_replacements_to_fragments(fragment_texts, replacements)
-    if updated_texts == fragment_texts:
-        return False
-
-    for node, updated_text in zip(text_nodes, updated_texts):
+    modified = False
+    for node in text_nodes:
+        original_text = node.text or ""
+        updated_text = original_text
+        for source_text, replacement in replacements:
+            if source_text and source_text in updated_text:
+                updated_text = updated_text.replace(source_text, replacement)
+        if updated_text == original_text:
+            continue
         node.text = updated_text
         _sync_space_preserve(node, updated_text)
+        modified = True
 
-    return True
+    return modified
 
 
 def _iter_paragraph_text_nodes(node: ET.Element) -> Iterator[ET.Element]:
@@ -258,11 +295,20 @@ def apply_replacements_to_fragments(
 
         start_text = updated_fragments[start_fragment]
         end_text = updated_fragments[end_fragment]
-        updated_fragments[start_fragment] = start_text[:start_char] + replacement
-        updated_fragments[end_fragment] = end_text[end_char + 1 :]
-
+        left_prefix = start_text[:start_char]
+        right_suffix = end_text[end_char + 1 :]
+        touched_lengths = [len(start_text) - start_char]
         for index in range(start_fragment + 1, end_fragment):
-            updated_fragments[index] = ""
+            touched_lengths.append(len(updated_fragments[index]))
+        touched_lengths.append(end_char + 1)
+        replacement_segments = _split_replacement_across_fragments(replacement, touched_lengths)
+        updated_fragments[start_fragment] = left_prefix + replacement_segments[0]
+
+        middle_indexes = range(start_fragment + 1, end_fragment)
+        for segment, fragment_index in zip(replacement_segments[1:-1], middle_indexes):
+            updated_fragments[fragment_index] = segment
+
+        updated_fragments[end_fragment] = replacement_segments[-1] + right_suffix
 
     return updated_fragments
 
@@ -312,6 +358,44 @@ def normalize_replacements(
         unique.append(key)
 
     return sorted(unique, key=lambda item: len(item[0]), reverse=True)
+
+
+def _split_replacement_across_fragments(replacement: str, fragment_lengths: Sequence[int]) -> List[str]:
+    if not fragment_lengths:
+        return []
+    if len(fragment_lengths) == 1:
+        return [replacement]
+
+    total_length = sum(max(0, length) for length in fragment_lengths)
+    if total_length <= 0:
+        return [replacement] + [""] * (len(fragment_lengths) - 1)
+
+    target_length = len(replacement)
+    base_allocations: List[int] = []
+    remainders: List[tuple[float, int]] = []
+    allocated = 0
+    for index, length in enumerate(fragment_lengths):
+        exact = target_length * max(0, length) / total_length
+        allocation = int(exact)
+        base_allocations.append(allocation)
+        remainders.append((exact - allocation, index))
+        allocated += allocation
+
+    remaining = target_length - allocated
+    for _, index in sorted(remainders, key=lambda item: (-item[0], item[1])):
+        if remaining <= 0:
+            break
+        base_allocations[index] += 1
+        remaining -= 1
+
+    segments: List[str] = []
+    cursor = 0
+    for allocation in base_allocations[:-1]:
+        next_cursor = min(target_length, cursor + allocation)
+        segments.append(replacement[cursor:next_cursor])
+        cursor = next_cursor
+    segments.append(replacement[cursor:])
+    return segments
 
 
 def _sync_space_preserve(node: ET.Element, text: str) -> None:

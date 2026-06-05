@@ -4,13 +4,10 @@
       <div class="hero-copy">
         <div class="eyebrow">First Launch Check</div>
         <h1>启动检查与初始化</h1>
-        <p>
-          这一页用于确认本机是否已经满足高质量 4B 脱敏要求。只有运行环境就绪后，系统才会开放正式处理入口，
-          这样可以尽量避免因为环境不完整导致的质量波动。
-        </p>
+        <p>{{ modeIntro }}</p>
         <div class="hero-actions">
           <el-button type="primary" :loading="loading" @click="refreshStatus">重新检测</el-button>
-          <el-button @click="goToDesensitize" :disabled="!runtimeStatus?.ready">进入文档脱敏</el-button>
+          <el-button @click="goToWorkspace" :disabled="!runtimeStatus?.ready">进入工作台</el-button>
         </div>
       </div>
       <div class="hero-status">
@@ -33,7 +30,7 @@
             <div class="panel-header">
               <div>
                 <div class="panel-title">运行状态</div>
-                <div class="panel-subtitle">用于确认 Ollama、本地固定模型和当前客户端入口是否就绪。</div>
+                <div class="panel-subtitle">{{ runtimePanelSubtitle }}</div>
               </div>
             </div>
           </template>
@@ -44,26 +41,37 @@
                 <el-descriptions-item label="平台">
                   {{ platformLabel }}
                 </el-descriptions-item>
-                <el-descriptions-item label="LLM 后端">
+                <el-descriptions-item label="运行后端">
                   {{ runtimeStatus.backend }}
                 </el-descriptions-item>
-                <el-descriptions-item label="固定模型">
+                <el-descriptions-item :label="isHighQualityLowmem ? '按需精审模型' : '默认模型'">
                   {{ runtimeStatus.required_model || '-' }}
+                </el-descriptions-item>
+                <el-descriptions-item label="当前可用模型">
+                  {{ runtimeStatus.preferred_processing_model || '-' }}
                 </el-descriptions-item>
                 <el-descriptions-item label="安装入口">
                   {{ runtimeStatus.installer_hint }}
                 </el-descriptions-item>
-                <el-descriptions-item label="Ollama 安装检测">
+                <el-descriptions-item v-if="!isHighQualityLowmem" label="Ollama 安装检测">
                   <el-tag :type="runtimeStatus.ollama_install_detected ? 'success' : 'danger'">
                     {{ runtimeStatus.ollama_install_detected ? '已检测到' : '未检测到' }}
                   </el-tag>
                 </el-descriptions-item>
-                <el-descriptions-item label="Ollama 服务">
+                <el-descriptions-item v-if="!isHighQualityLowmem" label="Ollama 服务">
                   <el-tag :type="runtimeStatus.service_available ? 'success' : 'warning'">
                     {{ runtimeStatus.service_available ? '可连接' : '未连接' }}
                   </el-tag>
                 </el-descriptions-item>
-                <el-descriptions-item label="4B 模型">
+                <el-descriptions-item
+                  v-if="isHighQualityLowmem"
+                  label="中文主识别模型"
+                >
+                  <el-tag :type="runtimeStatus.primary_models_ready ? 'success' : 'warning'">
+                    {{ runtimeStatus.primary_models_ready ? '已就绪' : '未就绪' }}
+                  </el-tag>
+                </el-descriptions-item>
+                <el-descriptions-item :label="isHighQualityLowmem ? '按需精审模型' : '默认 4B 模型'">
                   <el-tag :type="runtimeStatus.required_model_installed ? 'success' : 'warning'">
                     {{ runtimeStatus.required_model_installed ? '已安装' : '未安装' }}
                   </el-tag>
@@ -84,7 +92,7 @@
               />
 
               <el-alert
-                v-if="runtimeStatus?.ollama_path"
+                v-if="!isHighQualityLowmem && runtimeStatus?.ollama_path"
                 class="mb-16"
                 type="info"
                 :closable="false"
@@ -106,7 +114,7 @@
             <div class="panel-header">
               <div>
                 <div class="panel-title">操作步骤</div>
-                <div class="panel-subtitle">尽量按顺序完成，确保正式处理时保持你要求的质量基线。</div>
+              <div class="panel-subtitle">尽量按顺序完成，确保默认识别与脱敏主流程稳定可用。</div>
               </div>
             </div>
           </template>
@@ -146,6 +154,22 @@ const router = useRouter()
 const loading = ref(false)
 const runtimeStatus = ref<RuntimeStatusResponse | null>(null)
 
+const isHighQualityLowmem = computed(
+  () => runtimeStatus.value?.desensitize_mode === 'high_quality_lowmem'
+)
+
+const modeIntro = computed(() =>
+  isHighQualityLowmem.value
+    ? '这一页用于确认本机是否已经满足高质量低内存中文脱敏要求。默认路线是外挂规则、合同结构规则、中文实体模型主识别和小 Qwen 按需补漏，模型全部本地运行。'
+    : '这一页用于确认本机是否已经满足文本脱敏处理要求。只有运行环境就绪后，系统才会开放正式处理入口。'
+)
+
+const runtimePanelSubtitle = computed(() =>
+  isHighQualityLowmem.value
+    ? '用于确认中文主识别模型、按需精审模型和当前客户端入口是否就绪。'
+    : '用于确认 Ollama、可用处理模型和当前客户端入口是否就绪。'
+)
+
 const platformLabel = computed(() => {
   if (!runtimeStatus.value) {
     return '-'
@@ -162,6 +186,33 @@ const platformLabel = computed(() => {
 
 const steps = computed(() => {
   const modelName = runtimeStatus.value?.required_model || 'qwen3.5:4b'
+  const preferredModel = runtimeStatus.value?.preferred_processing_model || ''
+
+  if (isHighQualityLowmem.value) {
+    return [
+      {
+        index: '01',
+        title: '确认中文主识别模型',
+        description: runtimeStatus.value?.primary_models_ready
+          ? '中文实体模型与中文 NER 主识别模型已就绪，外挂规则、合同结构回填和主召回可以直接运行。'
+          : '请先下载中文实体模型与中文 NER 主识别模型；它们负责稳定召回，不依赖 Ollama 4B 全文抽取。'
+      },
+      {
+        index: '02',
+        title: `确认按需精审模型 ${modelName}`,
+        description: runtimeStatus.value?.review_model_installed
+          ? `当前已检测到按需精审模型，系统只在缺口片段加载 ${preferredModel || modelName}，处理结束后释放。`
+          : '精审模型未安装时主流程仍可运行，但会标记人工复核，不伪装成完整高质量结果。'
+      },
+      {
+        index: '03',
+        title: '重新检测并进入正式处理',
+        description: runtimeStatus.value?.ready
+          ? '当前环境已经满足高质量低内存脱敏要求，可以直接进入文档脱敏。'
+          : '完成模型下载后点击“重新检测”，状态通过后再进入文档脱敏。'
+      }
+    ]
+  }
 
   return [
     {
@@ -173,10 +224,12 @@ const steps = computed(() => {
     },
     {
       index: '02',
-      title: `安装固定模型 ${modelName}`,
-      description: runtimeStatus.value?.required_model_installed
-        ? '当前已经检测到固定 4B 模型。后续正式处理仍会锁定这一条路线，避免质量回退。'
-        : `请先下载固定模型 ${modelName}。当前系统不会开放正式处理入口，以避免环境不完整影响质量。`
+      title: `安装处理模型 ${modelName}`,
+      description: runtimeStatus.value?.ready && preferredModel
+        ? `当前已检测到可用处理模型 ${preferredModel}。如需默认 4B 稳态路线，可额外补装 ${modelName}。`
+        : runtimeStatus.value?.required_model_installed
+        ? '当前已经检测到默认 4B 模型。普通识别与脱敏会优先走这条稳态路线。'
+        : `请先下载默认模型 ${modelName}，或安装 qwen3.5:27b 系列模型。当前系统不会开放正式处理入口，以避免环境不完整影响质量。`
     },
     {
       index: '03',
@@ -191,6 +244,17 @@ const steps = computed(() => {
 const commandHint = computed(() => {
   const modelName = runtimeStatus.value?.required_model || 'qwen3.5:4b'
   const platform = runtimeStatus.value?.platform || ''
+
+  if (isHighQualityLowmem.value) {
+    return [
+      'python3 backend/bin/download_lowmem_models.py',
+      runtimeStatus.value?.download_hint || '模型目录：-',
+      '中文实体模型：uer/roberta-base-finetuned-cluener2020-chinese',
+      '中文 NER：p988744/eland-ner-zh',
+      '按需精审：Qwen/Qwen3-1.7B-MLX-4bit',
+      '兜底：unsloth/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf'
+    ].join('\n')
+  }
 
   if (platform === 'windows') {
     return `download_ollama_model.bat\nollama pull ${modelName}`
@@ -212,12 +276,12 @@ const refreshStatus = async () => {
   }
 }
 
-const goToDesensitize = () => {
+const goToWorkspace = () => {
   if (!runtimeStatus.value?.ready) {
     ElMessage.warning('请先完成运行环境初始化，再进入正式处理。')
     return
   }
-  router.push('/desensitize')
+  router.push('/workspace')
 }
 
 onMounted(async () => {

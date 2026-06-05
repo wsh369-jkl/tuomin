@@ -24,9 +24,16 @@ SERIAL_ROLE_PROFILE = AnonymizationStrategyProfile(
     description="人物和主体优先改成甲乙丙类序号称谓，适合快速区分不同参与方。",
 )
 
+SYMBOLIC_CODE_PROFILE = AnonymizationStrategyProfile(
+    key="symbolic_codes",
+    label="ABCD / 希腊 / 甲乙丙编码",
+    description="人名改成 a/b/c/d，机构改成 alpha/beta/gamma，地名改成甲乙丙，并对同一主体保持稳定编码。",
+)
+
 _STRATEGY_MAP = {
     OFFICIAL_STYLE_PROFILE.key: OFFICIAL_STYLE_PROFILE,
     SERIAL_ROLE_PROFILE.key: SERIAL_ROLE_PROFILE,
+    SYMBOLIC_CODE_PROFILE.key: SYMBOLIC_CODE_PROFILE,
 }
 
 DEFAULT_ANONYMIZATION_STRATEGY = OFFICIAL_STYLE_PROFILE.key

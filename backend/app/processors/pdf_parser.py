@@ -7,6 +7,7 @@ import logging
 import re
 import statistics
 from io import BytesIO
+from time import perf_counter
 from typing import Any, Dict, List, Optional
 
 import pdfplumber
@@ -14,7 +15,7 @@ import pypdfium2 as pdfium
 
 from app.core.config import settings
 from app.processors.base_parser import BaseParser
-from app.services.ollama_service import OllamaLLMService
+from app.services.macos_vision_ocr import MacOSVisionOCRService
 
 logger = logging.getLogger(__name__)
 
@@ -23,11 +24,11 @@ class PDFParser(BaseParser):
     async def parse(self, file_path: str, **kwargs: Any) -> Dict:
         logger.info("Start parsing PDF: %s", file_path)
         try:
-            return await asyncio.to_thread(
-                self._parse_sync,
+            return await self._parse_async(
                 file_path,
                 bool(kwargs.get("use_llm", False)),
                 kwargs.get("llm_model"),
+                kwargs.get("ocr_llm_model"),
             )
         except Exception as exc:
             logger.error("PDF parsing failed: %s", exc)
@@ -38,18 +39,50 @@ class PDFParser(BaseParser):
         file_path: str,
         use_llm: bool = False,
         llm_model: Optional[str] = None,
+        ocr_llm_model: Optional[str] = None,
     ) -> Dict:
-        ocr_service = self._build_ocr_service(use_llm=use_llm, llm_model=llm_model)
-        pdfium_document = self._open_pdfium_document(file_path, ocr_service)
+        return asyncio.run(
+            self._parse_async(
+                file_path,
+                use_llm=use_llm,
+                llm_model=llm_model,
+                ocr_llm_model=ocr_llm_model,
+            )
+        )
+
+    async def _parse_async(
+        self,
+        file_path: str,
+        use_llm: bool = False,
+        llm_model: Optional[str] = None,
+        ocr_llm_model: Optional[str] = None,
+    ) -> Dict:
+        requested_ocr_model = ocr_llm_model or llm_model
+        ocr_service: Optional[Any] = None
+        local_ocr_service: Optional[MacOSVisionOCRService] = None
+        pdfium_document: Optional[pdfium.PdfDocument] = None
+        ocr_runtime_initialized = False
         page_entries: List[Dict[str, Any]] = []
         parser_warnings: List[str] = []
+
+        def _ensure_ocr_runtime() -> tuple[Optional[MacOSVisionOCRService], Optional[Any], Optional[pdfium.PdfDocument]]:
+            nonlocal local_ocr_service, ocr_service, pdfium_document, ocr_runtime_initialized
+            if ocr_runtime_initialized:
+                return local_ocr_service, ocr_service, pdfium_document
+
+            ocr_runtime_initialized = True
+            local_ocr_service = self._build_local_ocr_service(use_llm=use_llm, llm_model=requested_ocr_model)
+            if local_ocr_service is None:
+                ocr_service = self._build_ocr_service(use_llm=use_llm, llm_model=requested_ocr_model)
+            pdfium_document = self._open_pdfium_document(file_path, local_ocr_service or ocr_service)
+            return local_ocr_service, ocr_service, pdfium_document
 
         with pdfplumber.open(file_path) as pdf:
             total_pages = len(pdf.pages)
 
             for page_index, page in enumerate(pdf.pages):
                 native_text = self._normalize_page_text(page.extract_text() or "")
-                native_blocks = self._extract_native_blocks(page, native_text)
+                native_blocks, native_lines = self._extract_native_layout(page, native_text)
                 page_entry: Dict[str, Any] = {
                     "page_number": page_index + 1,
                     "width": float(getattr(page, "width", 595.0) or 595.0),
@@ -58,20 +91,79 @@ class PDFParser(BaseParser):
                     "source": "native",
                     "char_count": self._count_readable_chars(native_text),
                     "blocks": native_blocks,
+                    "lines": native_lines,
                 }
 
                 needs_ocr = self._should_run_ocr(native_text)
                 if needs_ocr:
                     page_entry["source"] = "native_low_text" if native_text else "empty"
+                    local_ocr_service, ocr_service, pdfium_document = _ensure_ocr_runtime()
 
-                    if ocr_service is not None and pdfium_document is not None:
+                    if pdfium_document is not None and (local_ocr_service is not None or ocr_service is not None):
+                        ocr_started_at = perf_counter()
                         try:
-                            image_bytes = self._render_page_image(pdfium_document, page_index)
-                            ocr_result = ocr_service.extract_document_text_from_image(
-                                image_bytes,
-                                page_number=page_index + 1,
-                                total_pages=total_pages,
-                            )
+                            active_ocr_engine = ""
+                            active_ocr_model = requested_ocr_model or settings.OLLAMA_MODEL
+                            ocr_result: Optional[Dict[str, Any]] = None
+                            if local_ocr_service is not None:
+                                active_ocr_engine = "macos_vision"
+                                logger.info(
+                                    "Running PDF OCR on page %s/%s with engine %s",
+                                    page_index + 1,
+                                    total_pages,
+                                    active_ocr_engine,
+                                )
+                                image_bytes = self._render_page_image(
+                                    pdfium_document,
+                                    page_index,
+                                    ocr_model=requested_ocr_model,
+                                    ocr_engine=active_ocr_engine,
+                                )
+                                try:
+                                    ocr_result = await local_ocr_service.extract_document_text_from_image_async(
+                                        image_bytes,
+                                        page_number=page_index + 1,
+                                        total_pages=total_pages,
+                                    )
+                                except Exception as local_exc:
+                                    logger.warning(
+                                        "Local PDF OCR failed on page %s/%s: %s",
+                                        page_index + 1,
+                                        total_pages,
+                                        local_exc,
+                                    )
+                                    local_ocr_service = None
+                                    ocr_service = self._build_ocr_service(use_llm=use_llm, llm_model=requested_ocr_model)
+
+                            if ocr_result is None and ocr_service is not None:
+                                active_ocr_engine = "ollama_vision"
+                                active_ocr_model = getattr(ocr_service, "model", requested_ocr_model or settings.OLLAMA_MODEL)
+                                logger.info(
+                                    "Running PDF OCR on page %s/%s with model %s",
+                                    page_index + 1,
+                                    total_pages,
+                                    active_ocr_model,
+                                )
+                                image_bytes = self._render_page_image(
+                                    pdfium_document,
+                                    page_index,
+                                    ocr_model=active_ocr_model,
+                                    ocr_engine=active_ocr_engine,
+                                )
+                                if hasattr(ocr_service, "extract_document_text_from_image_async"):
+                                    ocr_result = await ocr_service.extract_document_text_from_image_async(
+                                        image_bytes,
+                                        page_number=page_index + 1,
+                                        total_pages=total_pages,
+                                    )
+                                else:
+                                    ocr_result = ocr_service.extract_document_text_from_image(
+                                        image_bytes,
+                                        page_number=page_index + 1,
+                                        total_pages=total_pages,
+                                    )
+                            if ocr_result is None:
+                                raise RuntimeError("No OCR engine available for scanned PDF page.")
                             ocr_text = self._normalize_page_text(ocr_result.get("text", ""))
                             if ocr_text:
                                 page_entry["text"] = ocr_text
@@ -79,29 +171,54 @@ class PDFParser(BaseParser):
                                 page_entry["char_count"] = self._count_readable_chars(ocr_text)
                                 page_entry["ocr_quality"] = ocr_result.get("quality")
                                 page_entry["ocr_layout"] = ocr_result.get("layout")
+                                page_entry["ocr_engine"] = active_ocr_engine or ocr_result.get("engine")
+                                page_entry["ocr_model"] = active_ocr_model if active_ocr_engine == "ollama_vision" else ocr_result.get("engine")
+                                page_entry["ocr_review_model"] = requested_ocr_model or llm_model
                                 page_entry["blocks"] = self._normalize_blocks(
                                     ocr_result.get("blocks"),
                                     fallback_text=ocr_text,
                                 )
+                                page_entry["lines"] = self._normalize_lines(ocr_result.get("lines"))
                                 if ocr_result.get("warnings"):
                                     page_entry["warnings"] = list(ocr_result["warnings"])
+                                logger.info(
+                                    "PDF OCR completed on page %s/%s in %.2fs, chars=%s, quality=%s",
+                                    page_index + 1,
+                                    total_pages,
+                                    perf_counter() - ocr_started_at,
+                                    page_entry["char_count"],
+                                    page_entry.get("ocr_quality") or "unknown",
+                                )
                             elif native_text:
                                 page_entry["source"] = "native_low_text"
                             else:
                                 page_entry["source"] = "ocr_empty"
                                 page_entry["blocks"] = []
+                                page_entry["lines"] = []
                         except Exception as exc:
+                            ocr_elapsed = perf_counter() - ocr_started_at
+                            timed_out = self._is_timeout_error(exc)
+                            parser_warnings.append(
+                                "ocr_timeout_for_scan_pages" if timed_out else "ocr_failed_for_scan_pages"
+                            )
+                            page_warnings = list(page_entry.get("warnings") or [])
+                            page_warnings.append("ocr_timeout" if timed_out else "ocr_failed")
+                            page_entry["warnings"] = sorted(set(page_warnings))
                             logger.warning(
-                                "PDF OCR failed on page %s: %s",
+                                "PDF OCR %s on page %s/%s after %.2fs: %s",
+                                "timed out" if timed_out else "failed",
                                 page_index + 1,
+                                total_pages,
+                                ocr_elapsed,
                                 exc,
                             )
                             page_entry["ocr_error"] = str(exc)
                             if native_text:
-                                page_entry["source"] = "native_ocr_failed"
+                                page_entry["source"] = "native_ocr_timeout" if timed_out else "native_ocr_failed"
                             else:
-                                page_entry["source"] = "ocr_failed"
+                                page_entry["source"] = "ocr_timeout" if timed_out else "ocr_failed"
                                 page_entry["blocks"] = []
+                                page_entry["lines"] = []
                     else:
                         parser_warnings.append("ocr_unavailable_for_scan_pages")
 
@@ -115,7 +232,36 @@ class PDFParser(BaseParser):
             1 for page in page_entries if str(page.get("source", "")).startswith("native")
         )
         ocr_pages = sum(1 for page in page_entries if page.get("source") == "ocr")
+        ocr_timeout_pages = sum(
+            1 for page in page_entries if page.get("source") in {"native_ocr_timeout", "ocr_timeout"}
+        )
+        ocr_failed_pages = sum(
+            1
+            for page in page_entries
+            if page.get("source") in {"native_ocr_timeout", "ocr_timeout", "native_ocr_failed", "ocr_failed"}
+        )
         empty_pages = sum(1 for page in page_entries if not str(page.get("text", "")).strip())
+        ocr_engines = sorted(
+            {
+                str(page.get("ocr_engine", "")).strip()
+                for page in page_entries
+                if page.get("source") == "ocr" and str(page.get("ocr_engine", "")).strip()
+            }
+        )
+        ocr_models = sorted(
+            {
+                str(page.get("ocr_model", "")).strip()
+                for page in page_entries
+                if page.get("source") == "ocr" and str(page.get("ocr_model", "")).strip()
+            }
+        )
+        ocr_review_models = sorted(
+            {
+                str(page.get("ocr_review_model", "")).strip()
+                for page in page_entries
+                if page.get("source") == "ocr" and str(page.get("ocr_review_model", "")).strip()
+            }
+        )
 
         metadata = {
             "pages": len(page_entries),
@@ -123,10 +269,16 @@ class PDFParser(BaseParser):
             "file_path": file_path,
             "native_text_pages": native_text_pages,
             "ocr_pages": ocr_pages,
+            "ocr_timeout_pages": ocr_timeout_pages,
+            "ocr_failed_pages": ocr_failed_pages,
             "empty_pages": empty_pages,
-            "ocr_enabled": bool(ocr_service),
-            "ocr_model": ocr_service.model if ocr_service is not None else None,
-            "normalized_export": "docx" if ocr_pages > 0 else None,
+            "ocr_enabled": bool(use_llm and settings.PDF_OCR_ENABLED),
+            "ocr_engine": "hybrid" if len(ocr_engines) > 1 else (ocr_engines[0] if ocr_engines else None),
+            "ocr_model": "hybrid" if len(ocr_models) > 1 else (ocr_models[0] if ocr_models else None),
+            "ocr_review_model": (
+                "hybrid" if len(ocr_review_models) > 1 else (ocr_review_models[0] if ocr_review_models else None)
+            ),
+            "normalized_export": "txt",
         }
         if parser_warnings:
             metadata["warnings"] = sorted(set(parser_warnings))
@@ -150,14 +302,18 @@ class PDFParser(BaseParser):
         *,
         use_llm: bool,
         llm_model: Optional[str],
-    ) -> Optional[OllamaLLMService]:
+    ) -> Optional[Any]:
         if not use_llm or not settings.PDF_OCR_ENABLED:
             return None
+        if settings.is_high_quality_lowmem_mode():
+            return None
+
+        from app.services.ollama_service import OllamaLLMService
 
         service = OllamaLLMService(
             base_url=settings.OLLAMA_BASE_URL,
             model=llm_model or settings.OLLAMA_MODEL,
-            timeout=settings.OLLAMA_TIMEOUT,
+            timeout=settings.PDF_OCR_TIMEOUT,
             num_ctx=settings.OLLAMA_NUM_CTX,
         )
         if not service.available:
@@ -165,10 +321,28 @@ class PDFParser(BaseParser):
             return None
         return service
 
+    def _build_local_ocr_service(
+        self,
+        *,
+        use_llm: bool,
+        llm_model: Optional[str],
+    ) -> Optional[MacOSVisionOCRService]:
+        if not use_llm or not settings.PDF_OCR_ENABLED:
+            return None
+
+        service = MacOSVisionOCRService(timeout=settings.PDF_OCR_TIMEOUT)
+        if not service.available:
+            return None
+        return service
+
+    def _is_timeout_error(self, exc: Exception) -> bool:
+        error_text = str(exc).strip().lower()
+        return isinstance(exc, TimeoutError) or "timed out" in error_text or "timeout" in error_text
+
     def _open_pdfium_document(
         self,
         file_path: str,
-        ocr_service: Optional[OllamaLLMService],
+        ocr_service: Optional[Any],
     ) -> Optional[pdfium.PdfDocument]:
         if ocr_service is None:
             return None
@@ -201,7 +375,7 @@ class PDFParser(BaseParser):
         normalized = re.sub(r"\n{3,}", "\n\n", normalized)
         return normalized.strip()
 
-    def _extract_native_blocks(self, page, native_text: str) -> List[Dict[str, Any]]:
+    def _extract_native_layout(self, page, native_text: str) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         try:
             raw_lines = page.extract_text_lines(strip=False, return_chars=True, layout=True)
         except TypeError:
@@ -213,10 +387,11 @@ class PDFParser(BaseParser):
             raw_lines = []
 
         if not isinstance(raw_lines, list) or not raw_lines:
-            return self._build_basic_blocks_from_text(native_text)
+            return self._build_basic_blocks_from_text(native_text), []
 
         line_entries: List[Dict[str, Any]] = []
         page_width = float(getattr(page, "width", 595.0) or 595.0)
+        page_height = float(getattr(page, "height", 842.0) or 842.0)
 
         for raw_line in raw_lines:
             if not isinstance(raw_line, dict):
@@ -254,11 +429,19 @@ class PDFParser(BaseParser):
                     "x0": x0,
                     "x1": x1,
                     "font_size_hint": font_size_hint,
+                    "bbox": self._normalize_relative_bbox(
+                        x0=x0,
+                        top=top,
+                        x1=x1,
+                        bottom=bottom,
+                        page_width=page_width,
+                        page_height=page_height,
+                    ),
                 }
             )
 
         if not line_entries:
-            return self._build_basic_blocks_from_text(native_text)
+            return self._build_basic_blocks_from_text(native_text), []
 
         line_entries.sort(key=lambda item: (item["top"], item["x0"]))
         min_x0 = min(item["x0"] for item in line_entries)
@@ -283,11 +466,20 @@ class PDFParser(BaseParser):
                     "indent_pt": round(max(0.0, min(item["x0"] - min_x0, 144.0)), 1),
                     "space_before_pt": round(min(max(gap - baseline_height * 0.25, 0.0), 18.0), 1),
                     "font_size_hint": item["font_size_hint"],
+                    "bbox": item.get("bbox"),
                 }
             )
             previous_bottom = item["bottom"]
 
-        return self._collapse_spacers(blocks)
+        normalized_lines = [
+            {
+                "text": item["text"],
+                "bbox": item["bbox"],
+            }
+            for item in line_entries
+            if item.get("text") and item.get("bbox")
+        ]
+        return self._collapse_spacers(blocks), normalized_lines
 
     def _normalize_blocks(
         self,
@@ -304,10 +496,39 @@ class PDFParser(BaseParser):
                 block_type = str(block.get("type", "line")).strip().lower()
                 if block_type == "spacer":
                     block["count"] = max(1, int(block.get("blank_before", block.get("count", 1)) or 1))
+                bbox = block.get("bbox")
+                if isinstance(bbox, list) and len(bbox) == 4:
+                    try:
+                        block["bbox"] = [float(value) for value in bbox]
+                    except (TypeError, ValueError):
+                        block.pop("bbox", None)
                 normalized.append(block)
             if normalized:
                 return self._collapse_spacers(normalized)
         return self._build_basic_blocks_from_text(fallback_text)
+
+    def _normalize_lines(self, lines: Any) -> List[Dict[str, Any]]:
+        if not isinstance(lines, list):
+            return []
+
+        normalized_lines: List[Dict[str, Any]] = []
+        for item in lines:
+            if not isinstance(item, dict):
+                continue
+            text = self._normalize_page_text(str(item.get("text", "")))
+            bbox = item.get("bbox")
+            if not text or not isinstance(bbox, list) or len(bbox) != 4:
+                continue
+            try:
+                numeric_bbox = [float(value) for value in bbox]
+            except (TypeError, ValueError):
+                continue
+            max_value = max(abs(value) for value in numeric_bbox)
+            if max_value > 1.5:
+                scale = 1000.0 if max_value > 10 else 100.0
+                numeric_bbox = [value / scale for value in numeric_bbox]
+            normalized_lines.append({"text": text, "bbox": numeric_bbox})
+        return normalized_lines
 
     def _build_basic_blocks_from_text(self, text: str) -> List[Dict[str, Any]]:
         if not text.strip():
@@ -407,22 +628,55 @@ class PDFParser(BaseParser):
 
         return collapsed
 
+    def _normalize_relative_bbox(
+        self,
+        *,
+        x0: float,
+        top: float,
+        x1: float,
+        bottom: float,
+        page_width: float,
+        page_height: float,
+    ) -> List[float]:
+        width = max(page_width, 1.0)
+        height = max(page_height, 1.0)
+        left = min(max(x0 / width, 0.0), 1.0)
+        upper = min(max(top / height, 0.0), 1.0)
+        right = min(max(x1 / width, 0.0), 1.0)
+        lower = min(max(bottom / height, 0.0), 1.0)
+        return [round(left, 5), round(upper, 5), round(right, 5), round(lower, 5)]
+
     def _render_page_image(
         self,
         pdfium_document: pdfium.PdfDocument,
         page_index: int,
+        *,
+        ocr_model: Optional[str] = None,
+        ocr_engine: Optional[str] = None,
     ) -> bytes:
         page = pdfium_document[page_index]
+        local_ocr = str(ocr_engine or "").strip().lower() == "macos_vision"
+        review_ocr = settings.is_review_capable_ollama_model(ocr_model) and not local_ocr
+        render_scale = (
+            settings.PDF_REVIEW_OCR_RENDER_SCALE
+            if review_ocr
+            else settings.PDF_OCR_RENDER_SCALE
+        )
+        image_max_edge = (
+            settings.PDF_REVIEW_OCR_IMAGE_MAX_EDGE
+            if review_ocr
+            else settings.PDF_OCR_IMAGE_MAX_EDGE
+        )
         bitmap = page.render(
-            scale=settings.PDF_OCR_RENDER_SCALE,
+            scale=render_scale,
             rev_byteorder=True,
         )
         image = bitmap.to_pil().convert("RGB")
 
         try:
             max_edge = max(image.size)
-            if max_edge > settings.PDF_OCR_IMAGE_MAX_EDGE:
-                scale = settings.PDF_OCR_IMAGE_MAX_EDGE / max_edge
+            if max_edge > image_max_edge:
+                scale = image_max_edge / max_edge
                 resized_size = (
                     max(1, int(image.size[0] * scale)),
                     max(1, int(image.size[1] * scale)),
@@ -432,12 +686,15 @@ class PDFParser(BaseParser):
                 image = resized_image
 
             buffer = BytesIO()
-            image.save(
-                buffer,
-                format="JPEG",
-                quality=settings.PDF_OCR_JPEG_QUALITY,
-                optimize=True,
-            )
+            if local_ocr:
+                image.save(buffer, format="PNG", optimize=False)
+            else:
+                image.save(
+                    buffer,
+                    format="JPEG",
+                    quality=settings.PDF_OCR_JPEG_QUALITY,
+                    optimize=True,
+                )
             return buffer.getvalue()
         finally:
             image.close()
@@ -445,12 +702,25 @@ class PDFParser(BaseParser):
             page.close()
 
     def _join_page_texts(self, page_entries: List[Dict[str, Any]]) -> str:
-        page_texts = [
-            str(page.get("text", "")).strip()
-            for page in page_entries
-            if str(page.get("text", "")).strip()
-        ]
-        return "\n\n".join(page_texts)
+        output_parts: List[str] = []
+        cursor = 0
+        for page in page_entries:
+            page_text = str(page.get("text", "")).strip()
+            if not page_text:
+                page["start"] = cursor
+                page["end"] = cursor
+                continue
+
+            if output_parts:
+                output_parts.append("\n\n")
+                cursor += 2
+
+            start = cursor
+            output_parts.append(page_text)
+            cursor += len(page_text)
+            page["start"] = start
+            page["end"] = cursor
+        return "".join(output_parts)
 
     def supports(self, file_extension: str) -> bool:
         return file_extension.lower() == ".pdf"

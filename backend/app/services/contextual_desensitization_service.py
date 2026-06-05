@@ -15,6 +15,7 @@ from app.core.anonymization_strategy import (
     get_anonymization_strategy_profile,
 )
 from app.core.config import settings
+from app.core.document_workflow import classify_document_workflow, resolve_large_document_page_count
 from app.core.identifier_rules import (
     label_matches,
     looks_like_case_number,
@@ -25,7 +26,17 @@ from app.core.llm_strategy import (
     get_runtime_llm_strategy_profile,
     parse_model_size_in_b,
 )
-from app.services.ollama_service import OllamaLLMService
+from app.services.lowmem_entity_utils import (
+    IDENTITY_REFERENCE_TERMS,
+    has_identity_reference_prefix,
+    is_generic_organization_term,
+    is_identity_reference_term,
+    is_org_like_text,
+    is_position_title,
+    is_probable_person,
+    looks_like_organization_short_name,
+    strip_identity_reference_prefix,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +49,10 @@ class ContextualDesensitizationService:
         "PERSON_NAME",
         "ORGANIZATION",
         "COMPANY_NAME",
+        "ALIAS",
         "LOCATION",
-        "POSITION",
+        "ADDRESS",
+        "COURT",
         "PROJECT",
         "CONTRACT_NO",
         "BANK_NAME",
@@ -59,17 +72,20 @@ class ContextualDesensitizationService:
     # recognition, but replacement wording should stay stable and easy to read.
     LLM_TYPES: set[str] = set()
 
-    PRESERVE_TYPES = {"AMOUNT", "DATE"}
+    PRESERVE_TYPES: set[str] = {"AMOUNT", "POSITION"}
 
     GROUP_FAMILIES = {
         "PERSON": "person",
         "PERSON_NAME": "person",
         "ORGANIZATION": "organization",
         "COMPANY_NAME": "organization",
+        "ALIAS": "alias",
         "ACCOUNT_NAME": "organization",
         "BANK_NAME": "bank",
         "PROJECT": "project",
         "LOCATION": "location",
+        "ADDRESS": "address",
+        "COURT": "court",
         "POSITION": "position",
         "CONTRACT_NO": "contract_no",
         "PROJECT_CODE": "project_code",
@@ -92,6 +108,8 @@ class ContextualDesensitizationService:
         "PERSON_NAME": 4,
         "PROJECT": 5,
         "LOCATION": 6,
+        "ADDRESS": 6,
+        "COURT": 6,
         "POSITION": 7,
         "CONTRACT_NO": 8,
         "PROJECT_CODE": 9,
@@ -145,6 +163,19 @@ class ContextualDesensitizationService:
         "银行",
         "支行",
         "分行",
+        "商行",
+        "合作社",
+        "工作室",
+        "经营部",
+        "门市部",
+        "营业部",
+        "办事处",
+        "基金会",
+        "联合会",
+        "研究所",
+        "协会",
+        "学校",
+        "医院",
     }
 
     ORGANIZATION_STOP_PREFIXES = (
@@ -233,6 +264,63 @@ class ContextualDesensitizationService:
         "工程技术",
         "工程设计",
         "建筑工程",
+        "新能源",
+        "新材料",
+        "信息技术",
+        "技术服务",
+        "商务服务",
+        "设计咨询",
+        "检测技术",
+        "供应链",
+        "供应链服务",
+    }
+
+    ORGANIZATION_BUSINESS_SUFFIXES = (
+        "供应链服务",
+        "信息技术",
+        "技术服务",
+        "商务服务",
+        "设计咨询",
+        "检测技术",
+        "工程设计",
+        "工程技术",
+        "工程建设",
+        "建筑工程",
+        "新能源",
+        "新材料",
+        "供应链",
+        "科技",
+        "工程",
+        "建设",
+        "贸易",
+        "实业",
+        "发展",
+        "咨询",
+        "服务",
+        "管理",
+        "材料",
+        "电力",
+        "能源",
+        "建筑",
+        "环保",
+        "智能",
+        "信息",
+        "网络",
+        "电子",
+        "机械",
+        "设备",
+        "制造",
+    )
+
+    WEAK_ORGANIZATION_REFERENCES = {
+        "本公司",
+        "该公司",
+        "我公司",
+        "贵公司",
+        "上述公司",
+        "前述公司",
+        "相关公司",
+        "涉案公司",
     }
 
     NON_ENTITY_FIXED_TERMS = {
@@ -254,7 +342,28 @@ class ContextualDesensitizationService:
         "敬礼",
         "特此申请",
         "特此上诉",
+        "控告人",
+        "被控告人",
+        "举报人",
+        "被举报人",
+        "申诉人",
+        "被申诉人",
+        "起诉人",
+        "自诉人",
+        "法定代表人",
+        "法定代理人",
+        "法人代表",
+        "负责人",
+        "联系人",
+        "委托代理人",
+        "委托诉讼代理人",
+        "诉讼代理人",
+        "代理人",
+        "职务",
+        "职位",
+        "岗位",
     }
+    NON_ENTITY_FIXED_TERMS.update(IDENTITY_REFERENCE_TERMS)
 
     ORGANIZATION_IDENTIFIER_LABELS = (
         "统一社会信用代码",
@@ -271,7 +380,60 @@ class ContextualDesensitizationService:
     )
 
     LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    LOWER_LETTERS = "abcdefghijklmnopqrstuvwxyz"
     CN_SERIALS = ["甲", "乙", "丙", "丁", "戊", "己", "庚", "辛", "壬", "癸"]
+    GREEK_ALIASES = [
+        "alpha",
+        "beta",
+        "gamma",
+        "delta",
+        "epsilon",
+        "zeta",
+        "eta",
+        "theta",
+        "iota",
+        "kappa",
+        "lambda",
+        "mu",
+        "nu",
+        "xi",
+        "omicron",
+        "pi",
+        "rho",
+        "sigma",
+        "tau",
+        "upsilon",
+        "phi",
+        "chi",
+        "psi",
+        "omega",
+    ]
+    OFFICIAL_GREEK_SYMBOLS = [
+        "α",
+        "β",
+        "γ",
+        "δ",
+        "ε",
+        "ζ",
+        "η",
+        "θ",
+        "ι",
+        "κ",
+        "λ",
+        "μ",
+        "ν",
+        "ξ",
+        "ο",
+        "π",
+        "ρ",
+        "σ",
+        "τ",
+        "υ",
+        "φ",
+        "χ",
+        "ψ",
+        "ω",
+    ]
 
     RESOLUTION_ROLES = {
         "PARTY_A",
@@ -297,7 +459,6 @@ class ContextualDesensitizationService:
         "ORGANIZATION",
         "COMPANY_NAME",
         "LOCATION",
-        "POSITION",
         "PROJECT",
         "CONTRACT_NO",
         "BANK_NAME",
@@ -308,6 +469,20 @@ class ContextualDesensitizationService:
         "CN_ID_CARD",
         "CN_CREDIT_CODE",
         "EMAIL_ADDRESS",
+    }
+
+    # Context review focuses on ambiguous name-like entities. Deterministic
+    # identifiers are already handled well by rule-based recognizers.
+    REVIEW_PROMPT_TYPES = {
+        "PERSON",
+        "PERSON_NAME",
+        "ORGANIZATION",
+        "COMPANY_NAME",
+        "LOCATION",
+        "PROJECT",
+        "CONTRACT_NO",
+        "BANK_NAME",
+        "ACCOUNT_NAME",
     }
 
     ROLE_LABELS = [
@@ -322,9 +497,18 @@ class ContextualDesensitizationService:
         "供应商",
         "收款单位",
         "法定代表人",
+        "法定代理人",
         "联系人",
         "项目负责人",
         "经办人",
+        "控告人",
+        "被控告人",
+        "举报人",
+        "被举报人",
+        "申诉人",
+        "被申诉人",
+        "起诉人",
+        "自诉人",
         "开户行",
         "户名",
         "账户",
@@ -507,7 +691,7 @@ class ContextualDesensitizationService:
 
     COMPANY_PREFIX = [
         "华宏",
-        "远衡",
+        "景衡",
         "云泽",
         "景岳",
         "启安",
@@ -603,10 +787,24 @@ class ContextualDesensitizationService:
         "有限责任公司",
         "有限公司",
         "集团有限公司",
+        "集团",
         "服务中心",
         "技术中心",
         "研究院",
+        "研究所",
         "事务所",
+        "商行",
+        "合作社",
+        "工作室",
+        "经营部",
+        "门市部",
+        "营业部",
+        "办事处",
+        "基金会",
+        "联合会",
+        "学校",
+        "医院",
+        "协会",
         "支行",
         "分行",
         "银行",
@@ -615,8 +813,9 @@ class ContextualDesensitizationService:
         "所",
     ]
 
-    def __init__(self) -> None:
-        self._ollama_services: Dict[str, OllamaLLMService] = {}
+    def __init__(self, *, review_service=None) -> None:
+        self._ollama_services: Dict[str, Any] = {}
+        self._lowmem_review_service = review_service
         self.last_quality_metadata: Dict[str, Any] = {}
 
     def get_last_quality_metadata(self) -> Dict[str, Any]:
@@ -629,21 +828,45 @@ class ContextualDesensitizationService:
         entities: List[Dict],
         use_llm: bool,
         llm_model: Optional[str] = None,
+        source_metadata: Optional[Dict[str, Any]] = None,
+        source_structure: Optional[Dict[str, Any]] = None,
+        progress_callback=None,
     ) -> List[Dict]:
         refined_entities = [dict(entity) for entity in entities]
         refined_entities = self._apply_metadata_identity_hints(refined_entities)
         if not refined_entities or not use_llm:
             return refined_entities
 
-        ollama = self._get_ollama_service(llm_model=llm_model)
-        if ollama is None or not ollama.available:
-            return refined_entities
-
         contexts = [self._build_context(text, entity) for entity in refined_entities]
-        llm_result = await self._build_llm_resolution_result(
+        self._emit_review_progress(
+            progress_callback,
+            current=1,
+            total=3,
+            message="正在整理上下文复审范围...",
+        )
+        review_bundle = self._build_resolution_review_bundle(
             text=text,
             entities=refined_entities,
             contexts=contexts,
+            llm_model=llm_model,
+        )
+        if not review_bundle["prompt_items"]:
+            return refined_entities
+
+        if not self._resolution_backend_available(llm_model=llm_model):
+            return refined_entities
+
+        self._emit_review_progress(
+            progress_callback,
+            current=2,
+            total=3,
+            message="正在执行上下文复审...",
+        )
+        llm_result = await self._build_llm_resolution_result(
+            text=text,
+            prompt_items=review_bundle["prompt_items"],
+            focus_lines=review_bundle["focus_lines"],
+            subject_catalog=review_bundle["subject_catalog"],
             llm_model=llm_model,
         )
         if not llm_result:
@@ -655,18 +878,12 @@ class ContextualDesensitizationService:
             if isinstance(item, dict) and item.get("id")
         }
 
-        for index, entity in enumerate(refined_entities, start=1):
-            update = updates_by_id.get(f"E{index}")
-            if not update:
-                continue
-
-            canonical_key = self._sanitize_canonical_key(update.get("canonical_key"))
-            if canonical_key:
-                entity["canonical_key"] = canonical_key
-
-            canonical_role = str(update.get("canonical_role", "")).strip().upper()
-            if canonical_role in self.RESOLUTION_ROLES:
-                entity["canonical_role"] = canonical_role
+        self._apply_resolution_updates(
+            refined_entities=refined_entities,
+            updates_by_id=updates_by_id,
+            entity_indexes_by_id=review_bundle["entity_indexes_by_id"],
+            allowed_canonical_keys_by_id=review_bundle["allowed_canonical_keys_by_id"],
+        )
 
         extra_entities = self._materialize_llm_extra_entities(
             text=text,
@@ -677,66 +894,1122 @@ class ContextualDesensitizationService:
             refined_entities.extend(extra_entities)
             refined_entities.sort(key=lambda item: (item["start"], item["end"]))
 
+        self._propagate_resolved_canonical_keys(
+            refined_entities=refined_entities,
+            text=text,
+        )
+        self._assign_distinct_short_org_canonical_keys(
+            refined_entities=refined_entities,
+            text=text,
+        )
+
+        self._emit_review_progress(
+            progress_callback,
+            current=3,
+            total=3,
+            message="正在整理最终实体关系...",
+        )
         return refined_entities
 
-    async def prepare_entities(
+    def _propagate_resolved_canonical_keys(
+        self,
+        *,
+        refined_entities: List[Dict],
+        text: str,
+        contexts: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        if contexts is None or len(contexts) != len(refined_entities):
+            contexts = [self._build_context(text, entity) for entity in refined_entities]
+        seeded_pairs = [
+            (entity, context)
+            for entity, context in zip(refined_entities, contexts)
+            if self._canonical_key_from_entity(entity)
+        ]
+        if not seeded_pairs:
+            return
+
+        for entity, context in zip(refined_entities, contexts):
+            if self._canonical_key_from_entity(entity):
+                continue
+
+            best_match: Optional[Dict[str, str]] = None
+            best_score = -1
+            for seeded_entity, seeded_context in seeded_pairs:
+                if not self._should_share_identity(entity, context, seeded_entity, seeded_context) and not self._should_bridge_organization_variant_to_seed(
+                    entity=entity,
+                    seeded_entity=seeded_entity,
+                ):
+                    continue
+
+                canonical_key = self._canonical_key_from_entity(seeded_entity)
+                if not canonical_key:
+                    continue
+                canonical_role = str(seeded_entity.get("canonical_role", "")).strip().upper()
+                score = 0
+                if canonical_role in {"PARTY_A", "PARTY_B", "PARTY_C"}:
+                    score += 100
+                if str((seeded_entity.get("metadata") or {}).get("definition_full_text") or "").strip():
+                    score += 30
+                if str((seeded_entity.get("metadata") or {}).get("definition_alias") or "").strip():
+                    score += 20
+                score += min(len(str(seeded_entity.get("text", "") or "").strip()), 24)
+
+                if score > best_score:
+                    best_score = score
+                    best_match = {
+                        "canonical_key": canonical_key,
+                        "canonical_role": canonical_role,
+                    }
+
+            if not best_match:
+                continue
+
+            entity["canonical_key"] = best_match["canonical_key"]
+            if best_match["canonical_role"] in self.RESOLUTION_ROLES:
+                entity["canonical_role"] = best_match["canonical_role"]
+
+    def _should_bridge_organization_variant_to_seed(
+        self,
+        *,
+        entity: Dict,
+        seeded_entity: Dict,
+    ) -> bool:
+        entity_type = str(entity.get("type", "")).strip().upper()
+        seeded_type = str(seeded_entity.get("type", "")).strip().upper()
+        if entity_type not in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME"}:
+            return False
+        if seeded_type not in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME"}:
+            return False
+
+        seeded_metadata = seeded_entity.get("metadata") or {}
+        seeded_definition_text = str(
+            seeded_metadata.get("definition_full_text")
+            or seeded_metadata.get("canonical")
+            or ""
+        ).strip()
+        if not seeded_definition_text:
+            return False
+
+        target_text = str(entity.get("text", "") or "").strip()
+        if not target_text or not self._looks_like_company_subject(target_text):
+            return False
+
+        seeded_aliases = self._derive_organization_identity_aliases(seeded_definition_text)
+        target_norm = self._normalize_group_text(target_text)
+        target_companyish = target_norm.removesuffix("公司")
+        for alias in seeded_aliases:
+            alias_norm = self._normalize_group_text(alias)
+            alias_companyish = alias_norm.removesuffix("公司")
+            if len(alias_companyish) < 2 or len(target_companyish) < 2:
+                continue
+            if alias_companyish == target_companyish:
+                return True
+            if alias_companyish in target_companyish or target_companyish in alias_companyish:
+                return True
+        return False
+
+    def _emit_review_progress(
+        self,
+        progress_callback,
+        *,
+        current: int,
+        total: int,
+        message: str,
+    ) -> None:
+        if progress_callback is None:
+            return
+
+        try:
+            progress_callback(
+                {
+                    "stage": "review",
+                    "current": current,
+                    "total": total,
+                    "message": message,
+                }
+            )
+        except Exception:
+            logger.debug("Failed to emit contextual review progress update", exc_info=True)
+
+    def _review_prompt_bucket(self, entity_type: str) -> str:
+        if entity_type in {"PERSON", "PERSON_NAME"}:
+            return "PERSON"
+        if entity_type in {"ORGANIZATION", "COMPANY_NAME"}:
+            return "ORGANIZATION"
+        return entity_type
+
+    def _review_prompt_signature(self, entity: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> tuple[str, str]:
+        entity_type = str(entity.get("type", "")).strip().upper()
+        text = str(entity.get("text", "")).strip()
+        if entity_type in {"PERSON", "PERSON_NAME"}:
+            normalized = self._normalize_person_source_text(text)
+        else:
+            normalized = self._normalize_group_text(text)
+        if context and self._requires_occurrence_level_resolution(entity, context):
+            return self._review_prompt_bucket(entity_type), f"{normalized}@{int(entity.get('start', 0))}"
+        return self._review_prompt_bucket(entity_type), normalized
+
+    def _requires_occurrence_level_resolution(
+        self,
+        entity: Dict[str, Any],
+        context: Dict[str, Any],
+    ) -> bool:
+        entity_type = str(entity.get("type", "")).strip().upper()
+        if entity_type not in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME"}:
+            return False
+        if self._canonical_key_from_entity(entity):
+            return False
+
+        text = str(entity.get("text", "")).strip()
+        normalized = self._normalize_group_text(text)
+        if len(normalized) < 2:
+            return False
+        if self._is_weak_organization_reference(text):
+            return True
+        if looks_like_organization_short_name(text):
+            return True
+        if len(normalized) <= 8 and not self._looks_like_organization_name(text):
+            source_layer = self._source_layer(entity)
+            if source_layer in {"llm_semantic", "llm_review", "propagated", "residual", "unknown"}:
+                return True
+        return False
+
+    def _review_prompt_priority(self, entity: Dict[str, Any], context: Dict[str, Any]) -> int:
+        entity_type = str(entity.get("type", "")).strip().upper()
+        text = str(entity.get("text", "")).strip()
+        source = self._source_layer(entity)
+        priority = 0
+
+        type_priority = {
+            "ORGANIZATION": 90,
+            "COMPANY_NAME": 90,
+            "ACCOUNT_NAME": 88,
+            "PERSON": 86,
+            "PERSON_NAME": 86,
+            "BANK_NAME": 80,
+            "LOCATION": 74,
+            "PROJECT": 70,
+            "POSITION": 64,
+            "CONTRACT_NO": 58,
+        }
+        priority += type_priority.get(entity_type, 40)
+        priority += max(0, 10 - self.SOURCE_LAYER_PRIORITY.get(source, 9))
+        priority += min(len(re.sub(r"\s+", "", text)), 24)
+        if context.get("label"):
+            priority += 8
+        if context.get("role"):
+            priority += 6
+        if context.get("line"):
+            priority += 4
+        return priority
+
+    def _get_review_entity_limit(self, llm_model: Optional[str], text_length: int = 0) -> int:
+        runtime = get_runtime_llm_strategy_profile(
+            llm_model or settings.get_default_llm_model(),
+            text_length=text_length,
+        )
+        return max(0, int(runtime.strategy.review_entity_limit or 0))
+
+    def _resolution_subject_family(self, entity_type: str) -> str:
+        family = self.GROUP_FAMILIES.get(str(entity_type or "").strip().upper(), "")
+        if family == "organization":
+            return "organization"
+        if family == "person":
+            return "person"
+        if family == "project":
+            return "project"
+        if family in {"location", "address", "court"}:
+            return "location"
+        if family == "bank":
+            return "bank"
+        return ""
+
+    def _is_resolution_subject_anchor(self, entity: Dict[str, Any], context: Dict[str, Any]) -> bool:
+        entity_type = str(entity.get("type", "")).strip().upper()
+        family = self._resolution_subject_family(entity_type)
+        if not family:
+            return False
+
+        text = str(entity.get("text", "")).strip()
+        normalized = (
+            self._normalize_person_source_text(text)
+            if family == "person"
+            else self._normalize_group_text(text)
+        )
+        if len(normalized) < 2:
+            return False
+
+        if self._canonical_key_from_entity(entity) and not self._is_provisional_canonical_entity(entity):
+            return True
+
+        party_role = self._party_role_from_context(context)
+        if party_role:
+            return True
+
+        label = str(context.get("label", "") or "")
+        role = str(context.get("role", "") or "")
+        source_priority = self._source_priority(entity)
+
+        if family == "organization":
+            if self._looks_like_organization_name(text):
+                return True
+            if label in {"甲方", "乙方", "丙方", "委托方", "受托方", "发包人", "承包人", "采购人", "供应商", "收款单位", "户名"}:
+                return True
+            return len(normalized) >= 6 and source_priority <= self.SOURCE_LAYER_PRIORITY.get("llm_semantic", 4)
+
+        if family == "person":
+            if label in {"联系人", "法定代表人", "项目负责人", "经办人", "申请人", "被申请人", "原告", "被告"}:
+                return True
+            return bool(role) and source_priority <= self.SOURCE_LAYER_PRIORITY.get("llm_review", 5)
+
+        if family == "project":
+            if label in {"项目名称", "工程名称"}:
+                return True
+            return len(normalized) >= 4
+
+        if family == "location":
+            if label in {"项目地址", "工程地址", "住址", "身份证住址", "住所", "住所地", "通讯地址", "送达地址"}:
+                return True
+            return len(normalized) >= 6
+
+        if family == "bank":
+            return "银行" in text or label == "开户行"
+
+        return False
+
+    def _build_resolution_subject_alias_hints(
+        self,
+        entity: Dict[str, Any],
+        context: Dict[str, Any],
+    ) -> List[str]:
+        entity_type = str(entity.get("type", "")).strip().upper()
+        family = self._resolution_subject_family(entity_type)
+        primary_text = str(entity.get("text", "")).strip()
+        if not primary_text:
+            return []
+
+        variants: List[str] = [primary_text]
+        metadata = entity.get("metadata") or {}
+        for candidate in (
+            metadata.get("definition_alias"),
+            metadata.get("definition_full_text"),
+            metadata.get("canonical"),
+            context.get("label"),
+        ):
+            if candidate:
+                variants.append(str(candidate).strip())
+
+        if family == "organization":
+            variants.extend(sorted(self._derive_organization_identity_aliases(primary_text)))
+        elif family == "person":
+            variants.extend(sorted(self._derive_person_identity_aliases(primary_text)))
+        elif family == "project":
+            variants.extend(sorted(self._derive_project_identity_aliases(primary_text)))
+
+        deduplicated: List[str] = []
+        seen_norms: set[str] = set()
+        primary_norm = (
+            self._normalize_person_source_text(primary_text)
+            if family == "person"
+            else self._normalize_group_text(primary_text)
+        )
+        ordered_variants = sorted(
+            [item for item in variants if item],
+            key=lambda item: (
+                self._normalize_person_source_text(item) != primary_norm
+                if family == "person"
+                else self._normalize_group_text(item) != primary_norm,
+                len(re.sub(r"\s+", "", item)),
+                item,
+            ),
+        )
+        for candidate in ordered_variants:
+            normalized = (
+                self._normalize_person_source_text(candidate)
+                if family == "person"
+                else self._normalize_group_text(candidate)
+            )
+            if len(normalized) < 2 or normalized in seen_norms:
+                continue
+            seen_norms.add(normalized)
+            deduplicated.append(candidate)
+            if len(deduplicated) >= 8:
+                break
+        return deduplicated
+
+    def _build_resolution_subject_catalog(
+        self,
+        *,
+        entities: List[Dict[str, Any]],
+        contexts: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        subject_catalog: List[Dict[str, Any]] = []
+        family_counters: Dict[str, int] = {}
+
+        ordered_pairs = sorted(
+            enumerate(zip(entities, contexts)),
+            key=lambda item: (
+                self._source_priority(item[1][0]),
+                self._entity_priority(item[1][0]),
+                -self._context_specificity(item[1][1]),
+                int(item[1][0].get("start", 0)),
+            ),
+        )
+
+        for _, (entity, context) in ordered_pairs:
+            entity_type = str(entity.get("type", "")).strip().upper()
+            family = self._resolution_subject_family(entity_type)
+            if not family or not self._is_resolution_subject_anchor(entity, context):
+                continue
+
+            canonical_key = self._canonical_key_from_entity(entity)
+            if not canonical_key:
+                party_role = self._party_role_from_context(context)
+                if party_role == "甲方":
+                    canonical_key = "PARTY_A"
+                elif party_role == "乙方":
+                    canonical_key = "PARTY_B"
+                elif party_role == "丙方":
+                    canonical_key = "PARTY_C"
+                else:
+                    family_counters[family] = family_counters.get(family, 0) + 1
+                    prefix_map = {
+                        "organization": "ORG",
+                        "person": "PERSON",
+                        "project": "PROJECT",
+                        "location": "LOCATION",
+                        "bank": "BANK",
+                    }
+                    canonical_key = f"{prefix_map[family]}_{family_counters[family]}"
+
+            merged = False
+            for subject in subject_catalog:
+                if subject["canonical_key"] == canonical_key:
+                    subject["alias_hints"] = self._merge_resolution_subject_aliases(
+                        subject["alias_hints"],
+                        self._build_resolution_subject_alias_hints(entity, context),
+                    )
+                    merged = True
+                    break
+                if subject["family"] != family:
+                    continue
+                if (
+                    family == "organization"
+                    and self._is_parallel_short_org_enumeration(
+                        entity=entity,
+                        context=context,
+                        other_entity=subject["primary_entity"],
+                        other_context=subject["primary_context"],
+                    )
+                ):
+                    continue
+                if self._should_share_identity(entity, context, subject["primary_entity"], subject["primary_context"]):
+                    subject["alias_hints"] = self._merge_resolution_subject_aliases(
+                        subject["alias_hints"],
+                        self._build_resolution_subject_alias_hints(entity, context),
+                    )
+                    if self._should_promote_group_primary(
+                        candidate_entity=entity,
+                        candidate_context=context,
+                        current_entity=subject["primary_entity"],
+                        current_context=subject["primary_context"],
+                    ):
+                        subject["primary_entity"] = entity
+                        subject["primary_context"] = context
+                        subject["primary_text"] = str(entity.get("text", "")).strip()
+                        subject["line"] = str(context.get("line", "") or "")
+                        subject["role_hint"] = str(context.get("role", "") or self._party_role_from_context(context) or "")
+                        subject["label"] = str(context.get("label", "") or "")
+                    merged = True
+                    break
+            if merged:
+                continue
+
+            canonical_role = str(entity.get("canonical_role", "")).strip().upper()
+            if not canonical_role:
+                if canonical_key == "PARTY_A":
+                    canonical_role = "PARTY_A"
+                elif canonical_key == "PARTY_B":
+                    canonical_role = "PARTY_B"
+                elif canonical_key == "PARTY_C":
+                    canonical_role = "PARTY_C"
+                elif family == "organization":
+                    canonical_role = "ORGANIZATION"
+                elif family == "person":
+                    canonical_role = "PERSON"
+                elif family == "project":
+                    canonical_role = "PROJECT"
+                elif family == "location":
+                    canonical_role = "LOCATION"
+                elif family == "bank":
+                    canonical_role = "BANK"
+
+            subject_catalog.append(
+                {
+                    "canonical_key": canonical_key,
+                    "canonical_role": canonical_role,
+                    "family": family,
+                    "type": entity_type,
+                    "primary_text": str(entity.get("text", "")).strip(),
+                    "role_hint": str(context.get("role", "") or self._party_role_from_context(context) or ""),
+                    "label": str(context.get("label", "") or ""),
+                    "line": str(context.get("line", "") or ""),
+                    "alias_hints": self._build_resolution_subject_alias_hints(entity, context),
+                    "primary_entity": entity,
+                    "primary_context": context,
+                }
+            )
+
+        return subject_catalog
+
+    def _merge_resolution_subject_aliases(
+        self,
+        left: List[str],
+        right: List[str],
+    ) -> List[str]:
+        merged: List[str] = []
+        seen_norms: set[str] = set()
+        for candidate in [*(left or []), *(right or [])]:
+            normalized = self._normalize_group_text(candidate)
+            if len(normalized) < 2 or normalized in seen_norms:
+                continue
+            seen_norms.add(normalized)
+            merged.append(candidate)
+            if len(merged) >= 8:
+                break
+        return merged
+
+    def _score_resolution_subject_candidate(
+        self,
+        *,
+        entity_type: str,
+        entity_text: str,
+        label: str,
+        role_hint: str,
+        subject: Dict[str, Any],
+    ) -> int:
+        family = self._resolution_subject_family(entity_type)
+        if not family or family != subject.get("family"):
+            return -1
+
+        if family == "person":
+            entity_norm = self._normalize_person_source_text(entity_text)
+        else:
+            entity_norm = self._normalize_group_text(entity_text)
+        if len(entity_norm) < 2:
+            return -1
+
+        alias_norms = {
+            self._normalize_person_source_text(item) if family == "person" else self._normalize_group_text(item)
+            for item in subject.get("alias_hints", [])
+            if item
+        }
+        primary_text = str(subject.get("primary_text", "") or "")
+        primary_norm = (
+            self._normalize_person_source_text(primary_text)
+            if family == "person"
+            else self._normalize_group_text(primary_text)
+        )
+
+        score = 0
+        identity_matched = False
+        if entity_norm == primary_norm or entity_norm in alias_norms:
+            score += 120
+            identity_matched = True
+        elif family == "organization" and self._share_organization_identity(entity_text, primary_text):
+            score += 95
+            identity_matched = True
+        elif family == "person" and self._share_person_identity(entity_norm, primary_norm):
+            score += 95
+            identity_matched = True
+        elif family == "project":
+            if entity_norm in primary_norm or primary_norm in entity_norm:
+                score += 80
+                identity_matched = True
+        elif family == "location":
+            if entity_norm in primary_norm or primary_norm in entity_norm:
+                score += 75
+                identity_matched = True
+        elif family == "bank" and "银行" in entity_text and "银行" in primary_text:
+            score += 80
+            identity_matched = True
+
+        if family == "person" and not identity_matched:
+            return -1
+        if family == "organization" and not identity_matched:
+            if not (
+                self._is_weak_organization_reference(entity_text)
+                or looks_like_organization_short_name(entity_text)
+                or (2 <= len(entity_norm) <= 8 and not self._looks_like_organization_name(entity_text))
+            ):
+                return -1
+
+        subject_role_hint = str(subject.get("role_hint", "") or "")
+        if role_hint and subject_role_hint and role_hint == subject_role_hint:
+            score += 36
+        if label and label == str(subject.get("label", "") or ""):
+            score += 12
+        if score == 0 and role_hint and subject_role_hint and role_hint == subject_role_hint:
+            score += 20
+        return score
+
+    def _build_prompt_subject_candidates(
+        self,
+        *,
+        prompt_item: Dict[str, str],
+        subject_catalog: List[Dict[str, Any]],
+    ) -> List[str]:
+        entity_type = str(prompt_item.get("type", "")).strip().upper()
+        entity_text = str(prompt_item.get("text", "")).strip()
+        label = str(prompt_item.get("label", "") or "")
+        role_hint = str(prompt_item.get("role_hint", "") or "")
+        existing_canonical_key = self._sanitize_canonical_key(prompt_item.get("existing_canonical_key"))
+        if self._is_transient_canonical_key(existing_canonical_key):
+            existing_canonical_key = ""
+
+        ranked: List[tuple[int, str]] = []
+        for subject in subject_catalog:
+            if existing_canonical_key and subject["canonical_key"] == existing_canonical_key:
+                ranked.append((1000, subject["canonical_key"]))
+                continue
+            score = self._score_resolution_subject_candidate(
+                entity_type=entity_type,
+                entity_text=entity_text,
+                label=label,
+                role_hint=role_hint,
+                subject=subject,
+            )
+            if score > 0:
+                ranked.append((score, subject["canonical_key"]))
+
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        candidate_keys: List[str] = []
+        for _, canonical_key in ranked:
+            if canonical_key not in candidate_keys:
+                candidate_keys.append(canonical_key)
+            if len(candidate_keys) >= 6:
+                break
+
+        if self._should_expand_subject_candidates(
+            entity_type=entity_type,
+            entity_text=entity_text,
+            existing_canonical_key=existing_canonical_key,
+            current_candidates=candidate_keys,
+        ):
+            supplemental = self._build_fallback_subject_candidates(
+                entity_type=entity_type,
+                label=label,
+                role_hint=role_hint,
+                subject_catalog=subject_catalog,
+                exclude_keys=set(candidate_keys),
+            )
+            for canonical_key in supplemental:
+                if canonical_key not in candidate_keys:
+                    candidate_keys.append(canonical_key)
+                if len(candidate_keys) >= 6:
+                    break
+        return candidate_keys
+
+    def _should_expand_subject_candidates(
+        self,
+        *,
+        entity_type: str,
+        entity_text: str,
+        existing_canonical_key: str,
+        current_candidates: List[str],
+    ) -> bool:
+        if existing_canonical_key or entity_type not in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME"}:
+            return False
+        if len(current_candidates) >= 2:
+            return False
+        if self._is_weak_organization_reference(entity_text):
+            return True
+        if looks_like_organization_short_name(entity_text):
+            return True
+        normalized = self._normalize_group_text(entity_text)
+        return 2 <= len(normalized) <= 8 and not self._looks_like_organization_name(entity_text)
+
+    def _build_fallback_subject_candidates(
+        self,
+        *,
+        entity_type: str,
+        label: str,
+        role_hint: str,
+        subject_catalog: List[Dict[str, Any]],
+        exclude_keys: set[str],
+    ) -> List[str]:
+        family = self._resolution_subject_family(entity_type)
+        if family != "organization":
+            return []
+
+        ranked: List[tuple[int, str]] = []
+        for subject in subject_catalog:
+            if subject.get("family") != "organization":
+                continue
+            canonical_key = str(subject.get("canonical_key", "") or "")
+            if not canonical_key or canonical_key in exclude_keys:
+                continue
+            score = 0
+            subject_role_hint = str(subject.get("role_hint", "") or "")
+            subject_label = str(subject.get("label", "") or "")
+            if role_hint and subject_role_hint and role_hint == subject_role_hint:
+                score += 60
+            if label and subject_label and label == subject_label:
+                score += 32
+            if canonical_key in {"PARTY_A", "PARTY_B", "PARTY_C"}:
+                score += 24
+            if subject_role_hint in {"甲方", "乙方", "丙方"}:
+                score += 12
+            score += min(len(str(subject.get("primary_text", "") or "")), 18)
+            score += min(len(subject.get("alias_hints", []) or []), 5)
+            ranked.append((score, canonical_key))
+
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        return [canonical_key for _, canonical_key in ranked[:4]]
+
+    def _build_resolution_review_bundle(
         self,
         *,
         text: str,
         entities: List[Dict],
-        use_llm: bool,
-        operator_config: Optional[Dict[str, Dict]] = None,
+        contexts: List[Dict],
         llm_model: Optional[str] = None,
-        anonymization_strategy: Optional[str] = None,
-    ) -> List[Dict]:
-        prepared_entities = self._apply_metadata_identity_hints([dict(entity) for entity in entities])
-        prepared_entities = self._prune_invalid_entities(prepared_entities)
-        explicit_types = set((operator_config or {}).keys()) - {"default"}
-        strategy_key = get_anonymization_strategy_profile(anonymization_strategy).key
-        strategy_profile = get_llm_strategy_profile(llm_model or settings.get_default_llm_model()) if use_llm else None
-        precision_multi_review = bool(strategy_profile and strategy_profile.key == "precision_4b")
-        self.last_quality_metadata = {}
-        residual_rounds: List[Dict[str, Any]] = []
-        text_groups: Dict[str, Dict] = {}
-        group_keys: List[str] = []
-        contexts: List[Dict[str, Any]] = []
+        candidate_indexes: Optional[List[int]] = None,
+        candidate_limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        review_candidates: Dict[tuple[str, str], Dict[str, Any]] = {}
+        limit = self._get_review_entity_limit(llm_model, text_length=len(text)) if candidate_limit is None else int(candidate_limit)
+        allowed_indexes = set(candidate_indexes or [])
+        subject_catalog = self._build_resolution_subject_catalog(
+            entities=entities,
+            contexts=contexts,
+        )
 
-        max_rounds = 3 if precision_multi_review else (2 if use_llm else 1)
-        for round_index in range(max_rounds):
-            contexts = [self._build_context(text, entity) for entity in prepared_entities]
-            text_groups, group_keys = self._group_entities_by_identity(
-                prepared_entities,
-                contexts,
-                explicit_types,
-            )
-            entity_memory = self._build_entity_memory(text_groups)
-            residual_entities = self._materialize_residual_entities(
-                text=text,
-                entities=prepared_entities,
-                entity_memory=entity_memory,
-                explicit_types=explicit_types,
-            )
-            residual_rounds.append(
-                {
-                    "round": round_index + 1,
-                    "memory_groups": len(entity_memory),
-                    "residual_entities_added": len(residual_entities),
+        for entity_index, (entity, context) in enumerate(zip(entities, contexts)):
+            if candidate_indexes is not None and entity_index not in allowed_indexes:
+                continue
+            entity_type = str(entity.get("type", "")).strip().upper()
+            entity_text = str(entity.get("text", "")).strip()
+            if entity_type not in self.REVIEW_PROMPT_TYPES or not entity_text:
+                continue
+
+            signature = self._review_prompt_signature(entity, context)
+            if not signature[1]:
+                continue
+
+            candidate = review_candidates.get(signature)
+            candidate_priority = self._review_prompt_priority(entity, context)
+            prompt_item = {
+                "type": entity_type,
+                "text": entity_text,
+                "label": context.get("label") or "",
+                "role_hint": context.get("role") or "",
+                "line": context.get("line") or "",
+                "local_context": context.get("window_text") or context.get("line") or "",
+                "previous_line": context.get("previous_line") or "",
+                "next_line": context.get("next_line") or "",
+                "existing_canonical_key": self._canonical_key_from_entity(entity),
+                "existing_canonical_role": str(entity.get("canonical_role", "")).strip().upper(),
+            }
+            if candidate is None:
+                review_candidates[signature] = {
+                    "entity_indexes": [entity_index],
+                    "priority": candidate_priority,
+                    "prompt_item": prompt_item,
+                    "sort_text": entity_text,
                 }
-            )
-            if not residual_entities:
-                break
-            prepared_entities.extend(residual_entities)
-            prepared_entities = self._sort_and_deduplicate_entities(prepared_entities)
-            prepared_entities = self._apply_metadata_identity_hints(prepared_entities)
-            prepared_entities = self._prune_invalid_entities(prepared_entities)
+                continue
 
-        contexts = [self._build_context(text, entity) for entity in prepared_entities]
-        text_groups, group_keys = self._group_entities_by_identity(
+            candidate["entity_indexes"].append(entity_index)
+            if candidate_priority > int(candidate["priority"]):
+                candidate["priority"] = candidate_priority
+                candidate["prompt_item"] = prompt_item
+                candidate["sort_text"] = entity_text
+
+        ordered_candidates = sorted(
+            review_candidates.values(),
+            key=lambda item: (
+                -int(item["priority"]),
+                -len(str(item["sort_text"])),
+                str(item["sort_text"]),
+            ),
+        )
+        if limit > 0:
+            ordered_candidates = ordered_candidates[:limit]
+
+        prompt_items: List[Dict[str, str]] = []
+        entity_indexes_by_id: Dict[str, List[int]] = {}
+        allowed_canonical_keys_by_id: Dict[str, List[str]] = {}
+        for prompt_index, candidate in enumerate(ordered_candidates, start=1):
+            item_id = f"E{prompt_index}"
+            prompt_item = dict(candidate["prompt_item"])
+            prompt_item["id"] = item_id
+            prompt_item["candidate_subject_keys"] = self._build_prompt_subject_candidates(
+                prompt_item=prompt_item,
+                subject_catalog=subject_catalog,
+            )
+            prompt_items.append(prompt_item)
+            entity_indexes_by_id[item_id] = list(candidate["entity_indexes"])
+            allowed_canonical_keys_by_id[item_id] = list(prompt_item.get("candidate_subject_keys") or [])
+
+        focus_contexts = (
+            [contexts[index] for index in sorted(allowed_indexes) if 0 <= index < len(contexts)]
+            if candidate_indexes is not None
+            else contexts
+        )
+        focus_text = text
+        if candidate_indexes is not None:
+            focus_blocks: List[str] = []
+            seen_focus_blocks: set[str] = set()
+            for context in focus_contexts:
+                block = str(context.get("line", "") or "").strip()
+                if not block or block in seen_focus_blocks:
+                    continue
+                seen_focus_blocks.add(block)
+                focus_blocks.append(block)
+            if focus_blocks:
+                focus_text = "\n".join(focus_blocks)
+        focus_lines = self._collect_review_focus_lines(
+            text=focus_text,
+            contexts=focus_contexts,
+            max_lines=self._get_review_focus_line_limit(llm_model, text_length=len(text)),
+        )
+        return {
+            "prompt_items": prompt_items,
+            "focus_lines": focus_lines,
+            "entity_indexes_by_id": entity_indexes_by_id,
+            "allowed_canonical_keys_by_id": allowed_canonical_keys_by_id,
+            "subject_catalog": [
+                {
+                    "canonical_key": item["canonical_key"],
+                    "canonical_role": item["canonical_role"],
+                    "type": item["type"],
+                    "primary_text": item["primary_text"],
+                    "role_hint": item["role_hint"],
+                    "label": item["label"],
+                    "line": item["line"],
+                    "alias_hints": item["alias_hints"],
+                }
+                for item in subject_catalog
+            ],
+        }
+
+    def _apply_resolution_updates(
+        self,
+        *,
+        refined_entities: List[Dict],
+        updates_by_id: Dict[str, Dict[str, Any]],
+        entity_indexes_by_id: Dict[str, List[int]],
+        allowed_canonical_keys_by_id: Dict[str, List[str]],
+        allow_drop: bool = False,
+    ) -> set[int]:
+        dropped_indexes: set[int] = set()
+        for item_id, entity_indexes in entity_indexes_by_id.items():
+            update = updates_by_id.get(item_id)
+            if not update:
+                continue
+
+            action = str(update.get("action", "")).strip().lower()
+            should_drop = allow_drop and (
+                action in {"drop", "reject", "remove", "delete"}
+                or bool(update.get("drop")) is True
+                or update.get("keep") is False
+            )
+            canonical_key = self._sanitize_canonical_key(update.get("canonical_key"))
+            canonical_role = str(update.get("canonical_role", "")).strip().upper()
+            allowed_canonical_keys = {
+                self._sanitize_canonical_key(value)
+                for value in allowed_canonical_keys_by_id.get(item_id, [])
+                if self._sanitize_canonical_key(value)
+            }
+            for entity_index in entity_indexes:
+                if entity_index < 0 or entity_index >= len(refined_entities):
+                    continue
+                if should_drop:
+                    dropped_indexes.add(entity_index)
+                    continue
+                entity = refined_entities[entity_index]
+                existing_canonical_key = self._canonical_key_from_entity(entity)
+                resolved_canonical_key = canonical_key
+                if resolved_canonical_key and not allowed_canonical_keys and not existing_canonical_key:
+                    resolved_canonical_key = ""
+                if resolved_canonical_key and allowed_canonical_keys and resolved_canonical_key not in allowed_canonical_keys:
+                    resolved_canonical_key = (
+                        existing_canonical_key if existing_canonical_key in allowed_canonical_keys else ""
+                    )
+                if resolved_canonical_key:
+                    entity["canonical_key"] = resolved_canonical_key
+                if canonical_role in self.RESOLUTION_ROLES:
+                    entity["canonical_role"] = canonical_role
+        if dropped_indexes:
+            refined_entities[:] = [
+                entity
+                for index, entity in enumerate(refined_entities)
+                if index not in dropped_indexes
+            ]
+        return dropped_indexes
+
+    def _assign_distinct_short_org_canonical_keys(
+        self,
+        *,
+        refined_entities: List[Dict],
+        text: str,
+        contexts: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        used_keys = {
+            self._canonical_key_from_entity(entity)
+            for entity in refined_entities
+            if self._canonical_key_from_entity(entity)
+        }
+        occurrence_index = 0
+        if contexts is None or len(contexts) != len(refined_entities):
+            contexts = [self._build_context(text, entity) for entity in refined_entities]
+        for entity, context in zip(refined_entities, contexts):
+            entity_type = str(entity.get("type", "")).strip().upper()
+            if entity_type not in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME"}:
+                continue
+            if self._canonical_key_from_entity(entity):
+                continue
+            entity_text = str(entity.get("text", "")).strip()
+            if not looks_like_organization_short_name(entity_text):
+                continue
+            if not self._requires_occurrence_level_resolution(entity, context):
+                continue
+            occurrence_index += 1
+            candidate_key = f"ORG_OCC_{occurrence_index}"
+            while candidate_key in used_keys:
+                occurrence_index += 1
+                candidate_key = f"ORG_OCC_{occurrence_index}"
+            entity["canonical_key"] = candidate_key
+            if not str(entity.get("canonical_role", "")).strip().upper():
+                entity["canonical_role"] = "ORGANIZATION"
+            used_keys.add(candidate_key)
+
+    def _assign_large_document_provisional_canonical_keys(
+        self,
+        *,
+        refined_entities: List[Dict[str, Any]],
+        contexts: List[Dict[str, Any]],
+    ) -> None:
+        used_keys = {
+            self._canonical_key_from_entity(entity)
+            for entity in refined_entities
+            if self._canonical_key_from_entity(entity)
+        }
+        occurrence_index = 0
+        for entity, context in zip(refined_entities, contexts):
+            entity_type = str(entity.get("type", "")).strip().upper()
+            if entity_type not in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME"}:
+                continue
+            if self._canonical_key_from_entity(entity):
+                continue
+            if not self._requires_occurrence_level_resolution(entity, context):
+                continue
+            occurrence_index += 1
+            candidate_key = f"ORG_OCC_{occurrence_index}"
+            while candidate_key in used_keys:
+                occurrence_index += 1
+                candidate_key = f"ORG_OCC_{occurrence_index}"
+            entity["canonical_key"] = candidate_key
+            if not str(entity.get("canonical_role", "")).strip().upper():
+                entity["canonical_role"] = "ORGANIZATION"
+            metadata = dict(entity.get("metadata") or {})
+            metadata["provisional_canonical"] = True
+            entity["metadata"] = metadata
+            used_keys.add(candidate_key)
+
+    def _cleanup_provisional_canonical_markers(
+        self,
+        *,
+        refined_entities: List[Dict[str, Any]],
+    ) -> None:
+        for entity in refined_entities:
+            metadata = dict(entity.get("metadata") or {})
+            if not metadata.get("provisional_canonical"):
+                continue
+            canonical_key = self._canonical_key_from_entity(entity)
+            if canonical_key.startswith("ORG_OCC_"):
+                entity["metadata"] = metadata
+                continue
+            metadata.pop("provisional_canonical", None)
+            if metadata:
+                entity["metadata"] = metadata
+            else:
+                entity.pop("metadata", None)
+
+    def _prepare_large_document_group_state(
+        self,
+        *,
+        text: str,
+        entities: List[Dict[str, Any]],
+        explicit_types: set[str],
+        assign_provisional: bool = True,
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Dict[str, Any]], List[str], Dict[str, Dict[str, Any]]]:
+        prepared_entities = self._apply_metadata_identity_hints(
+            [dict(entity) for entity in entities],
+            materialize_short_org_hints=False,
+        )
+        prepared_entities = self._prune_invalid_entities_for_large_document(
+            entities=prepared_entities,
+            text=text,
+        )
+        contexts = [self._build_minimal_context(text, entity) for entity in prepared_entities]
+        if assign_provisional:
+            self._assign_large_document_provisional_canonical_keys(
+                refined_entities=prepared_entities,
+                contexts=contexts,
+            )
+        groups, group_keys = self._group_entities_by_identity(
             prepared_entities,
             contexts,
             explicit_types,
         )
-        entity_memory = self._build_entity_memory(text_groups)
+        entity_memory = self._build_entity_memory(groups)
+        return prepared_entities, contexts, groups, group_keys, entity_memory
+
+    def _is_provisional_canonical_entity(self, entity: Dict[str, Any]) -> bool:
+        metadata = entity.get("metadata") or {}
+        if metadata.get("provisional_canonical"):
+            return True
+        raw_key = self._sanitize_canonical_key(entity.get("canonical_key"))
+        if not raw_key:
+            raw_key = self._sanitize_canonical_key(metadata.get("canonical_key"))
+        return self._is_transient_canonical_key(raw_key)
+
+    def _stable_canonical_key_from_entity(self, entity: Dict[str, Any]) -> str:
+        return self._canonical_key_from_entity(entity)
+
+    def _stabilize_large_document_subjects(
+        self,
+        *,
+        refined_entities: List[Dict[str, Any]],
+        contexts: List[Dict[str, Any]],
+        force_remaining: bool = False,
+    ) -> None:
+        provisional_clusters: Dict[tuple[str, str, str], Dict[str, Any]] = {}
+        stable_keys = {
+            self._stable_canonical_key_from_entity(entity)
+            for entity in refined_entities
+            if self._stable_canonical_key_from_entity(entity)
+        }
+        organization_counter = 0
+
+        for index, (entity, context) in enumerate(zip(refined_entities, contexts)):
+            if not self._is_provisional_canonical_entity(entity):
+                continue
+            entity_type = str(entity.get("type", "")).strip().upper()
+            if entity_type not in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME"}:
+                continue
+            normalized = self._normalize_group_text(str(entity.get("text", "") or ""))
+            if len(normalized) < 2:
+                continue
+            cluster_key = (
+                normalized,
+                str(self._party_role_from_context(context) or context.get("role") or "").strip(),
+                str(context.get("label") or "").strip(),
+            )
+            cluster = provisional_clusters.setdefault(
+                cluster_key,
+                {
+                    "indexes": [],
+                    "normalized": normalized,
+                    "role_hint": str(self._party_role_from_context(context) or context.get("role") or "").strip(),
+                    "label": str(context.get("label") or "").strip(),
+                    "has_anchor": False,
+                },
+            )
+            cluster["indexes"].append(index)
+            metadata = entity.get("metadata") or {}
+            if (
+                metadata.get("definition_alias")
+                or metadata.get("definition_full_text")
+                or metadata.get("canonical")
+                or self._is_resolution_subject_anchor(entity, context)
+            ):
+                cluster["has_anchor"] = True
+
+        for cluster in provisional_clusters.values():
+            indexes = list(cluster.get("indexes") or [])
+            if not indexes:
+                continue
+            role_hint = str(cluster.get("role_hint") or "")
+            label = str(cluster.get("label") or "")
+            has_anchor = bool(cluster.get("has_anchor"))
+            occurrence_count = len(indexes)
+            should_stabilize = bool(role_hint or label or has_anchor or occurrence_count >= 2 or force_remaining)
+            if not should_stabilize:
+                continue
+
+            stable_key = ""
+            stable_role = "ORGANIZATION"
+            if role_hint == "甲方":
+                stable_key = "PARTY_A"
+                stable_role = "PARTY_A"
+            elif role_hint == "乙方":
+                stable_key = "PARTY_B"
+                stable_role = "PARTY_B"
+            elif role_hint == "丙方":
+                stable_key = "PARTY_C"
+                stable_role = "PARTY_C"
+            else:
+                organization_counter += 1
+                stable_key = f"ORG_LEDGER_{organization_counter}"
+                while stable_key in stable_keys:
+                    organization_counter += 1
+                    stable_key = f"ORG_LEDGER_{organization_counter}"
+
+            stable_keys.add(stable_key)
+            for index in indexes:
+                entity = refined_entities[index]
+                entity["canonical_key"] = stable_key
+                entity["canonical_role"] = stable_role
+                metadata = dict(entity.get("metadata") or {})
+                metadata.pop("provisional_canonical", None)
+                if metadata:
+                    entity["metadata"] = metadata
+                else:
+                    entity.pop("metadata", None)
+
+    async def _apply_large_document_resolution_state(
+        self,
+        *,
+        text: str,
+        entities: List[Dict[str, Any]],
+        explicit_types: set[str],
+        strategy_key: str,
+        use_llm: bool,
+        llm_model: Optional[str],
+        stabilize_subjects: bool = True,
+        assign_provisional: bool = True,
+    ) -> tuple[
+        List[Dict[str, Any]],
+        List[Dict[str, Any]],
+        Dict[str, Dict[str, Any]],
+        List[str],
+        Dict[str, Dict[str, Any]],
+        List[Dict[str, Any]],
+    ]:
+        prepared_entities, contexts, text_groups, group_keys, entity_memory = self._prepare_large_document_group_state(
+            text=text,
+            entities=entities,
+            explicit_types=explicit_types,
+            assign_provisional=assign_provisional,
+        )
+        if stabilize_subjects:
+            self._stabilize_large_document_subjects(
+                refined_entities=prepared_entities,
+                contexts=contexts,
+            )
+            self._cleanup_provisional_canonical_markers(
+                refined_entities=prepared_entities,
+            )
+            prepared_entities, contexts, text_groups, group_keys, entity_memory = self._prepare_large_document_group_state(
+                text=text,
+                entities=prepared_entities,
+                explicit_types=explicit_types,
+                assign_provisional=assign_provisional,
+            )
+
         replacement_bundle = self._build_deterministic_group_replacement_bundle(
             text_groups,
             strategy_key=strategy_key,
@@ -746,7 +2019,7 @@ class ContextualDesensitizationService:
         collision_suffixes = replacement_bundle["collision_suffixes"]
         llm_updates: Dict[str, str] = {}
 
-        if use_llm:
+        if use_llm and strategy_key != "symbolic_codes":
             llm_updates = await self._build_llm_group_replacements(
                 text_groups,
                 replacements,
@@ -763,6 +2036,17 @@ class ContextualDesensitizationService:
             entity["context_role"] = entity_context.get("role") or None
             if entity_type in explicit_types:
                 continue
+
+            if entity_type == "ALIAS":
+                alias_replacement = self._resolve_alias_replacement(
+                    entity=entity,
+                    text_groups=text_groups,
+                    replacements=replacements,
+                )
+                if alias_replacement:
+                    entity["replacement"] = alias_replacement
+                    entity["replacement_method"] = "contextual"
+                    continue
 
             if entity_type in self.GROUPABLE_TYPES:
                 group_key = group_keys[index]
@@ -809,12 +2093,254 @@ class ContextualDesensitizationService:
                 entity.pop("replacement", None)
                 entity["replacement_method"] = "preserve"
 
-        prepared_entities = self._harmonize_duplicate_text_replacements(prepared_entities)
+        prepared_entities = self._harmonize_duplicate_text_replacements(
+            prepared_entities,
+            group_keys=group_keys,
+            strategy_key=strategy_key,
+        )
+        prepared_entities = self._annotate_entities_with_evidence(
+            entities=prepared_entities,
+            contexts=contexts,
+            group_keys=group_keys,
+            entity_memory=entity_memory,
+        )
+        consistency_issues = self._collect_consistency_issues(
+            entities=prepared_entities,
+            group_keys=group_keys,
+            strategy_key=strategy_key,
+        )
+        return prepared_entities, contexts, text_groups, group_keys, entity_memory, consistency_issues
+
+    async def prepare_entities(
+        self,
+        *,
+        text: str,
+        entities: List[Dict],
+        use_llm: bool,
+        operator_config: Optional[Dict[str, Dict]] = None,
+        llm_model: Optional[str] = None,
+        anonymization_strategy: Optional[str] = None,
+        source_metadata: Optional[Dict[str, Any]] = None,
+        source_structure: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict]:
+        raw_entities = self._apply_metadata_identity_hints([dict(entity) for entity in entities])
+        prepared_entities = self._prune_invalid_entities(raw_entities, full_text=text)
+        explicit_types = set((operator_config or {}).keys()) - {"default"}
+        strategy_key = get_anonymization_strategy_profile(anonymization_strategy).key
+        strategy_profile = get_llm_strategy_profile(llm_model or settings.get_default_llm_model()) if use_llm else None
+        precision_multi_review = bool(strategy_profile and strategy_profile.key == "precision_4b")
+        self.last_quality_metadata = {}
+        residual_rounds: List[Dict[str, Any]] = []
+        text_groups: Dict[str, Dict] = {}
+        group_keys: List[str] = []
+        contexts: List[Dict[str, Any]] = []
+        large_document_policy = self._large_document_policy(
+            text=text,
+            entities=prepared_entities,
+            use_llm=use_llm,
+            precision_multi_review=precision_multi_review,
+            source_metadata=source_metadata,
+            source_structure=source_structure,
+        )
+        if large_document_policy["enabled"]:
+            return await self._prepare_entities_large_document_mode(
+                text=text,
+                prepared_entities=prepared_entities,
+                raw_entities=raw_entities,
+                explicit_types=explicit_types,
+                strategy_key=strategy_key,
+                use_llm=use_llm,
+                llm_model=llm_model,
+                strategy_profile=strategy_profile,
+                large_document_policy=large_document_policy,
+                source_metadata=source_metadata,
+                source_structure=source_structure,
+            )
+        prepared_entities, quality_metadata = await self._prepare_entities_standard_mode(
+            text=text,
+            prepared_entities=prepared_entities,
+            explicit_types=explicit_types,
+            strategy_key=strategy_key,
+            use_llm=use_llm,
+            llm_model=llm_model,
+            strategy_profile=strategy_profile,
+            quality_policy=large_document_policy,
+            source_metadata=source_metadata,
+            source_structure=source_structure,
+        )
+        self.last_quality_metadata = quality_metadata
+        return prepared_entities
+
+    async def _prepare_entities_standard_mode(
+        self,
+        *,
+        text: str,
+        prepared_entities: List[Dict[str, Any]],
+        explicit_types: set[str],
+        strategy_key: str,
+        use_llm: bool,
+        llm_model: Optional[str],
+        strategy_profile,
+        quality_policy: Dict[str, Any],
+        run_llm_refine: bool = True,
+        materialize_short_org_hints: bool = True,
+        source_metadata: Optional[Dict[str, Any]] = None,
+        source_structure: Optional[Dict[str, Any]] = None,
+    ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        prepared_entities = [dict(entity) for entity in prepared_entities]
+        residual_rounds: List[Dict[str, Any]] = []
+        text_groups: Dict[str, Dict] = {}
+        group_keys: List[str] = []
+        contexts: List[Dict[str, Any]] = []
+
+        max_rounds = int(quality_policy["recall_rounds"])
+        for round_index in range(max_rounds):
+            contexts = [self._build_context(text, entity) for entity in prepared_entities]
+            text_groups, group_keys = self._group_entities_by_identity(
+                prepared_entities,
+                contexts,
+                explicit_types,
+            )
+            entity_memory = self._build_entity_memory(text_groups)
+            residual_entities = self._materialize_residual_entities(
+                text=text,
+                entities=prepared_entities,
+                entity_memory=entity_memory,
+                explicit_types=explicit_types,
+                max_added=int(quality_policy["max_residual_entity_additions"]),
+            )
+            residual_rounds.append(
+                {
+                    "round": round_index + 1,
+                    "memory_groups": len(entity_memory),
+                    "residual_entities_added": len(residual_entities),
+                }
+            )
+            if not residual_entities:
+                break
+            prepared_entities.extend(residual_entities)
+            prepared_entities = self._sort_and_deduplicate_entities(prepared_entities)
+            prepared_entities = self._apply_metadata_identity_hints(
+                prepared_entities,
+                materialize_short_org_hints=materialize_short_org_hints,
+            )
+            prepared_entities = self._prune_invalid_entities(prepared_entities, full_text=text)
+
+        if prepared_entities and use_llm and run_llm_refine:
+            prepared_entities = await self.refine_recognition_entities(
+                text=text,
+                entities=prepared_entities,
+                use_llm=True,
+                llm_model=llm_model,
+                source_metadata=source_metadata,
+                source_structure=source_structure,
+            )
+            prepared_entities = self._apply_metadata_identity_hints(
+                prepared_entities,
+                materialize_short_org_hints=materialize_short_org_hints,
+            )
+            prepared_entities = self._prune_invalid_entities(prepared_entities, full_text=text)
+
+        contexts = [self._build_context(text, entity) for entity in prepared_entities]
+        text_groups, group_keys = self._group_entities_by_identity(
+            prepared_entities,
+            contexts,
+            explicit_types,
+        )
+        entity_memory = self._build_entity_memory(text_groups)
+        replacement_bundle = self._build_deterministic_group_replacement_bundle(
+            text_groups,
+            strategy_key=strategy_key,
+        )
+        replacements = replacement_bundle["replacements"]
+        base_replacements = replacement_bundle["base_replacements"]
+        collision_suffixes = replacement_bundle["collision_suffixes"]
+        llm_updates: Dict[str, str] = {}
+
+        if use_llm and strategy_key != "symbolic_codes":
+            llm_updates = await self._build_llm_group_replacements(
+                text_groups,
+                replacements,
+                llm_model=llm_model,
+            )
+            replacements.update(llm_updates)
+
+        amount_cluster_values = self._build_amount_cluster_values(prepared_entities, contexts)
+
+        for index, entity in enumerate(prepared_entities):
+            entity_type = entity["type"]
+            entity_context = contexts[index]
+            entity["context_label"] = entity_context.get("label") or None
+            entity["context_role"] = entity_context.get("role") or None
+            if entity_type in explicit_types:
+                continue
+
+            if entity_type == "ALIAS":
+                alias_replacement = self._resolve_alias_replacement(
+                    entity=entity,
+                    text_groups=text_groups,
+                    replacements=replacements,
+                )
+                if alias_replacement:
+                    entity["replacement"] = alias_replacement
+                    entity["replacement_method"] = "contextual"
+                    continue
+
+            if entity_type in self.GROUPABLE_TYPES:
+                group_key = group_keys[index]
+                replacement = replacements.get(group_key)
+                if replacement:
+                    metadata = dict(entity.get("metadata") or {})
+                    if group_key not in llm_updates:
+                        rendered_replacement, replacement_family_key = self._render_group_replacement(
+                            entity=entity,
+                            context=entity_context,
+                            group=text_groups[group_key],
+                            group_key=group_key,
+                            default_replacement=replacement,
+                            base_replacement=base_replacements.get(group_key, replacement),
+                            collision_suffix=collision_suffixes.get(group_key, ""),
+                            strategy_key=strategy_key,
+                        )
+                        replacement = rendered_replacement
+                        if replacement_family_key:
+                            metadata["replacement_family_key"] = replacement_family_key
+                    if self._should_preserve_surface_replacement(entity_type, entity.get("text", ""), replacement):
+                        entity.pop("replacement", None)
+                        if metadata:
+                            entity["metadata"] = metadata
+                        entity["replacement_method"] = "preserve"
+                        continue
+                    entity["replacement"] = replacement
+                    if metadata:
+                        entity["metadata"] = metadata
+                    entity["replacement_method"] = (
+                        "llm_contextual" if group_key in llm_updates else "contextual"
+                    )
+                    continue
+
+            structured_replacement = self._build_structured_replacement(
+                entity=entity,
+                context=entity_context,
+                amount_cluster_values=amount_cluster_values,
+            )
+            if structured_replacement:
+                entity["replacement"] = structured_replacement
+                entity["replacement_method"] = "structured"
+            elif entity_type in self.PRESERVE_TYPES:
+                entity.pop("replacement", None)
+                entity["replacement_method"] = "preserve"
+
+        prepared_entities = self._harmonize_duplicate_text_replacements(
+            prepared_entities,
+            group_keys=group_keys,
+            strategy_key=strategy_key,
+        )
         repair_rounds: List[Dict[str, Any]] = []
         quality_gate_passed = False
         quality_gate_reason = ""
 
-        max_repair_rounds = 4 if precision_multi_review else 3
+        max_repair_rounds = int(quality_policy["repair_rounds"])
         for repair_index in range(max_repair_rounds):
             contexts = [self._build_context(text, entity) for entity in prepared_entities]
             text_groups, group_keys = self._group_entities_by_identity(
@@ -832,12 +2358,15 @@ class ContextualDesensitizationService:
             consistency_issues = self._collect_consistency_issues(
                 entities=prepared_entities,
                 group_keys=group_keys,
+                strategy_key=strategy_key,
             )
             residual_hits = self._collect_residual_hits(
                 text=text,
                 entities=prepared_entities,
                 entity_memory=entity_memory,
                 explicit_types=explicit_types,
+                max_hits=int(quality_policy["max_residual_hits"]),
+                allow_weak_org_refs=bool(quality_policy["allow_weak_org_refs"]),
             )
             quality_gate_passed = not consistency_issues and not residual_hits
             repair_rounds.append(
@@ -861,12 +2390,13 @@ class ContextualDesensitizationService:
                 entity_memory=entity_memory,
                 consistency_issues=consistency_issues,
                 residual_hits=residual_hits,
+                max_residual_hit_additions=int(quality_policy["max_residual_hit_repairs"]),
             )
             if not repaired:
                 quality_gate_reason = self._summarize_quality_gate_failure(consistency_issues, residual_hits)
                 break
 
-        prepared_entities = self._prune_invalid_entities(prepared_entities)
+        prepared_entities = self._prune_invalid_entities(prepared_entities, full_text=text)
         contexts = [self._build_context(text, entity) for entity in prepared_entities]
         text_groups, group_keys = self._group_entities_by_identity(
             prepared_entities,
@@ -883,18 +2413,23 @@ class ContextualDesensitizationService:
         consistency_issues = self._collect_consistency_issues(
             entities=prepared_entities,
             group_keys=group_keys,
+            strategy_key=strategy_key,
         )
         residual_hits = self._collect_residual_hits(
             text=text,
             entities=prepared_entities,
             entity_memory=entity_memory,
             explicit_types=explicit_types,
+            max_hits=int(quality_policy["max_residual_hits"]),
+            allow_weak_org_refs=bool(quality_policy["allow_weak_org_refs"]),
         )
         quality_gate_passed = not consistency_issues and not residual_hits
         if not quality_gate_reason and not quality_gate_passed:
             quality_gate_reason = self._summarize_quality_gate_failure(consistency_issues, residual_hits)
-        self.last_quality_metadata = {
+        quality_metadata = {
             "engine_strategy": strategy_profile.key if strategy_profile else "rules_only",
+            "large_document_mode": bool(quality_policy["enabled"]),
+            "large_document_policy": quality_policy,
             "recall_passes": residual_rounds,
             "repair_rounds": repair_rounds,
             "entity_memory_groups": len(entity_memory),
@@ -915,9 +2450,2247 @@ class ContextualDesensitizationService:
                 for key, value in list(entity_memory.items())[:20]
             ],
         }
+        return prepared_entities, quality_metadata
+
+    async def _prepare_entities_large_document_mode(
+        self,
+        *,
+        text: str,
+        prepared_entities: List[Dict],
+        raw_entities: List[Dict],
+        explicit_types: set[str],
+        strategy_key: str,
+        use_llm: bool,
+        llm_model: Optional[str],
+        strategy_profile,
+        large_document_policy: Dict[str, Any],
+        source_metadata: Optional[Dict[str, Any]] = None,
+        source_structure: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict]:
+        page_chunk_plan = self._build_large_document_page_batches(
+            text=text,
+            source_metadata=source_metadata,
+            source_structure=source_structure,
+            batch_page_count=10,
+        )
+        if page_chunk_plan:
+            return await self._prepare_entities_large_document_paged_default_mode(
+                text=text,
+                prepared_entities=prepared_entities,
+                raw_entities=raw_entities,
+                explicit_types=explicit_types,
+                strategy_key=strategy_key,
+                use_llm=use_llm,
+                llm_model=llm_model,
+                strategy_profile=strategy_profile,
+                large_document_policy=large_document_policy,
+                page_chunk_plan=page_chunk_plan,
+            )
+
+        residual_rounds: List[Dict[str, Any]] = []
+        repair_rounds: List[Dict[str, Any]] = []
+        quality_gate_reason = ""
+        context_mode = "minimal"
+        prepared_entities = self._restore_large_document_anchor_entities(
+            text=text,
+            prepared_entities=prepared_entities,
+            raw_entities=raw_entities,
+        )
+        chunk_plan = self._build_large_document_chunks(
+            text=text,
+            llm_model=llm_model,
+        )
+        contexts = [self._build_minimal_context(text, entity) for entity in prepared_entities]
+        initial_subset_review: Dict[str, Any] = {
+            "candidate_count": 0,
+            "prompt_count": 0,
+            "updated_entity_count": 0,
+            "extra_entity_count": 0,
+            "applied": False,
+            "chunk_count": 0,
+            "reviewed_chunk_count": 0,
+            "reviewed_chunks": [],
+        }
+        if prepared_entities and use_llm:
+            initial_review_plan = self._build_large_document_initial_review_plan(
+                text=text,
+                entities=prepared_entities,
+                contexts=contexts,
+                chunks=chunk_plan,
+                llm_model=llm_model,
+            )
+            initial_subset_review = await self._run_large_document_chunked_review(
+                text=text,
+                refined_entities=prepared_entities,
+                contexts=contexts,
+                review_plan=initial_review_plan,
+                llm_model=llm_model,
+            )
+            prepared_entities = self._apply_metadata_identity_hints(prepared_entities)
+            prepared_entities = self._prune_invalid_entities_for_large_document(
+                entities=prepared_entities,
+                text=text,
+            )
+            contexts = [self._build_minimal_context(text, entity) for entity in prepared_entities]
+
+        (
+            prepared_entities,
+            contexts,
+            text_groups,
+            group_keys,
+            entity_memory,
+            consistency_issues,
+        ) = await self._apply_large_document_resolution_state(
+            text=text,
+            entities=prepared_entities,
+            explicit_types=explicit_types,
+            strategy_key=strategy_key,
+            use_llm=use_llm,
+            llm_model=llm_model,
+        )
+        residual_entities, residual_chunk_stats = self._materialize_large_document_residual_entities(
+            text=text,
+            entities=prepared_entities,
+            entity_memory=entity_memory,
+            explicit_types=explicit_types,
+            chunks=chunk_plan,
+            max_added=int(large_document_policy["max_residual_entity_additions"]),
+        )
+        if residual_entities:
+            prepared_entities.extend(residual_entities)
+            (
+                prepared_entities,
+                contexts,
+                text_groups,
+                group_keys,
+                entity_memory,
+                consistency_issues,
+            ) = await self._apply_large_document_resolution_state(
+                text=text,
+                entities=prepared_entities,
+                explicit_types=explicit_types,
+                strategy_key=strategy_key,
+                use_llm=use_llm,
+                llm_model=llm_model,
+            )
+        residual_rounds.append(
+            {
+                "round": 1,
+                "memory_groups": len(entity_memory),
+                "residual_entities_added": len(residual_entities),
+                "chunk_count": len(chunk_plan),
+                "chunk_stats": residual_chunk_stats[:20],
+                "mode": "isolated_large_document_chunked",
+            }
+        )
+        residual_hits, residual_hit_chunk_stats = self._collect_large_document_residual_hits(
+            text=text,
+            entities=prepared_entities,
+            entity_memory=entity_memory,
+            explicit_types=explicit_types,
+            chunks=chunk_plan,
+            max_hits=int(large_document_policy["max_residual_hits"]),
+            allow_weak_org_refs=bool(large_document_policy["allow_weak_org_refs"]),
+        )
+        final_review_subset = self._collect_large_document_review_subset(
+            entities=prepared_entities,
+            consistency_issues=consistency_issues,
+            residual_hits=residual_hits,
+        )
+        final_subset_review: Dict[str, Any] = {
+            "candidate_count": 0,
+            "prompt_count": 0,
+            "updated_entity_count": 0,
+            "extra_entity_count": 0,
+            "dropped_entity_count": 0,
+            "applied": False,
+            "chunk_count": 0,
+            "reviewed_chunk_count": 0,
+            "reviewed_chunks": [],
+        }
+        final_quality_gate_review: Dict[str, Any] = {
+            "candidate_count": 0,
+            "prompt_count": 0,
+            "updated_entity_count": 0,
+            "extra_entity_count": 0,
+            "dropped_entity_count": 0,
+            "applied": False,
+            "chunk_count": 0,
+            "reviewed_chunk_count": 0,
+            "reviewed_chunks": [],
+        }
+        if use_llm:
+            residual_review_entities = self._build_large_document_residual_review_entities(
+                residual_hits=residual_hits,
+            )
+            final_review_plan = self._build_large_document_subset_review_plan(
+                entities=prepared_entities,
+                chunks=chunk_plan,
+                review_subset=final_review_subset,
+                extra_review_entities=residual_review_entities,
+            )
+            final_subset_review = await self._run_large_document_chunked_review(
+                text=text,
+                refined_entities=prepared_entities,
+                contexts=contexts,
+                review_plan=final_review_plan,
+                llm_model=llm_model,
+            )
+            if final_subset_review.get("applied"):
+                (
+                    prepared_entities,
+                    contexts,
+                    text_groups,
+                    group_keys,
+                    entity_memory,
+                    consistency_issues,
+                ) = await self._apply_large_document_resolution_state(
+                    text=text,
+                    entities=prepared_entities,
+                    explicit_types=explicit_types,
+                    strategy_key=strategy_key,
+                    use_llm=use_llm,
+                    llm_model=llm_model,
+                )
+                residual_hits, residual_hit_chunk_stats = self._collect_large_document_residual_hits(
+                    text=text,
+                    entities=prepared_entities,
+                    entity_memory=entity_memory,
+                    explicit_types=explicit_types,
+                    chunks=chunk_plan,
+                    max_hits=int(large_document_policy["max_residual_hits"]),
+                    allow_weak_org_refs=bool(large_document_policy["allow_weak_org_refs"]),
+                )
+                final_review_subset = self._collect_large_document_review_subset(
+                    entities=prepared_entities,
+                    consistency_issues=consistency_issues,
+                    residual_hits=residual_hits,
+                )
+
+        repaired = False
+        if consistency_issues or residual_hits:
+            prepared_entities, repaired = self._repair_quality_issues(
+                text=text,
+                entities=prepared_entities,
+                explicit_types=explicit_types,
+                strategy_key=strategy_key,
+                group_keys=group_keys,
+                groups=text_groups,
+                entity_memory=entity_memory,
+                consistency_issues=consistency_issues,
+                residual_hits=residual_hits,
+                max_residual_hit_additions=int(large_document_policy["max_residual_hit_repairs"]),
+            )
+            if repaired:
+                (
+                    prepared_entities,
+                    contexts,
+                    text_groups,
+                    group_keys,
+                    entity_memory,
+                    consistency_issues,
+                ) = await self._apply_large_document_resolution_state(
+                    text=text,
+                    entities=prepared_entities,
+                    explicit_types=explicit_types,
+                    strategy_key=strategy_key,
+                    use_llm=use_llm,
+                    llm_model=llm_model,
+                )
+                residual_hits, residual_hit_chunk_stats = self._collect_large_document_residual_hits(
+                    text=text,
+                    entities=prepared_entities,
+                    entity_memory=entity_memory,
+                    explicit_types=explicit_types,
+                    chunks=chunk_plan,
+                    max_hits=int(large_document_policy["max_residual_hits"]),
+                    allow_weak_org_refs=bool(large_document_policy["allow_weak_org_refs"]),
+                )
+                final_review_subset = self._collect_large_document_review_subset(
+                    entities=prepared_entities,
+                    consistency_issues=consistency_issues,
+                    residual_hits=residual_hits,
+                )
+
+        (
+            prepared_entities,
+            contexts,
+            text_groups,
+            group_keys,
+            entity_memory,
+            consistency_issues,
+        ) = await self._finalize_large_document_subject_state(
+            text=text,
+            entities=prepared_entities,
+            explicit_types=explicit_types,
+            strategy_key=strategy_key,
+            use_llm=use_llm,
+            llm_model=llm_model,
+        )
+        residual_hits, residual_hit_chunk_stats = self._collect_large_document_residual_hits(
+            text=text,
+            entities=prepared_entities,
+            entity_memory=entity_memory,
+            explicit_types=explicit_types,
+            chunks=chunk_plan,
+            max_hits=int(large_document_policy["max_residual_hits"]),
+            allow_weak_org_refs=bool(large_document_policy["allow_weak_org_refs"]),
+        )
+        final_review_subset = self._collect_large_document_review_subset(
+            entities=prepared_entities,
+            consistency_issues=consistency_issues,
+            residual_hits=residual_hits,
+        )
+        if use_llm:
+            final_quality_gate_review = await self._run_large_document_final_quality_gate(
+                text=text,
+                refined_entities=prepared_entities,
+                contexts=contexts,
+                chunks=chunk_plan,
+                residual_hits=residual_hits,
+                llm_model=llm_model,
+            )
+            if final_quality_gate_review.get("applied"):
+                (
+                    prepared_entities,
+                    contexts,
+                    text_groups,
+                    group_keys,
+                    entity_memory,
+                    consistency_issues,
+                ) = await self._finalize_large_document_subject_state(
+                    text=text,
+                    entities=prepared_entities,
+                    explicit_types=explicit_types,
+                    strategy_key=strategy_key,
+                    use_llm=use_llm,
+                    llm_model=llm_model,
+                )
+                residual_hits, residual_hit_chunk_stats = self._collect_large_document_residual_hits(
+                    text=text,
+                    entities=prepared_entities,
+                    entity_memory=entity_memory,
+                    explicit_types=explicit_types,
+                    chunks=chunk_plan,
+                    max_hits=int(large_document_policy["max_residual_hits"]),
+                    allow_weak_org_refs=bool(large_document_policy["allow_weak_org_refs"]),
+                )
+                final_review_subset = self._collect_large_document_review_subset(
+                    entities=prepared_entities,
+                    consistency_issues=consistency_issues,
+                    residual_hits=residual_hits,
+                )
+
+        subject_ledger = self._build_large_document_subject_ledger(
+            groups=text_groups,
+            entities=prepared_entities,
+            group_keys=group_keys,
+        )
+        terminal_issues = self._collect_large_document_terminal_issues(
+            entities=prepared_entities,
+        )
+        quality_gate_passed = not consistency_issues and not residual_hits and not terminal_issues
+        repair_rounds.append(
+            {
+                "round": 1,
+                "consistency_issue_count": len(consistency_issues),
+                "residual_hit_count": len(residual_hits),
+                "final_review_subset_count": len(final_review_subset),
+                "subject_ledger_count": len(subject_ledger),
+                "residual_chunk_count": len(residual_hit_chunk_stats),
+                "repair_applied": repaired,
+                "initial_subset_review_applied": bool(initial_subset_review.get("applied")),
+                "final_subset_review_applied": bool(final_subset_review.get("applied")),
+                "final_quality_gate_applied": bool(final_quality_gate_review.get("applied")),
+                "terminal_issue_count": len(terminal_issues),
+                "passed": quality_gate_passed,
+                "mode": "isolated_large_document_chunked",
+            }
+        )
+        if not quality_gate_passed:
+            quality_reasons: List[str] = []
+            summarized_failure = self._summarize_quality_gate_failure(consistency_issues, residual_hits)
+            if summarized_failure:
+                quality_reasons.append(summarized_failure)
+            terminal_summary = self._summarize_large_document_terminal_issues(terminal_issues)
+            if terminal_summary:
+                quality_reasons.append(terminal_summary)
+            quality_gate_reason = "; ".join(quality_reasons)
+
+        self.last_quality_metadata = {
+            "engine_strategy": strategy_profile.key if strategy_profile else "rules_only",
+            "large_document_mode": True,
+            "large_document_policy": large_document_policy,
+            "recall_passes": residual_rounds,
+            "repair_rounds": repair_rounds,
+            "entity_memory_groups": len(entity_memory),
+            "consistency_issues": consistency_issues,
+            "residual_hits": residual_hits,
+            "terminal_issues_count": len(terminal_issues),
+            "terminal_issues": terminal_issues[:20],
+            "quality_gate_passed": quality_gate_passed,
+            "quality_gate_reason": quality_gate_reason,
+            "arbitration_conflicts": sum(1 for item in entity_memory.values() if item.get("conflict")),
+            "context_mode": context_mode,
+            "chunk_context_mode": "minimal_chunked",
+            "chunk_count": len(chunk_plan),
+            "chunk_plan": [
+                {
+                    "index": int(chunk.get("index", 0)),
+                    "start": int(chunk.get("start", 0)),
+                    "end": int(chunk.get("end", 0)),
+                    "length": int(chunk.get("length", 0)),
+                    "line_count": int(chunk.get("line_count", 0)),
+                }
+                for chunk in chunk_plan[:24]
+            ],
+            "initial_subset_review": initial_subset_review,
+            "final_subset_review": final_subset_review,
+            "final_quality_gate_review": final_quality_gate_review,
+            "residual_recall_chunks": residual_chunk_stats[:20],
+            "residual_hit_chunks": residual_hit_chunk_stats[:20],
+            "final_review_subset_count": len(final_review_subset),
+            "final_review_subset": final_review_subset[:20],
+            "subject_ledger_count": len(subject_ledger),
+            "subject_ledger": subject_ledger[:20],
+            "evidence_summary": [
+                {
+                    "canonical_key": key,
+                    "primary_text": value.get("primary_text", ""),
+                    "source_layer": value.get("source_layer", ""),
+                    "conflict": bool(value.get("conflict")),
+                    "conflict_reasons": list(value.get("conflict_reasons", [])),
+                    "evidence_chain": list(value.get("evidence_chain", []))[:3],
+                }
+                for key, value in list(entity_memory.items())[:20]
+            ],
+            "execution_mode": "large_document_isolated_postprocess",
+            "large_document_execution_mode": "chunked_subset_review",
+            "final_result_quality_gate": bool(use_llm),
+        }
         return prepared_entities
 
-    def _apply_metadata_identity_hints(self, entities: List[Dict]) -> List[Dict]:
+    def _build_standard_quality_policy(
+        self,
+        *,
+        text: str,
+        entities: List[Dict[str, Any]],
+        use_llm: bool,
+        precision_multi_review: bool,
+    ) -> Dict[str, Any]:
+        return {
+            "enabled": False,
+            "text_length": len(text or ""),
+            "entity_count": len(entities),
+            "recall_rounds": 3 if precision_multi_review else (2 if use_llm else 1),
+            "repair_rounds": 4 if precision_multi_review else 3,
+            "max_residual_entity_additions": 500,
+            "max_residual_hits": 20,
+            "allow_weak_org_refs": True,
+            "max_residual_hit_repairs": 24,
+        }
+
+    async def _prepare_entities_large_document_paged_default_mode(
+        self,
+        *,
+        text: str,
+        prepared_entities: List[Dict[str, Any]],
+        raw_entities: List[Dict[str, Any]],
+        explicit_types: set[str],
+        strategy_key: str,
+        use_llm: bool,
+        llm_model: Optional[str],
+        strategy_profile,
+        large_document_policy: Dict[str, Any],
+        page_chunk_plan: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        precision_multi_review = bool(strategy_profile and strategy_profile.key == "precision_4b")
+        seed_entities = self._restore_large_document_anchor_entities(
+            text=text,
+            prepared_entities=prepared_entities,
+            raw_entities=raw_entities,
+        )
+        aggregated_entities: List[Dict[str, Any]] = []
+        batch_runs: List[Dict[str, Any]] = []
+
+        for batch in page_chunk_plan:
+            batch_text = str(batch.get("text", "") or "")
+            if not batch_text.strip():
+                batch_runs.append(
+                    {
+                        "batch_index": int(batch.get("index", 0)),
+                        "page_numbers": list(batch.get("page_numbers", [])),
+                        "input_entity_count": 0,
+                        "output_entity_count": 0,
+                        "quality_gate_passed": True,
+                        "quality_gate_reason": "",
+                    }
+                )
+                continue
+
+            local_entities = self._project_entities_to_page_batch(
+                entities=seed_entities,
+                batch=batch,
+            )
+            batch_policy = self._build_standard_quality_policy(
+                text=batch_text,
+                entities=local_entities,
+                use_llm=use_llm,
+                precision_multi_review=precision_multi_review,
+            )
+            batch_entities, batch_quality = await self._prepare_entities_standard_mode(
+                text=batch_text,
+                prepared_entities=local_entities,
+                explicit_types=explicit_types,
+                strategy_key=strategy_key,
+                use_llm=use_llm,
+                llm_model=llm_model,
+                strategy_profile=strategy_profile,
+                quality_policy=batch_policy,
+                run_llm_refine=True,
+            )
+            projected_entities = self._restore_page_batch_entities_to_global(
+                entities=batch_entities,
+                batch=batch,
+                full_text=text,
+            )
+            aggregated_entities.extend(
+                self._sanitize_entity_for_global_reconciliation(
+                    entity=item,
+                    batch_index=int(batch.get("index", 0)),
+                )
+                for item in projected_entities
+            )
+            batch_runs.append(
+                {
+                    "batch_index": int(batch.get("index", 0)),
+                    "page_numbers": list(batch.get("page_numbers", [])),
+                    "input_entity_count": len(local_entities),
+                    "output_entity_count": len(projected_entities),
+                    "quality_gate_passed": bool(batch_quality.get("quality_gate_passed")),
+                    "quality_gate_reason": str(batch_quality.get("quality_gate_reason", "") or ""),
+                }
+            )
+
+        return await self._finalize_large_document_page_batched_entities(
+            text=text,
+            aggregated_entities=aggregated_entities,
+            seed_entities=seed_entities,
+            raw_entities=raw_entities,
+            explicit_types=explicit_types,
+            strategy_key=strategy_key,
+            use_llm=use_llm,
+            llm_model=llm_model,
+            strategy_profile=strategy_profile,
+            large_document_policy=large_document_policy,
+            page_chunk_plan=page_chunk_plan,
+            batch_runs=batch_runs,
+        )
+
+    async def _finalize_large_document_page_batched_entities(
+        self,
+        *,
+        text: str,
+        aggregated_entities: List[Dict[str, Any]],
+        seed_entities: List[Dict[str, Any]],
+        raw_entities: List[Dict[str, Any]],
+        explicit_types: set[str],
+        strategy_key: str,
+        use_llm: bool,
+        llm_model: Optional[str],
+        strategy_profile,
+        large_document_policy: Dict[str, Any],
+        page_chunk_plan: List[Dict[str, Any]],
+        batch_runs: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        precision_multi_review = bool(strategy_profile and strategy_profile.key == "precision_4b")
+        finalized_batch_runs = list(batch_runs or [])
+        reconciled_entities = list(aggregated_entities)
+        reconciled_entities.extend(
+            self._sanitize_entity_for_global_reconciliation(entity=item)
+            for item in seed_entities
+        )
+        reconciled_entities = self._sort_and_deduplicate_entities(reconciled_entities)
+        reconciled_entities = self._apply_metadata_identity_hints(
+            reconciled_entities,
+            materialize_short_org_hints=False,
+        )
+        reconciled_entities = self._prune_invalid_entities_for_large_document(
+            entities=reconciled_entities,
+            text=text,
+        )
+
+        (
+            reconciled_entities,
+            aggregated_contexts,
+            aggregated_groups,
+            aggregated_group_keys,
+            aggregated_entity_memory,
+            aggregated_consistency_issues,
+        ) = await self._apply_large_document_resolution_state(
+            text=text,
+            entities=reconciled_entities,
+            explicit_types=explicit_types,
+            strategy_key=strategy_key,
+            use_llm=use_llm,
+            llm_model=llm_model,
+        )
+        aggregated_residual_hits, aggregated_residual_hit_chunks = self._collect_large_document_residual_hits(
+            text=text,
+            entities=reconciled_entities,
+            entity_memory=aggregated_entity_memory,
+            explicit_types=explicit_types,
+            chunks=page_chunk_plan,
+            max_hits=int(large_document_policy["max_residual_hits"]),
+            allow_weak_org_refs=bool(large_document_policy["allow_weak_org_refs"]),
+        )
+        global_review_subset = self._collect_large_document_review_subset(
+            entities=reconciled_entities,
+            consistency_issues=aggregated_consistency_issues,
+            residual_hits=aggregated_residual_hits,
+        )
+        final_quality_gate_review: Dict[str, Any] = {
+            "candidate_count": 0,
+            "prompt_count": 0,
+            "updated_entity_count": 0,
+            "extra_entity_count": 0,
+            "dropped_entity_count": 0,
+            "review_text_length": 0,
+            "applied": False,
+            "chunk_count": 0,
+            "reviewed_chunk_count": 0,
+            "reviewed_chunks": [],
+        }
+        if use_llm:
+            final_quality_gate_review = await self._run_large_document_final_quality_gate(
+                text=text,
+                refined_entities=reconciled_entities,
+                contexts=aggregated_contexts,
+                chunks=page_chunk_plan,
+                residual_hits=aggregated_residual_hits,
+                llm_model=llm_model,
+            )
+            if final_quality_gate_review.get("applied"):
+                (
+                    reconciled_entities,
+                    aggregated_contexts,
+                    aggregated_groups,
+                    aggregated_group_keys,
+                    aggregated_entity_memory,
+                    aggregated_consistency_issues,
+                ) = await self._finalize_large_document_subject_state(
+                    text=text,
+                    entities=reconciled_entities,
+                    explicit_types=explicit_types,
+                    strategy_key=strategy_key,
+                    use_llm=use_llm,
+                    llm_model=llm_model,
+                )
+                aggregated_residual_hits, aggregated_residual_hit_chunks = self._collect_large_document_residual_hits(
+                    text=text,
+                    entities=reconciled_entities,
+                    entity_memory=aggregated_entity_memory,
+                    explicit_types=explicit_types,
+                    chunks=page_chunk_plan,
+                    max_hits=int(large_document_policy["max_residual_hits"]),
+                    allow_weak_org_refs=bool(large_document_policy["allow_weak_org_refs"]),
+                )
+                global_review_subset = self._collect_large_document_review_subset(
+                    entities=reconciled_entities,
+                    consistency_issues=aggregated_consistency_issues,
+                    residual_hits=aggregated_residual_hits,
+                )
+
+        final_policy = self._build_standard_quality_policy(
+            text=text,
+            entities=reconciled_entities,
+            use_llm=use_llm,
+            precision_multi_review=precision_multi_review,
+        )
+        final_entities, final_quality = await self._prepare_entities_standard_mode(
+            text=text,
+            prepared_entities=reconciled_entities,
+            explicit_types=explicit_types,
+            strategy_key=strategy_key,
+            use_llm=use_llm,
+            llm_model=llm_model,
+            strategy_profile=strategy_profile,
+            quality_policy=final_policy,
+            run_llm_refine=False,
+            materialize_short_org_hints=False,
+        )
+        final_entities = self._restore_large_document_anchor_entities(
+            text=text,
+            prepared_entities=final_entities,
+            raw_entities=raw_entities,
+        )
+        final_entities = self._prune_invalid_entities_for_large_document(
+            entities=final_entities,
+            text=text,
+        )
+        (
+            ledger_entities,
+            _ledger_contexts,
+            ledger_groups,
+            ledger_group_keys,
+            _ledger_entity_memory,
+        ) = self._prepare_large_document_group_state(
+            text=text,
+            entities=final_entities,
+            explicit_types=explicit_types,
+            assign_provisional=False,
+        )
+        subject_ledger = self._build_large_document_subject_ledger(
+            groups=ledger_groups,
+            entities=ledger_entities,
+            group_keys=ledger_group_keys,
+        )
+        terminal_issues = self._collect_large_document_terminal_issues(
+            entities=final_entities,
+        )
+        quality_gate_passed = bool(final_quality.get("quality_gate_passed")) and not terminal_issues
+        if not quality_gate_passed:
+            quality_reasons: List[str] = []
+            summarized_failure = self._summarize_quality_gate_failure(
+                final_quality.get("consistency_issues", []),
+                final_quality.get("residual_hits", []),
+            )
+            if summarized_failure:
+                quality_reasons.append(summarized_failure)
+            terminal_summary = self._summarize_large_document_terminal_issues(terminal_issues)
+            if terminal_summary:
+                quality_reasons.append(terminal_summary)
+            final_quality["quality_gate_reason"] = "; ".join(item for item in quality_reasons if item)
+        final_quality.update(
+            {
+                "large_document_mode": True,
+                "large_document_policy": large_document_policy,
+                "execution_mode": "large_document_page_batched_default_workflow",
+                "large_document_execution_mode": "page_batches_of_10_default_workflow",
+                "page_batch_count": len(page_chunk_plan),
+                "page_batch_plan": [
+                    {
+                        "batch_index": int(batch.get("index", 0)),
+                        "page_numbers": list(batch.get("page_numbers", [])),
+                        "start": int(batch.get("start", 0)),
+                        "end": int(batch.get("end", 0)),
+                        "length": int(batch.get("length", 0)),
+                    }
+                    for batch in page_chunk_plan[:24]
+                ],
+                "page_batch_runs": finalized_batch_runs[:24],
+                "chunk_context_mode": "page_batched_default_workflow",
+                "global_reconciliation_input_entities": len(reconciled_entities),
+                "global_reconciliation_consistency_issue_count": len(aggregated_consistency_issues),
+                "global_reconciliation_residual_hit_count": len(aggregated_residual_hits),
+                "global_reconciliation_review_subset_count": len(global_review_subset),
+                "global_reconciliation_review_subset": global_review_subset[:20],
+                "global_final_quality_gate_review": final_quality_gate_review,
+                "global_residual_hit_chunks": aggregated_residual_hit_chunks[:20],
+                "subject_ledger_count": len(subject_ledger),
+                "subject_ledger": subject_ledger[:20],
+                "terminal_issues_count": len(terminal_issues),
+                "terminal_issues": terminal_issues[:20],
+                "quality_gate_passed": quality_gate_passed,
+                "final_result_quality_gate": bool(use_llm),
+            }
+        )
+        self.last_quality_metadata = final_quality
+        return final_entities
+
+    def _build_large_document_page_batches(
+        self,
+        *,
+        text: str,
+        source_metadata: Optional[Dict[str, Any]],
+        source_structure: Optional[Dict[str, Any]],
+        batch_page_count: int = 10,
+    ) -> List[Dict[str, Any]]:
+        pages = self._normalize_large_document_pages(
+            text=text,
+            source_metadata=source_metadata,
+            source_structure=source_structure,
+        )
+        if len(pages) <= 1:
+            return []
+
+        batches: List[Dict[str, Any]] = []
+        page_step = max(1, int(batch_page_count or 10))
+        for index in range(0, len(pages), page_step):
+            batch_pages = pages[index:index + page_step]
+            batch_start = int(batch_pages[0].get("start", 0))
+            batch_end = int(batch_pages[-1].get("end", batch_start))
+            if batch_end < batch_start:
+                batch_end = batch_start
+            batch_text = text[batch_start:batch_end]
+            batches.append(
+                {
+                    "index": len(batches),
+                    "page_numbers": [int(page.get("page_number", 0) or 0) for page in batch_pages],
+                    "pages": [dict(page) for page in batch_pages],
+                    "start": batch_start,
+                    "end": batch_end,
+                    "text": batch_text,
+                    "length": max(0, batch_end - batch_start),
+                    "page_count": len(batch_pages),
+                }
+            )
+        return batches
+
+    def _normalize_large_document_pages(
+        self,
+        *,
+        text: str,
+        source_metadata: Optional[Dict[str, Any]],
+        source_structure: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        fallback_page_count = self._resolve_large_document_page_count(
+            source_metadata=source_metadata,
+            source_structure=source_structure,
+        )
+        if not isinstance(source_structure, dict):
+            return (
+                self._fallback_normalized_large_document_pages(
+                    text=text,
+                    page_count=fallback_page_count,
+                )
+                if fallback_page_count > 1
+                else []
+            )
+        raw_pages = source_structure.get("pages")
+        if not isinstance(raw_pages, list) or not raw_pages:
+            return (
+                self._fallback_normalized_large_document_pages(
+                    text=text,
+                    page_count=fallback_page_count,
+                )
+                if fallback_page_count > 1
+                else []
+            )
+
+        normalized_pages: List[Dict[str, Any]] = []
+        cursor = 0
+
+        for index, raw_page in enumerate(raw_pages, start=1):
+            if not isinstance(raw_page, dict):
+                continue
+            page_text = str(raw_page.get("text", "") or "")
+            start = raw_page.get("start")
+            end = raw_page.get("end")
+
+            try:
+                start_int = int(start)
+            except (TypeError, ValueError):
+                start_int = -1
+            try:
+                end_int = int(end)
+            except (TypeError, ValueError):
+                end_int = -1
+
+            if start_int < 0 or end_int < start_int:
+                page_text_for_find = page_text
+                found_at = text.find(page_text_for_find, cursor) if page_text_for_find else cursor
+                if found_at < 0 and page_text_for_find:
+                    found_at = text.find(page_text_for_find)
+                if found_at < 0:
+                    found_at = max(0, min(cursor, len(text)))
+                start_int = found_at
+                end_int = min(len(text), start_int + len(page_text_for_find))
+            cursor = max(cursor, end_int)
+            while cursor < len(text) and text[cursor] == "\n":
+                cursor += 1
+
+            page_number = raw_page.get("page_number")
+            try:
+                page_number_int = int(page_number)
+            except (TypeError, ValueError):
+                page_number_int = index
+            if page_number_int <= 0:
+                page_number_int = index
+
+            normalized_pages.append(
+                {
+                    "page_number": page_number_int,
+                    "text": page_text,
+                    "start": max(0, min(start_int, len(text))),
+                    "end": max(0, min(end_int, len(text))),
+                }
+            )
+
+        if fallback_page_count > 1 and len(normalized_pages) < fallback_page_count:
+            return self._fallback_normalized_large_document_pages(
+                text=text,
+                page_count=fallback_page_count,
+            )
+
+        if not normalized_pages and fallback_page_count > 1:
+            return self._fallback_normalized_large_document_pages(
+                text=text,
+                page_count=fallback_page_count,
+            )
+        return normalized_pages
+
+    def _fallback_normalized_large_document_pages(
+        self,
+        *,
+        text: str,
+        page_count: int,
+    ) -> List[Dict[str, Any]]:
+        total_pages = max(1, int(page_count or 1))
+        if total_pages <= 1:
+            return [{"page_number": 1, "text": text, "start": 0, "end": len(text)}]
+
+        chunk_size = max(1, len(text) // total_pages)
+        normalized_pages: List[Dict[str, Any]] = []
+        start = 0
+        for page_no in range(1, total_pages + 1):
+            end = len(text) if page_no == total_pages else min(len(text), start + chunk_size)
+            if end < len(text):
+                newline_pos = text.rfind("\n", start, end)
+                if newline_pos > start:
+                    end = newline_pos
+            normalized_pages.append(
+                {
+                    "page_number": page_no,
+                    "text": text[start:end],
+                    "start": start,
+                    "end": end,
+                }
+            )
+            start = end
+        return normalized_pages
+
+    def _project_entities_to_page_batch(
+        self,
+        *,
+        entities: List[Dict[str, Any]],
+        batch: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        batch_start = int(batch.get("start", 0))
+        batch_end = int(batch.get("end", batch_start))
+        batch_text = str(batch.get("text", "") or "")
+        local_entities: List[Dict[str, Any]] = []
+        for entity in entities:
+            start = int(entity.get("start", 0))
+            end = int(entity.get("end", start))
+            if start < batch_start or end > batch_end or end <= start:
+                continue
+            item = dict(entity)
+            item["start"] = start - batch_start
+            item["end"] = end - batch_start
+            if 0 <= item["start"] < item["end"] <= len(batch_text):
+                item["text"] = batch_text[item["start"]:item["end"]]
+            local_entities.append(item)
+        return local_entities
+
+    def _restore_page_batch_entities_to_global(
+        self,
+        *,
+        entities: List[Dict[str, Any]],
+        batch: Dict[str, Any],
+        full_text: str,
+    ) -> List[Dict[str, Any]]:
+        batch_start = int(batch.get("start", 0))
+        restored: List[Dict[str, Any]] = []
+        for entity in entities:
+            local_start = int(entity.get("start", 0))
+            local_end = int(entity.get("end", local_start))
+            if local_end <= local_start:
+                continue
+            start = batch_start + local_start
+            end = batch_start + local_end
+            if start < 0 or end > len(full_text) or end <= start:
+                continue
+            item = dict(entity)
+            item["start"] = start
+            item["end"] = end
+            item["text"] = full_text[start:end]
+            restored.append(item)
+        return restored
+
+    def _sanitize_entity_for_global_reconciliation(
+        self,
+        *,
+        entity: Dict[str, Any],
+        batch_index: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        item = dict(entity)
+        metadata = dict(item.get("metadata") or {})
+        stable_canonical_key = self._canonical_key_from_entity(item)
+        stable_canonical_role = str(item.get("canonical_role", "")).strip().upper()
+        keep_canonical_key = stable_canonical_key in {"PARTY_A", "PARTY_B", "PARTY_C"}
+        keep_canonical_role = stable_canonical_role in {"PARTY_A", "PARTY_B", "PARTY_C"}
+
+        for field in ("replacement", "replacement_method", "context_label", "context_role"):
+            item.pop(field, None)
+
+        if not keep_canonical_key:
+            item.pop("canonical_key", None)
+            metadata.pop("canonical_key", None)
+        if not keep_canonical_role:
+            item.pop("canonical_role", None)
+            metadata.pop("canonical_role", None)
+
+        for transient_key in (
+            "replacement_family_key",
+            "source_layer",
+            "source_priority",
+            "trigger_line",
+            "trigger_label",
+            "trigger_role",
+            "evidence_window",
+            "resolved_group_key",
+            "memory_primary_text",
+            "memory_primary_type",
+            "memory_conflict",
+            "memory_conflict_reasons",
+            "arbitration_result",
+            "provisional_canonical",
+        ):
+            metadata.pop(transient_key, None)
+
+        if batch_index is not None:
+            metadata["page_batch_index"] = int(batch_index)
+
+        if metadata:
+            item["metadata"] = metadata
+        else:
+            item.pop("metadata", None)
+        return item
+
+    def _build_large_document_chunks(
+        self,
+        *,
+        text: str,
+        llm_model: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        if not text:
+            return [{"index": 0, "start": 0, "end": 0, "text": "", "length": 0, "line_count": 0}]
+
+        runtime = get_runtime_llm_strategy_profile(
+            llm_model or settings.get_default_llm_model(),
+            text_length=len(text),
+            line_count=max(1, text.count("\n") + 1),
+        )
+        target_size = max(900, int(runtime.strategy.chunk_target_size))
+        overlap = max(120, int(runtime.strategy.chunk_overlap))
+        if len(text) <= target_size:
+            chunk_text = text.strip()
+            leading = len(text) - len(text.lstrip())
+            trailing = len(text) - len(text.rstrip())
+            start = leading
+            end = len(text) - trailing if trailing else len(text)
+            return [
+                {
+                    "index": 0,
+                    "start": start,
+                    "end": max(start, end),
+                    "text": chunk_text,
+                    "length": max(0, end - start),
+                    "line_count": max(1, chunk_text.count("\n") + 1) if chunk_text else 0,
+                }
+            ]
+
+        chunks: List[Dict[str, Any]] = []
+        start = 0
+        text_length = len(text)
+
+        while start < text_length:
+            end = min(start + target_size, text_length)
+            if end < text_length:
+                newline_pos = text.rfind("\n", start, end)
+                if newline_pos > start + 400:
+                    end = newline_pos
+
+            raw_chunk = text[start:end]
+            stripped_chunk = raw_chunk.strip()
+            if stripped_chunk:
+                leading = len(raw_chunk) - len(raw_chunk.lstrip())
+                trailing = len(raw_chunk) - len(raw_chunk.rstrip())
+                actual_start = start + leading
+                actual_end = end - trailing if trailing else end
+                chunks.append(
+                    {
+                        "index": len(chunks),
+                        "start": actual_start,
+                        "end": max(actual_start, actual_end),
+                        "text": text[actual_start:max(actual_start, actual_end)],
+                        "length": max(0, actual_end - actual_start),
+                        "line_count": max(1, stripped_chunk.count("\n") + 1),
+                    }
+                )
+
+            if end >= text_length:
+                break
+            start = max(end - overlap, start + 1)
+
+        if not chunks:
+            chunks.append(
+                {
+                    "index": 0,
+                    "start": 0,
+                    "end": len(text),
+                    "text": text,
+                    "length": len(text),
+                    "line_count": max(1, text.count("\n") + 1),
+                }
+            )
+        return chunks
+
+    def _entity_signature(self, entity: Dict[str, Any]) -> tuple[str, int, int, str]:
+        return (
+            str(entity.get("type", "")).strip().upper(),
+            int(entity.get("start", 0)),
+            int(entity.get("end", 0)),
+            str(entity.get("text", "")).strip(),
+        )
+
+    def _find_large_document_chunk_index_for_span(
+        self,
+        *,
+        start: int,
+        end: int,
+        chunks: List[Dict[str, Any]],
+    ) -> int:
+        if not chunks:
+            return 0
+
+        for chunk in chunks:
+            if int(chunk.get("start", 0)) <= start and end <= int(chunk.get("end", 0)):
+                return int(chunk.get("index", 0))
+
+        midpoint = start + max(0, end - start) // 2
+        for chunk in chunks:
+            chunk_start = int(chunk.get("start", 0))
+            chunk_end = int(chunk.get("end", 0))
+            if chunk_start <= midpoint < chunk_end:
+                return int(chunk.get("index", 0))
+
+        return int(chunks[-1].get("index", 0))
+
+    def _resolve_entity_indexes_by_signatures(
+        self,
+        *,
+        refined_entities: List[Dict[str, Any]],
+        candidate_signatures: List[tuple[str, int, int, str]],
+    ) -> List[int]:
+        index_by_signature: Dict[tuple[str, int, int, str], List[int]] = {}
+        for index, entity in enumerate(refined_entities):
+            index_by_signature.setdefault(self._entity_signature(entity), []).append(index)
+
+        resolved: List[int] = []
+        seen_indexes: set[int] = set()
+        for signature in candidate_signatures:
+            for index in index_by_signature.get(signature, []):
+                if index in seen_indexes:
+                    continue
+                seen_indexes.add(index)
+                resolved.append(index)
+        return resolved
+
+    def _project_entities_to_large_document_chunk(
+        self,
+        *,
+        entities: List[Dict[str, Any]],
+        chunk: Dict[str, Any],
+        chunks: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        chunk_index = int(chunk.get("index", 0))
+        chunk_start = int(chunk.get("start", 0))
+        chunk_end = int(chunk.get("end", 0))
+        projected: List[Dict[str, Any]] = []
+
+        for entity in entities:
+            start = int(entity.get("start", 0))
+            end = int(entity.get("end", start))
+            assigned_chunk_index = self._find_large_document_chunk_index_for_span(
+                start=start,
+                end=end,
+                chunks=chunks,
+            )
+            if assigned_chunk_index != chunk_index:
+                continue
+            if start < chunk_start or end > chunk_end:
+                continue
+            item = dict(entity)
+            item["start"] = start - chunk_start
+            item["end"] = end - chunk_start
+            projected.append(item)
+        return projected
+
+    def _build_large_document_initial_review_plan(
+        self,
+        *,
+        text: str,
+        entities: List[Dict[str, Any]],
+        contexts: List[Dict[str, Any]],
+        chunks: List[Dict[str, Any]],
+        llm_model: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        if not entities or not chunks:
+            return []
+
+        per_chunk_limit = max(1, self._get_review_entity_limit(llm_model, text_length=len(text)))
+        plan: List[Dict[str, Any]] = []
+        for chunk in chunks:
+            ranked: List[tuple[int, int]] = []
+            for index, (entity, context) in enumerate(zip(entities, contexts)):
+                assigned_chunk_index = self._find_large_document_chunk_index_for_span(
+                    start=int(entity.get("start", 0)),
+                    end=int(entity.get("end", 0)),
+                    chunks=chunks,
+                )
+                if assigned_chunk_index != int(chunk.get("index", 0)):
+                    continue
+                entity_type = str(entity.get("type", "")).strip().upper()
+                entity_text = str(entity.get("text", "")).strip()
+                if entity_type not in self.REVIEW_PROMPT_TYPES or not entity_text:
+                    continue
+                if self._canonical_key_from_entity(entity):
+                    continue
+                if not (
+                    self._requires_occurrence_level_resolution(entity, context)
+                    or bool(context.get("label"))
+                    or bool(context.get("role"))
+                    or self._source_layer(entity) in {"llm_semantic", "llm_review", "propagated", "residual", "unknown"}
+                ):
+                    continue
+                ranked.append((self._review_prompt_priority(entity, context), index))
+
+            ranked.sort(key=lambda item: (-item[0], item[1]))
+            ranked = ranked[:per_chunk_limit]
+            candidate_signatures = [self._entity_signature(entities[index]) for _, index in ranked]
+            if not candidate_signatures:
+                continue
+            plan.append(
+                {
+                    "chunk_index": int(chunk.get("index", 0)),
+                    "start": int(chunk.get("start", 0)),
+                    "end": int(chunk.get("end", 0)),
+                    "text": str(chunk.get("text", "")),
+                    "candidate_signatures": candidate_signatures,
+                    "extra_review_entities": [],
+                }
+            )
+        return plan
+
+    def _build_large_document_subset_review_plan(
+        self,
+        *,
+        entities: List[Dict[str, Any]],
+        chunks: List[Dict[str, Any]],
+        review_subset: List[Dict[str, Any]],
+        extra_review_entities: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not chunks:
+            return []
+
+        chunk_map: Dict[int, Dict[str, Any]] = {}
+        for item in review_subset:
+            if item.get("source") != "entity" or not isinstance(item.get("entity_index"), int):
+                continue
+            entity_index = int(item["entity_index"])
+            if entity_index < 0 or entity_index >= len(entities):
+                continue
+            entity = entities[entity_index]
+            chunk_index = self._find_large_document_chunk_index_for_span(
+                start=int(entity.get("start", 0)),
+                end=int(entity.get("end", 0)),
+                chunks=chunks,
+            )
+            chunk = chunks[chunk_index]
+            entry = chunk_map.setdefault(
+                chunk_index,
+                {
+                    "chunk_index": chunk_index,
+                    "start": int(chunk.get("start", 0)),
+                    "end": int(chunk.get("end", 0)),
+                    "text": str(chunk.get("text", "")),
+                    "candidate_signatures": [],
+                    "extra_review_entities": [],
+                },
+            )
+            entry["candidate_signatures"].append(self._entity_signature(entity))
+
+        for entity in extra_review_entities:
+            chunk_index = self._find_large_document_chunk_index_for_span(
+                start=int(entity.get("start", 0)),
+                end=int(entity.get("end", 0)),
+                chunks=chunks,
+            )
+            chunk = chunks[chunk_index]
+            entry = chunk_map.setdefault(
+                chunk_index,
+                {
+                    "chunk_index": chunk_index,
+                    "start": int(chunk.get("start", 0)),
+                    "end": int(chunk.get("end", 0)),
+                    "text": str(chunk.get("text", "")),
+                    "candidate_signatures": [],
+                    "extra_review_entities": [],
+                },
+            )
+            entry["extra_review_entities"].append(dict(entity))
+
+        return [
+            chunk_map[index]
+            for index in sorted(chunk_map)
+            if chunk_map[index]["candidate_signatures"] or chunk_map[index]["extra_review_entities"]
+        ]
+
+    def _build_large_document_final_quality_gate_plan(
+        self,
+        *,
+        entities: List[Dict[str, Any]],
+        chunks: List[Dict[str, Any]],
+        residual_hits: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not chunks:
+            return []
+
+        chunk_map: Dict[int, Dict[str, Any]] = {}
+        for entity in entities:
+            entity_type = str(entity.get("type", "")).strip().upper()
+            entity_text = str(entity.get("text", "")).strip()
+            if entity_type not in self.REVIEW_PROMPT_TYPES or not entity_text:
+                continue
+            chunk_index = self._find_large_document_chunk_index_for_span(
+                start=int(entity.get("start", 0)),
+                end=int(entity.get("end", 0)),
+                chunks=chunks,
+            )
+            chunk = chunks[chunk_index]
+            entry = chunk_map.setdefault(
+                chunk_index,
+                {
+                    "chunk_index": chunk_index,
+                    "start": int(chunk.get("start", 0)),
+                    "end": int(chunk.get("end", 0)),
+                    "text": str(chunk.get("text", "")),
+                    "candidate_signatures": [],
+                    "extra_review_entities": [],
+                    "candidate_limit": 0,
+                    "allow_drop": True,
+                },
+            )
+            entry["candidate_signatures"].append(self._entity_signature(entity))
+
+        for entity in self._build_large_document_residual_review_entities(residual_hits=residual_hits):
+            chunk_index = self._find_large_document_chunk_index_for_span(
+                start=int(entity.get("start", 0)),
+                end=int(entity.get("end", 0)),
+                chunks=chunks,
+            )
+            chunk = chunks[chunk_index]
+            entry = chunk_map.setdefault(
+                chunk_index,
+                {
+                    "chunk_index": chunk_index,
+                    "start": int(chunk.get("start", 0)),
+                    "end": int(chunk.get("end", 0)),
+                    "text": str(chunk.get("text", "")),
+                    "candidate_signatures": [],
+                    "extra_review_entities": [],
+                    "candidate_limit": 0,
+                    "allow_drop": True,
+                },
+            )
+            entry["extra_review_entities"].append(dict(entity))
+
+        return [
+            chunk_map[index]
+            for index in sorted(chunk_map)
+            if chunk_map[index]["candidate_signatures"] or chunk_map[index]["extra_review_entities"]
+        ]
+
+    async def _run_large_document_chunked_review(
+        self,
+        *,
+        text: str,
+        refined_entities: List[Dict[str, Any]],
+        contexts: List[Dict[str, Any]],
+        review_plan: List[Dict[str, Any]],
+        llm_model: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        summary: Dict[str, Any] = {
+            "candidate_count": 0,
+            "prompt_count": 0,
+            "updated_entity_count": 0,
+            "extra_entity_count": 0,
+            "dropped_entity_count": 0,
+            "review_text_length": 0,
+            "applied": False,
+            "chunk_count": len(review_plan),
+            "reviewed_chunk_count": 0,
+            "reviewed_chunks": [],
+        }
+        if not review_plan:
+            return summary
+
+        current_contexts = list(contexts)
+        for plan_entry in review_plan:
+            candidate_indexes = self._resolve_entity_indexes_by_signatures(
+                refined_entities=refined_entities,
+                candidate_signatures=list(plan_entry.get("candidate_signatures") or []),
+            )
+            extra_review_entities = [dict(item) for item in list(plan_entry.get("extra_review_entities") or [])]
+            if not candidate_indexes and not extra_review_entities:
+                continue
+            if len(current_contexts) != len(refined_entities):
+                current_contexts = [self._build_minimal_context(text, entity) for entity in refined_entities]
+
+            chunk_result = await self._run_resolution_subset_review(
+                text=text,
+                refined_entities=refined_entities,
+                contexts=current_contexts,
+                candidate_indexes=candidate_indexes,
+                extra_review_entities=extra_review_entities,
+                llm_model=llm_model,
+                review_text_override=str(plan_entry.get("review_text_override") or ""),
+                candidate_limit=(
+                    int(plan_entry["candidate_limit"])
+                    if plan_entry.get("candidate_limit") is not None
+                    else None
+                ),
+                allow_drop=bool(plan_entry.get("allow_drop")),
+            )
+            summary["candidate_count"] += int(chunk_result.get("candidate_count", 0) or 0)
+            summary["prompt_count"] += int(chunk_result.get("prompt_count", 0) or 0)
+            summary["updated_entity_count"] += int(chunk_result.get("updated_entity_count", 0) or 0)
+            summary["extra_entity_count"] += int(chunk_result.get("extra_entity_count", 0) or 0)
+            summary["dropped_entity_count"] += int(chunk_result.get("dropped_entity_count", 0) or 0)
+            summary["review_text_length"] += int(chunk_result.get("review_text_length", 0) or 0)
+            summary["applied"] = bool(summary["applied"] or chunk_result.get("applied"))
+            summary["reviewed_chunk_count"] += 1
+            summary["reviewed_chunks"].append(
+                {
+                    "chunk_index": int(plan_entry.get("chunk_index", 0)),
+                    "candidate_count": len(candidate_indexes) + len(extra_review_entities),
+                    "prompt_count": int(chunk_result.get("prompt_count", 0) or 0),
+                    "updated_entity_count": int(chunk_result.get("updated_entity_count", 0) or 0),
+                    "extra_entity_count": int(chunk_result.get("extra_entity_count", 0) or 0),
+                    "dropped_entity_count": int(chunk_result.get("dropped_entity_count", 0) or 0),
+                    "applied": bool(chunk_result.get("applied")),
+                }
+            )
+            refined_entities[:] = self._apply_metadata_identity_hints(refined_entities)
+            refined_entities[:] = self._prune_invalid_entities(refined_entities, full_text=text)
+            current_contexts = [self._build_minimal_context(text, entity) for entity in refined_entities]
+
+        summary["reviewed_chunks"] = summary["reviewed_chunks"][:24]
+        return summary
+
+    async def _finalize_large_document_subject_state(
+        self,
+        *,
+        text: str,
+        entities: List[Dict[str, Any]],
+        explicit_types: set[str],
+        strategy_key: str,
+        use_llm: bool,
+        llm_model: Optional[str],
+    ) -> tuple[
+        List[Dict[str, Any]],
+        List[Dict[str, Any]],
+        Dict[str, Dict[str, Any]],
+        List[str],
+        Dict[str, Dict[str, Any]],
+        List[Dict[str, Any]],
+    ]:
+        prepared_entities, contexts, _, _, _ = self._prepare_large_document_group_state(
+            text=text,
+            entities=entities,
+            explicit_types=explicit_types,
+            assign_provisional=False,
+        )
+        self._stabilize_large_document_subjects(
+            refined_entities=prepared_entities,
+            contexts=contexts,
+            force_remaining=True,
+        )
+        self._cleanup_provisional_canonical_markers(
+            refined_entities=prepared_entities,
+        )
+        return await self._apply_large_document_resolution_state(
+            text=text,
+            entities=prepared_entities,
+            explicit_types=explicit_types,
+            strategy_key=strategy_key,
+            use_llm=use_llm,
+            llm_model=llm_model,
+            stabilize_subjects=False,
+            assign_provisional=False,
+        )
+
+    async def _run_large_document_final_quality_gate(
+        self,
+        *,
+        text: str,
+        refined_entities: List[Dict[str, Any]],
+        contexts: List[Dict[str, Any]],
+        chunks: List[Dict[str, Any]],
+        residual_hits: List[Dict[str, Any]],
+        llm_model: Optional[str],
+    ) -> Dict[str, Any]:
+        if not refined_entities or not chunks:
+            return {
+                "candidate_count": 0,
+                "prompt_count": 0,
+                "updated_entity_count": 0,
+                "extra_entity_count": 0,
+                "dropped_entity_count": 0,
+                "review_text_length": 0,
+                "applied": False,
+                "chunk_count": 0,
+                "reviewed_chunk_count": 0,
+                "reviewed_chunks": [],
+            }
+        review_plan = self._build_large_document_final_quality_gate_plan(
+            entities=refined_entities,
+            chunks=chunks,
+            residual_hits=residual_hits,
+        )
+        return await self._run_large_document_chunked_review(
+            text=text,
+            refined_entities=refined_entities,
+            contexts=contexts,
+            review_plan=review_plan,
+            llm_model=llm_model,
+        )
+
+    def _materialize_large_document_residual_entities(
+        self,
+        *,
+        text: str,
+        entities: List[Dict[str, Any]],
+        entity_memory: Dict[str, Dict[str, Any]],
+        explicit_types: set[str],
+        chunks: List[Dict[str, Any]],
+        max_added: int = 120,
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        if max_added <= 0 or not chunks or not entity_memory:
+            return [], []
+
+        occupied = {(int(item["start"]), int(item["end"]), str(item["type"])) for item in entities}
+        occupied_ranges = [(int(item["start"]), int(item["end"])) for item in entities]
+        additions: List[Dict[str, Any]] = []
+        chunk_stats: List[Dict[str, Any]] = []
+
+        for chunk in chunks:
+            remaining = max_added - len(additions)
+            if remaining <= 0:
+                break
+            local_entities = self._project_entities_to_large_document_chunk(
+                entities=entities,
+                chunk=chunk,
+                chunks=chunks,
+            )
+            local_additions = self._materialize_residual_entities(
+                text=str(chunk.get("text", "")),
+                entities=local_entities,
+                entity_memory=entity_memory,
+                explicit_types=explicit_types,
+                max_added=remaining,
+            )
+            chunk_added = 0
+            chunk_start = int(chunk.get("start", 0))
+            for item in local_additions:
+                start = chunk_start + int(item.get("start", 0))
+                end = chunk_start + int(item.get("end", 0))
+                entity_type = str(item.get("type", ""))
+                if start >= end or (start, end, entity_type) in occupied:
+                    continue
+                if any(start < existing_end and end > existing_start for existing_start, existing_end in occupied_ranges):
+                    continue
+                normalized = dict(item)
+                normalized["start"] = start
+                normalized["end"] = end
+                normalized["text"] = text[start:end]
+                additions.append(normalized)
+                occupied.add((start, end, entity_type))
+                occupied_ranges.append((start, end))
+                chunk_added += 1
+                if len(additions) >= max_added:
+                    break
+            if chunk_added:
+                chunk_stats.append(
+                    {
+                        "chunk_index": int(chunk.get("index", 0)),
+                        "residual_entities_added": chunk_added,
+                    }
+                )
+        return additions, chunk_stats
+
+    def _collect_large_document_residual_hits(
+        self,
+        *,
+        text: str,
+        entities: List[Dict[str, Any]],
+        entity_memory: Dict[str, Dict[str, Any]],
+        explicit_types: set[str],
+        chunks: List[Dict[str, Any]],
+        max_hits: int = 20,
+        allow_weak_org_refs: bool = True,
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        if max_hits <= 0 or not chunks or not entity_memory:
+            return [], []
+
+        hits: List[Dict[str, Any]] = []
+        chunk_stats: List[Dict[str, Any]] = []
+        seen: set[tuple[int, int, str, str]] = set()
+
+        for chunk in chunks:
+            remaining = max_hits - len(hits)
+            if remaining <= 0:
+                break
+            local_entities = self._project_entities_to_large_document_chunk(
+                entities=entities,
+                chunk=chunk,
+                chunks=chunks,
+            )
+            local_hits = self._collect_residual_hits(
+                text=str(chunk.get("text", "")),
+                entities=local_entities,
+                entity_memory=entity_memory,
+                explicit_types=explicit_types,
+                max_hits=remaining,
+                allow_weak_org_refs=allow_weak_org_refs,
+            )
+            chunk_hit_count = 0
+            chunk_start = int(chunk.get("start", 0))
+            for item in local_hits:
+                start = chunk_start + int(item.get("start", 0))
+                end = chunk_start + int(item.get("end", 0))
+                entity_type = str(item.get("type", ""))
+                variant = str(item.get("variant", ""))
+                key = (start, end, entity_type, variant)
+                if start >= end or key in seen:
+                    continue
+                seen.add(key)
+                normalized = dict(item)
+                normalized["start"] = start
+                normalized["end"] = end
+                hits.append(normalized)
+                chunk_hit_count += 1
+                if len(hits) >= max_hits:
+                    break
+            if chunk_hit_count:
+                chunk_stats.append(
+                    {
+                        "chunk_index": int(chunk.get("index", 0)),
+                        "residual_hit_count": chunk_hit_count,
+                    }
+                )
+        return hits, chunk_stats
+
+    def _build_minimal_context(self, text: str, entity: Dict) -> Dict[str, Any]:
+        start = int(entity.get("start", 0))
+        end = int(entity.get("end", start))
+        line_start = text.rfind("\n", 0, start) + 1
+        line_end = text.find("\n", end)
+        if line_end == -1:
+            line_end = len(text)
+        line = text[line_start:line_end]
+        previous_line = self._neighbor_line(text, line_start - 1, reverse=True)
+        next_line = self._neighbor_line(text, line_end + 1, reverse=False)
+        local_start = max(0, start - line_start)
+        local_end = max(local_start, min(len(line), end - line_start))
+        before = line[:local_start].strip()
+        after = line[local_end:].strip()
+        label = self._extract_label(before, previous_line)
+        role = self._infer_role(
+            str(entity.get("type", "")).strip().upper(),
+            before,
+            after,
+            label,
+            previous_line,
+            next_line,
+        )
+        return {
+            "line_start": line_start,
+            "line_end": line_end,
+            "line": line.strip(),
+            "before": before[-40:],
+            "after": after[:40],
+            "previous_line": previous_line,
+            "next_line": next_line,
+            "label": label,
+            "role": role,
+            "window_text": line.strip(),
+            "canonical_role": entity.get("canonical_role", ""),
+        }
+
+    def _collect_large_document_review_subset(
+        self,
+        *,
+        entities: List[Dict],
+        consistency_issues: List[Dict[str, Any]],
+        residual_hits: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        flagged_keys = {
+            self._sanitize_canonical_key(item.get("canonical_key"))
+            for item in consistency_issues
+            if self._sanitize_canonical_key(item.get("canonical_key"))
+        }
+        subset: List[Dict[str, Any]] = []
+        seen: set[tuple[int, int, str]] = set()
+
+        for entity_index, entity in enumerate(entities):
+            canonical_key = self._canonical_key_from_entity(entity)
+            metadata = entity.get("metadata") or {}
+            include = False
+            reasons: List[str] = []
+            if canonical_key and canonical_key in flagged_keys:
+                include = True
+                reasons.append("consistency_issue")
+            if metadata.get("memory_conflict"):
+                include = True
+                reasons.append("memory_conflict")
+            if metadata.get("residual_scan"):
+                include = True
+                reasons.append("residual_repair")
+            if include:
+                key = (int(entity.get("start", 0)), int(entity.get("end", 0)), str(entity.get("type", "")))
+                if key in seen:
+                    continue
+                seen.add(key)
+                subset.append(
+                    {
+                        "source": "entity",
+                        "entity_index": entity_index,
+                        "text": str(entity.get("text", "")),
+                        "type": str(entity.get("type", "")),
+                        "start": int(entity.get("start", 0)),
+                        "end": int(entity.get("end", 0)),
+                        "canonical_key": canonical_key,
+                        "reasons": reasons,
+                    }
+                )
+
+        for hit in residual_hits:
+            key = (int(hit.get("start", 0)), int(hit.get("end", 0)), str(hit.get("type", "")))
+            if key in seen:
+                continue
+            seen.add(key)
+            subset.append(
+                {
+                    "source": "residual_hit",
+                    "text": str(hit.get("variant") or ""),
+                    "type": str(hit.get("type", "")),
+                    "start": int(hit.get("start", 0)),
+                    "end": int(hit.get("end", 0)),
+                    "canonical_key": self._sanitize_canonical_key(hit.get("canonical_key")),
+                    "reasons": ["residual_hit"],
+                }
+            )
+        return subset
+
+    def _select_large_document_resolution_candidate_indexes(
+        self,
+        *,
+        entities: List[Dict],
+        contexts: List[Dict[str, Any]],
+        text_length: int = 0,
+        llm_model: Optional[str] = None,
+    ) -> List[int]:
+        limit = self._get_review_entity_limit(llm_model, text_length=text_length)
+        ranked: List[tuple[int, int]] = []
+        for index, (entity, context) in enumerate(zip(entities, contexts)):
+            entity_type = str(entity.get("type", "")).strip().upper()
+            entity_text = str(entity.get("text", "")).strip()
+            if entity_type not in self.REVIEW_PROMPT_TYPES or not entity_text:
+                continue
+            if self._canonical_key_from_entity(entity):
+                continue
+            if not (
+                self._requires_occurrence_level_resolution(entity, context)
+                or bool(context.get("label"))
+                or bool(context.get("role"))
+                or self._source_layer(entity) in {"llm_semantic", "llm_review", "propagated", "residual", "unknown"}
+            ):
+                continue
+            ranked.append((self._review_prompt_priority(entity, context), index))
+
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        if limit > 0:
+            ranked = ranked[:limit]
+        return [index for _, index in ranked]
+
+    async def _run_resolution_subset_review(
+        self,
+        *,
+        text: str,
+        refined_entities: List[Dict],
+        contexts: List[Dict[str, Any]],
+        candidate_indexes: List[int],
+        extra_review_entities: Optional[List[Dict[str, Any]]] = None,
+        llm_model: Optional[str] = None,
+        review_text_override: Optional[str] = None,
+        candidate_limit: Optional[int] = None,
+        allow_drop: bool = False,
+    ) -> Dict[str, Any]:
+        extra_review_entities = list(extra_review_entities or [])
+        if not candidate_indexes and not extra_review_entities:
+            return {
+                "candidate_count": 0,
+                "prompt_count": 0,
+                "updated_entity_count": 0,
+                "extra_entity_count": 0,
+                "dropped_entity_count": 0,
+                "applied": False,
+            }
+        if not self._resolution_backend_available(llm_model=llm_model):
+            return {
+                "candidate_count": len(candidate_indexes) + len(extra_review_entities),
+                "prompt_count": 0,
+                "updated_entity_count": 0,
+                "extra_entity_count": 0,
+                "dropped_entity_count": 0,
+                "applied": False,
+            }
+        review_entities = [dict(entity) for entity in refined_entities]
+        review_contexts = list(contexts)
+        effective_candidate_indexes = list(candidate_indexes)
+        for entity in extra_review_entities:
+            review_entities.append(dict(entity))
+            review_contexts.append(self._build_minimal_context(text, entity))
+            effective_candidate_indexes.append(len(review_entities) - 1)
+        effective_review_text = str(review_text_override or "").strip()
+        if not effective_review_text:
+            effective_review_text = self._build_large_document_review_text(
+                text=text,
+                contexts=review_contexts,
+                candidate_indexes=effective_candidate_indexes,
+                llm_model=llm_model,
+            )
+
+        review_bundle = self._build_resolution_review_bundle(
+            text=text,
+            entities=review_entities,
+            contexts=review_contexts,
+            llm_model=llm_model,
+            candidate_indexes=effective_candidate_indexes,
+            candidate_limit=candidate_limit,
+        )
+        if not review_bundle["prompt_items"]:
+            return {
+                "candidate_count": len(effective_candidate_indexes),
+                "prompt_count": 0,
+                "updated_entity_count": 0,
+                "extra_entity_count": 0,
+                "dropped_entity_count": 0,
+                "applied": False,
+            }
+
+        llm_result = await self._build_llm_resolution_result(
+            text=text,
+            prompt_items=review_bundle["prompt_items"],
+            focus_lines=review_bundle["focus_lines"],
+            subject_catalog=review_bundle["subject_catalog"],
+            llm_model=llm_model,
+            review_text_override=effective_review_text,
+        )
+        if not llm_result:
+            return {
+                "candidate_count": len(effective_candidate_indexes),
+                "prompt_count": len(review_bundle["prompt_items"]),
+                "updated_entity_count": 0,
+                "extra_entity_count": 0,
+                "dropped_entity_count": 0,
+                "applied": False,
+            }
+
+        updates_by_id = {
+            item["id"]: item
+            for item in llm_result.get("entity_updates", [])
+            if isinstance(item, dict) and item.get("id")
+        }
+        updated_indexes = {
+            entity_index
+            for item_id, entity_indexes in review_bundle["entity_indexes_by_id"].items()
+            if item_id in updates_by_id
+            for entity_index in entity_indexes
+            if 0 <= entity_index < len(refined_entities)
+        }
+        subset_candidate_entities = self._materialize_subset_review_candidate_entities(
+            existing_entities=refined_entities,
+            review_entities=review_entities,
+            updates_by_id=updates_by_id,
+            entity_indexes_by_id=review_bundle["entity_indexes_by_id"],
+            allowed_canonical_keys_by_id=review_bundle["allowed_canonical_keys_by_id"],
+        )
+        dropped_indexes = self._apply_resolution_updates(
+            refined_entities=refined_entities,
+            updates_by_id=updates_by_id,
+            entity_indexes_by_id=review_bundle["entity_indexes_by_id"],
+            allowed_canonical_keys_by_id=review_bundle["allowed_canonical_keys_by_id"],
+            allow_drop=allow_drop,
+        )
+
+        extra_entities = self._materialize_llm_extra_entities(
+            text=text,
+            existing_entities=refined_entities,
+            extra_items=llm_result.get("extra_entities", []),
+        )
+        manual_extra_count = len(subset_candidate_entities)
+        if subset_candidate_entities:
+            refined_entities.extend(subset_candidate_entities)
+        if extra_entities:
+            refined_entities.extend(extra_entities)
+        if subset_candidate_entities or extra_entities:
+            refined_entities.sort(key=lambda item: (item["start"], item["end"]))
+
+        updated_contexts = [self._build_minimal_context(text, entity) for entity in refined_entities]
+        self._propagate_resolved_canonical_keys(
+            refined_entities=refined_entities,
+            text=text,
+            contexts=updated_contexts,
+        )
+        return {
+            "candidate_count": len(effective_candidate_indexes),
+            "prompt_count": len(review_bundle["prompt_items"]),
+            "updated_entity_count": len(updated_indexes),
+            "extra_entity_count": manual_extra_count + len(extra_entities),
+            "dropped_entity_count": len(dropped_indexes),
+            "review_text_length": len(effective_review_text),
+            "applied": bool(updated_indexes or subset_candidate_entities or extra_entities or dropped_indexes),
+        }
+
+    def _build_large_document_residual_review_entities(
+        self,
+        *,
+        residual_hits: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        review_entities: List[Dict[str, Any]] = []
+        seen: set[tuple[int, int, str]] = set()
+        for hit in residual_hits:
+            entity_type = str(hit.get("type", "")).strip().upper()
+            start = int(hit.get("start", 0))
+            end = int(hit.get("end", 0))
+            text = str(hit.get("variant") or "").strip()
+            if not entity_type or not text or start < 0 or end <= start:
+                continue
+            key = (start, end, entity_type)
+            if key in seen:
+                continue
+            seen.add(key)
+            review_entities.append(
+                {
+                    "type": entity_type,
+                    "text": text,
+                    "start": start,
+                    "end": end,
+                    "score": 0.82,
+                    "source": "large_document_subset_review",
+                    "metadata": {
+                        "canonical_key": self._sanitize_canonical_key(hit.get("canonical_key")),
+                        "residual_variant": text,
+                        "residual_scan": True,
+                        "weak_reference": bool(hit.get("weak_reference")),
+                    },
+                }
+            )
+        return review_entities
+
+    def _materialize_subset_review_candidate_entities(
+        self,
+        *,
+        existing_entities: List[Dict],
+        review_entities: List[Dict],
+        updates_by_id: Dict[str, Dict[str, Any]],
+        entity_indexes_by_id: Dict[str, List[int]],
+        allowed_canonical_keys_by_id: Dict[str, List[str]],
+    ) -> List[Dict]:
+        occupied = {
+            (int(entity["start"]), int(entity["end"]), str(entity["type"]))
+            for entity in existing_entities
+        }
+        occupied_ranges = [(int(entity["start"]), int(entity["end"])) for entity in existing_entities]
+        additions: List[Dict] = []
+
+        for item_id, entity_indexes in entity_indexes_by_id.items():
+            update = updates_by_id.get(item_id)
+            if not update:
+                continue
+            canonical_key = self._sanitize_canonical_key(update.get("canonical_key"))
+            canonical_role = str(update.get("canonical_role", "")).strip().upper()
+            allowed_canonical_keys = {
+                self._sanitize_canonical_key(value)
+                for value in allowed_canonical_keys_by_id.get(item_id, [])
+                if self._sanitize_canonical_key(value)
+            }
+            for entity_index in entity_indexes:
+                if entity_index < len(existing_entities) or entity_index >= len(review_entities):
+                    continue
+                if canonical_key and allowed_canonical_keys and canonical_key not in allowed_canonical_keys:
+                    continue
+                source_entity = review_entities[entity_index]
+                entity_type = str(source_entity.get("type", ""))
+                start = int(source_entity.get("start", 0))
+                end = int(source_entity.get("end", 0))
+                if not canonical_key or start >= end:
+                    continue
+                if (start, end, entity_type) in occupied:
+                    continue
+                if any(start < existing_end and end > existing_start for existing_start, existing_end in occupied_ranges):
+                    continue
+                metadata = dict(source_entity.get("metadata") or {})
+                metadata["canonical_key"] = canonical_key
+                if canonical_role in self.RESOLUTION_ROLES:
+                    metadata["canonical_role"] = canonical_role
+                additions.append(
+                    {
+                        "type": entity_type,
+                        "text": str(source_entity.get("text", "")),
+                        "start": start,
+                        "end": end,
+                        "score": float(source_entity.get("score", 0.82) or 0.82),
+                        "source": "large_document_subset_review",
+                        "canonical_key": canonical_key,
+                        "canonical_role": canonical_role if canonical_role in self.RESOLUTION_ROLES else None,
+                        "metadata": metadata,
+                    }
+                )
+                occupied.add((start, end, entity_type))
+                occupied_ranges.append((start, end))
+        return additions
+
+    def _build_large_document_review_text(
+        self,
+        *,
+        text: str,
+        contexts: List[Dict[str, Any]],
+        candidate_indexes: List[int],
+        llm_model: Optional[str] = None,
+    ) -> str:
+        limit = self._get_review_text_limit(llm_model, text_length=len(text))
+        blocks: List[str] = []
+        seen_blocks: set[str] = set()
+
+        for index in candidate_indexes:
+            if index < 0 or index >= len(contexts):
+                continue
+            context = contexts[index]
+            block = str(context.get("line", "") or "").strip()
+            if not block or block in seen_blocks:
+                continue
+            seen_blocks.add(block)
+            blocks.append(block)
+
+        review_text = "\n\n".join(blocks).strip()
+        if not review_text:
+            review_text = text[:limit]
+        elif len(review_text) > limit:
+            review_text = review_text[:limit]
+        return review_text
+
+    def _build_large_document_subject_ledger(
+        self,
+        *,
+        groups: Dict[str, Dict[str, Any]],
+        entities: List[Dict],
+        group_keys: List[str],
+    ) -> List[Dict[str, Any]]:
+        occurrence_counts: Dict[str, int] = {}
+        for group_key in group_keys:
+            normalized = self._sanitize_canonical_key(group_key) or str(group_key)
+            occurrence_counts[normalized] = occurrence_counts.get(normalized, 0) + 1
+
+        ordered_groups = sorted(groups.items(), key=lambda item: item[1]["first_start"])
+        ledger: List[Dict[str, Any]] = []
+        for group_key, group in ordered_groups:
+            normalized_key = self._sanitize_canonical_key(group_key) or str(group_key)
+            primary_entity = group.get("primary_entity") or {}
+            primary_metadata = primary_entity.get("metadata") or {}
+            variants = sorted(
+                {
+                    str(entity.get("text", "")).strip()
+                    for entity in group.get("entities", [])
+                    if str(entity.get("text", "")).strip()
+                }
+            )
+            ledger.append(
+                {
+                    "ledger_key": normalized_key,
+                    "canonical_key": self._canonical_key_from_entity(primary_entity) or normalized_key,
+                    "canonical_role": str(primary_entity.get("canonical_role", "")).strip().upper()
+                    or self._pick_group_role(group),
+                    "primary_text": str(primary_entity.get("text", "")).strip(),
+                    "primary_type": str(primary_entity.get("type", "")).strip(),
+                    "occurrence_count": occurrence_counts.get(normalized_key, 0),
+                    "variant_count": len(variants),
+                    "variants": variants[:8],
+                    "first_start": int(group.get("first_start", 0)),
+                    "definition_anchor": bool(
+                        primary_metadata.get("definition_alias")
+                        or primary_metadata.get("definition_full_text")
+                        or primary_metadata.get("canonical")
+                    ),
+                    "conflict": bool(primary_metadata.get("memory_conflict")),
+                }
+            )
+        return ledger
+
+    def _large_document_policy(
+        self,
+        *,
+        text: str,
+        entities: List[Dict],
+        use_llm: bool,
+        precision_multi_review: bool,
+        source_metadata: Optional[Dict[str, Any]] = None,
+        source_structure: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        entity_count = len(entities)
+        workflow = classify_document_workflow(
+            text=text,
+            source_metadata=source_metadata,
+            source_structure=source_structure,
+        )
+        page_count = int(workflow["page_count"])
+        text_length = int(workflow["text_length"])
+        enabled = bool(workflow["enabled"])
+        if not enabled:
+            return {
+                "enabled": False,
+                "page_count": page_count,
+                "text_length": text_length,
+                "entity_count": entity_count,
+                "recall_rounds": 3 if precision_multi_review else (2 if use_llm else 1),
+                "repair_rounds": 4 if precision_multi_review else 3,
+                "max_residual_entity_additions": 500,
+                "max_residual_hits": 20,
+                "allow_weak_org_refs": True,
+                "max_residual_hit_repairs": 24,
+            }
+        return {
+            "enabled": True,
+            "page_count": page_count,
+            "text_length": text_length,
+            "entity_count": entity_count,
+            "recall_rounds": 1,
+            "repair_rounds": 1,
+            "max_residual_entity_additions": 120,
+            "max_residual_hits": 8,
+            "allow_weak_org_refs": False,
+            "max_residual_hit_repairs": 8,
+        }
+
+    def _resolve_large_document_page_count(
+        self,
+        *,
+        source_metadata: Optional[Dict[str, Any]] = None,
+        source_structure: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        return resolve_large_document_page_count(
+            source_metadata=source_metadata,
+            source_structure=source_structure,
+        )
+
+    def _is_large_document_anchor_entity(self, text: str, entity: Dict[str, Any]) -> bool:
+        entity_type = str(entity.get("type", "")).strip().upper()
+        if entity_type not in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME"}:
+            return False
+
+        entity_text = str(entity.get("text", "") or "").strip()
+        normalized = self._normalize_group_text(entity_text)
+        if not normalized or not looks_like_organization_short_name(normalized):
+            return False
+        if self._looks_like_organization_name(entity_text):
+            return False
+        if is_identity_reference_term(normalized) or is_position_title(normalized) or is_generic_organization_term(normalized):
+            return False
+
+        context = self._build_minimal_context(text, entity)
+        role = str(self._party_role_from_context(context) or context.get("role") or "").strip()
+        label = str(context.get("label") or "").strip()
+        line = str(context.get("line") or "").strip()
+
+        if role in {"甲方", "乙方", "丙方"}:
+            return True
+        if label in {"甲方", "乙方", "丙方", "委托方", "受托方", "发包人", "承包人", "采购人", "供应商"}:
+            return True
+        return bool(line and normalized in self._normalize_group_text(line) and any(token in line for token in ("公司", "企业", "集团", "机构", "单位")))
+
+    def _mark_large_document_anchor_entities(
+        self,
+        *,
+        text: str,
+        entities: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        marked: List[Dict[str, Any]] = []
+        for entity in entities:
+            item = dict(entity)
+            if not self._is_large_document_anchor_entity(text, item):
+                marked.append(item)
+                continue
+            metadata = dict(item.get("metadata") or {})
+            metadata["large_document_anchor"] = True
+            metadata.setdefault("definition_anchor", True)
+            metadata.setdefault("short_org_candidate", True)
+            metadata.setdefault("identity_surface", self._normalize_group_text(str(item.get("text", "") or "")))
+            item["metadata"] = metadata
+            marked.append(item)
+        return marked
+
+    def _restore_large_document_anchor_entities(
+        self,
+        *,
+        text: str,
+        prepared_entities: List[Dict[str, Any]],
+        raw_entities: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        prepared = self._mark_large_document_anchor_entities(text=text, entities=prepared_entities)
+        if not raw_entities:
+            return prepared
+
+        existing_keys = {
+            (
+                str(item.get("type", "")).strip().upper(),
+                int(item.get("start", 0)),
+                int(item.get("end", 0)),
+                str(item.get("text", "")).strip(),
+            )
+            for item in prepared
+        }
+        restored = list(prepared)
+        for entity in self._mark_large_document_anchor_entities(text=text, entities=raw_entities):
+            metadata = entity.get("metadata") or {}
+            if not metadata.get("large_document_anchor"):
+                continue
+            key = (
+                str(entity.get("type", "")).strip().upper(),
+                int(entity.get("start", 0)),
+                int(entity.get("end", 0)),
+                str(entity.get("text", "")).strip(),
+            )
+            if key in existing_keys:
+                continue
+            restored.append(entity)
+            existing_keys.add(key)
+
+        return self._sort_and_deduplicate_entities(restored)
+
+    def _prune_invalid_entities_for_large_document(
+        self,
+        *,
+        entities: List[Dict[str, Any]],
+        text: str,
+    ) -> List[Dict[str, Any]]:
+        marked = self._mark_large_document_anchor_entities(text=text, entities=entities)
+        filtered = self._prune_invalid_entities(marked, full_text=text)
+        return self._restore_large_document_anchor_entities(
+            text=text,
+            prepared_entities=filtered,
+            raw_entities=marked,
+        )
+
+    def _apply_metadata_identity_hints(
+        self,
+        entities: List[Dict],
+        *,
+        materialize_short_org_hints: bool = True,
+    ) -> List[Dict]:
         enriched: List[Dict] = []
         for entity in entities:
             item = dict(entity)
@@ -926,6 +4699,19 @@ class ContextualDesensitizationService:
                 item["canonical_key"] = metadata["canonical_key"]
             if not item.get("canonical_role") and metadata.get("canonical_role"):
                 item["canonical_role"] = metadata["canonical_role"]
+            if (
+                materialize_short_org_hints
+                and
+                not item.get("canonical_key")
+                and str(item.get("type") or "").upper() in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME"}
+                and metadata.get("short_org_candidate")
+                and not metadata.get("large_document_anchor")
+            ):
+                identity_surface = self._normalize_group_text(
+                    str(metadata.get("identity_surface") or item.get("text") or "")
+                )
+                if identity_surface:
+                    item["canonical_key"] = f"ORG_SHORT::{identity_surface}"
             enriched.append(item)
         return enriched
 
@@ -1042,7 +4828,7 @@ class ContextualDesensitizationService:
         return {
             "primary_entity": winner["entity"],
             "primary_context": winner["context"],
-            "canonical_role": self._pick_group_role(group),
+            "canonical_role": self._pick_group_canonical_role(group),
             "source_layer": winner["source_layer"],
             "source_priority": winner["source_priority"],
             "conflict": bool(conflict_reasons),
@@ -1140,6 +4926,7 @@ class ContextualDesensitizationService:
         entities: List[Dict],
         entity_memory: Dict[str, Dict[str, Any]],
         explicit_types: set[str],
+        max_added: int = 500,
     ) -> List[Dict]:
         occupied = {(int(item["start"]), int(item["end"]), str(item["type"])) for item in entities}
         occupied_ranges = [(int(item["start"]), int(item["end"])) for item in entities]
@@ -1148,6 +4935,8 @@ class ContextualDesensitizationService:
         for group_key, memory in entity_memory.items():
             entity_type = str(memory["primary_type"])
             if entity_type in explicit_types:
+                continue
+            if entity_type == "POSITION":
                 continue
             if entity_type not in self.GROUPABLE_TYPES:
                 continue
@@ -1188,6 +4977,8 @@ class ContextualDesensitizationService:
                     )
                     occupied.add(key)
                     occupied_ranges.append((start, end))
+                    if len(residual_entities) >= max_added:
+                        return residual_entities
                     break
 
         return residual_entities
@@ -1199,6 +4990,8 @@ class ContextualDesensitizationService:
         entities: List[Dict],
         entity_memory: Dict[str, Dict[str, Any]],
         explicit_types: set[str],
+        max_hits: int = 20,
+        allow_weak_org_refs: bool = True,
     ) -> List[Dict[str, Any]]:
         covered = {
             (int(entity["start"]), int(entity["end"]), str(entity["type"]))
@@ -1210,6 +5003,8 @@ class ContextualDesensitizationService:
         for group_key, memory in entity_memory.items():
             entity_type = str(memory["primary_type"])
             if entity_type in explicit_types:
+                continue
+            if entity_type == "POSITION":
                 continue
             for variant in memory["variants"]:
                 if (
@@ -1243,10 +5038,172 @@ class ContextualDesensitizationService:
                             "window_text": context.get("window_text", ""),
                         }
                     )
-                    if len(hits) >= 20:
+                    if len(hits) >= max_hits:
                         return hits
                     break
+        if allow_weak_org_refs and len(hits) < max_hits:
+            weak_reference_hits = self._collect_weak_organization_reference_hits(
+                text=text,
+                entities=entities,
+                entity_memory=entity_memory,
+                covered=covered,
+                covered_ranges=covered_ranges,
+            )
+            for hit in weak_reference_hits:
+                hits.append(hit)
+                if len(hits) >= max_hits:
+                    break
         return hits
+
+    def _collect_weak_organization_reference_hits(
+        self,
+        *,
+        text: str,
+        entities: List[Dict],
+        entity_memory: Dict[str, Dict[str, Any]],
+        covered: set[tuple[int, int, str]],
+        covered_ranges: List[tuple[int, int]],
+    ) -> List[Dict[str, Any]]:
+        support_mentions: List[Dict[str, Any]] = []
+        for entity in entities:
+            entity_type = str(entity.get("type", "")).upper()
+            if entity_type not in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME", "ALIAS"}:
+                continue
+            group_key = self._canonical_key_from_entity(entity) or str(
+                (entity.get("metadata") or {}).get("resolved_group_key") or ""
+            ).strip()
+            memory = entity_memory.get(group_key)
+            if not group_key or not memory or not self._supports_company_weak_reference(memory):
+                continue
+            if self._is_weak_organization_reference(str(entity.get("text", ""))) and not self._sanitize_canonical_key(group_key):
+                continue
+            support_mentions.append(
+                {
+                    "group_key": group_key,
+                    "start": int(entity.get("start", 0)),
+                    "end": int(entity.get("end", 0)),
+                }
+            )
+
+        hits: List[Dict[str, Any]] = []
+        for weak_ref in sorted(self.WEAK_ORGANIZATION_REFERENCES, key=len, reverse=True):
+            for start, end in self._find_text_spans(text, weak_ref):
+                if (start, end, "ORGANIZATION") in covered:
+                    continue
+                if any(start < existing_end and end > existing_start for existing_start, existing_end in covered_ranges):
+                    continue
+                group_key = self._resolve_weak_reference_group_key(
+                    text=text,
+                    start=start,
+                    end=end,
+                    support_mentions=support_mentions,
+                )
+                memory = entity_memory.get(group_key or "")
+                if not group_key or not memory:
+                    continue
+                context = self._build_context(
+                    text,
+                    {
+                        "type": "ORGANIZATION",
+                        "text": text[start:end],
+                        "start": start,
+                        "end": end,
+                    },
+                )
+                hits.append(
+                    {
+                        "canonical_key": group_key,
+                        "type": "ORGANIZATION",
+                        "variant": weak_ref,
+                        "start": start,
+                        "end": end,
+                        "line": context.get("line", ""),
+                        "window_text": context.get("window_text", ""),
+                        "weak_reference": True,
+                    }
+                )
+                covered.add(("ORGANIZATION", start, end, weak_ref))
+                covered_ranges.append((start, end))
+        return hits
+
+    def _resolve_weak_reference_group_key(
+        self,
+        *,
+        text: str,
+        start: int,
+        end: int,
+        support_mentions: List[Dict[str, Any]],
+    ) -> str:
+        if not support_mentions:
+            return ""
+
+        current_context = self._build_context(
+            text,
+            {
+                "type": "ORGANIZATION",
+                "text": text[start:end],
+                "start": start,
+                "end": end,
+            },
+        )
+        current_line_start = int(current_context.get("line_start", 0))
+        line_mentions = [
+            item
+            for item in support_mentions
+            if item["start"] >= current_line_start and item["end"] <= int(current_context.get("line_end", end))
+        ]
+        unique_line_groups = {item["group_key"] for item in line_mentions}
+        if len(unique_line_groups) == 1:
+            return next(iter(unique_line_groups))
+        if len(unique_line_groups) > 1:
+            return ""
+
+        if current_line_start > 0:
+            previous_line_end = current_line_start - 1
+            previous_line_start = text.rfind("\n", 0, previous_line_end) + 1
+            previous_line_mentions = [
+                item
+                for item in support_mentions
+                if item["start"] >= previous_line_start and item["end"] <= previous_line_end
+            ]
+            unique_previous_groups = {item["group_key"] for item in previous_line_mentions}
+            if len(unique_previous_groups) == 1:
+                previous_group = next(iter(unique_previous_groups))
+                conflicting_between_lines = [
+                    item
+                    for item in support_mentions
+                    if item["group_key"] != previous_group
+                    and item["start"] >= previous_line_start
+                    and item["end"] <= start
+                ]
+                if not conflicting_between_lines:
+                    return previous_group
+            elif len(unique_previous_groups) > 1:
+                return ""
+
+        preceding = [
+            item for item in support_mentions if item["end"] <= start and 0 <= start - item["end"] <= 120
+        ]
+        if not preceding:
+            return ""
+        preceding.sort(key=lambda item: (start - item["end"], -item["end"]))
+        best = preceding[0]
+        conflicting = [
+            item
+            for item in preceding[1:]
+            if item["group_key"] != best["group_key"] and (start - item["end"]) <= 60
+        ]
+        if conflicting:
+            return ""
+        between_text = text[best["end"] : start]
+        if any(token in between_text for token in ("。", "；", ";", "\n\n")):
+            return ""
+        return str(best["group_key"])
+
+    def _supports_company_weak_reference(self, memory: Dict[str, Any]) -> bool:
+        primary_text = str(memory.get("primary_text", "") or "")
+        normalized = self._normalize_group_text(primary_text)
+        return any(token in normalized for token in ("公司", "集团", "企业", "商行"))
 
     def _normalize_replacement_text(self, value: Any) -> str:
         if value is None:
@@ -1256,25 +5213,53 @@ class ContextualDesensitizationService:
             return ""
         return replacement
 
-    def _prune_invalid_entities(self, entities: List[Dict]) -> List[Dict]:
+    def _prune_invalid_entities(self, entities: List[Dict], full_text: str = "") -> List[Dict]:
         filtered: List[Dict] = []
         removed = 0
         for entity in entities:
             entity_type = str(entity.get("type", "")).upper()
-            if entity_type in {"PERSON", "PERSON_NAME", "ORGANIZATION", "COMPANY_NAME", "PROJECT"} and self._is_non_entity_heading_candidate(
-                str(entity.get("text", ""))
+            entity_text = str(entity.get("text", ""))
+            organization_metadata = self._build_organization_validation_metadata(entity)
+            if entity_type in {"PERSON", "PERSON_NAME", "ORGANIZATION", "COMPANY_NAME", "PROJECT", "POSITION"} and self._is_non_entity_heading_candidate(
+                entity_text
+            ):
+                removed += 1
+                continue
+            if entity_type in {"PERSON", "PERSON_NAME"} and (
+                is_identity_reference_term(entity_text)
+                or is_position_title(entity_text)
+                or is_org_like_text(entity_text)
+            ):
+                removed += 1
+                continue
+            if entity_type == "POSITION" and is_identity_reference_term(entity_text):
+                removed += 1
+                continue
+            if entity_type in {"ORGANIZATION", "COMPANY_NAME", "COURT"} and self._is_numbered_fragment_entity(
+                entity_text
+            ):
+                removed += 1
+                continue
+            if (
+                entity_type in {"ORGANIZATION", "COMPANY_NAME"}
+                and is_probable_person(entity_text)
+                and not self._should_keep_reviewed_short_org_candidate(
+                    entity_text,
+                    source=str(entity.get("source", "")),
+                    metadata=organization_metadata,
+                )
             ):
                 removed += 1
                 continue
             if entity_type in {"ORGANIZATION", "COMPANY_NAME"} and not self._is_valid_organization_variant(
-                str(entity.get("text", "")),
-                primary_text=str(entity.get("text", "")),
+                entity_text,
+                primary_text=entity_text,
                 source=str(entity.get("source", "")),
-                metadata=entity.get("metadata") or {},
+                metadata=organization_metadata,
             ):
                 removed += 1
                 continue
-            if entity_type in self.PRESERVE_TYPES:
+            if entity.get("replacement") is None:
                 entity = dict(entity)
                 entity.pop("replacement", None)
             filtered.append(entity)
@@ -1282,6 +5267,89 @@ class ContextualDesensitizationService:
         if removed:
             logger.info("Pruned %s invalid organization entities before replacement", removed)
         return filtered
+
+    def _is_numbered_fragment_entity(self, text: str) -> bool:
+        compact = re.sub(r"\s+", "", str(text or ""))
+        if not compact:
+            return False
+        return re.match(r"^[（(]?(?:\d+|[一二三四五六七八九十]+)[)）]", compact) is not None
+
+    def _build_organization_validation_metadata(self, entity: Dict[str, Any]) -> Dict[str, Any]:
+        metadata = dict(entity.get("metadata") or {})
+        canonical_key = self._canonical_key_from_entity(entity)
+        if canonical_key and not metadata.get("canonical_key"):
+            metadata["canonical_key"] = canonical_key
+        canonical_role = str(entity.get("canonical_role") or "").strip().upper()
+        if canonical_role and canonical_role in self.RESOLUTION_ROLES and not metadata.get("canonical_role"):
+            metadata["canonical_role"] = canonical_role
+        return metadata
+
+    def _should_keep_reviewed_short_org_candidate(
+        self,
+        text: str,
+        *,
+        source: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        metadata = metadata or {}
+        normalized = self._normalize_group_text(text)
+        if not looks_like_organization_short_name(normalized):
+            return False
+        if (
+            is_identity_reference_term(normalized)
+            or is_position_title(normalized)
+            or is_generic_organization_term(normalized)
+            or strip_identity_reference_prefix(normalized)
+        ):
+            return False
+
+        if (
+            metadata.get("canonical_key")
+            or metadata.get("definition_alias")
+            or metadata.get("definition_full_text")
+            or metadata.get("canonical")
+            or metadata.get("residual_scan")
+            or metadata.get("large_document_anchor")
+        ):
+            return True
+
+        role = str(metadata.get("role") or "").strip()
+        if role in {
+            "甲方",
+            "乙方",
+            "丙方",
+            "委托方",
+            "受托方",
+            "发包人",
+            "承包人",
+            "采购人",
+            "供应商",
+            "收款单位",
+        }:
+            return True
+
+        snippet_type = str(metadata.get("snippet_type") or "").strip().lower()
+        if snippet_type == "quality_gate_block":
+            return True
+
+        risk_reason = str(metadata.get("risk_reason") or "").strip().lower()
+        if risk_reason in {"organization_action_cue", "final_entity_quality_gate"}:
+            return True
+
+        source_text = str(source or "").strip().lower()
+        source_layer = str(metadata.get("source_layer") or "").strip().lower()
+        review_backed = bool(
+            metadata.get("review")
+            or source_layer == "llm_review"
+            or source_text in {"qwen_fragment_review", "qwen_heavy_arbitration"}
+        )
+        if not review_backed:
+            return False
+
+        if source_text in {"qwen_fragment_review", "qwen_heavy_arbitration"}:
+            return True
+
+        return False
 
     def _is_non_entity_heading_candidate(self, text: str) -> bool:
         normalized = re.sub(r"[\s:：，,。；;（）()《》【】\"“”'`]", "", str(text or ""))
@@ -1291,10 +5359,19 @@ class ContextualDesensitizationService:
 
     def _strip_organization_suffix(self, text: str) -> str:
         return re.sub(
-            r"(股份有限公司|有限责任公司|有限公司|集团有限公司|集团|研究院|研究所|事务所|服务中心|中心|银行|支行|分行|子公司|分公司|公司)$",
+            r"(股份有限公司|有限责任公司|有限公司|集团有限公司|集团|研究院|研究所|事务所|服务中心|中心|银行|支行|分行|子公司|分公司|公司|商行|合作社|工作室|经营部|门市部|营业部|办事处|基金会|联合会|学校|医院|协会)$",
             "",
             text,
         )
+
+    def _strip_organization_business_suffix(self, text: str) -> str:
+        normalized = self._normalize_group_text(text)
+        if len(normalized) < 3:
+            return normalized
+        for token in sorted(self.ORGANIZATION_BUSINESS_SUFFIXES, key=len, reverse=True):
+            if normalized.endswith(token) and len(normalized) - len(token) >= 2:
+                return normalized[: -len(token)]
+        return normalized
 
     def _looks_like_identifier_like_text(self, text: str) -> bool:
         normalized = self._normalize_group_text(text)
@@ -1320,10 +5397,18 @@ class ContextualDesensitizationService:
         source: str = "",
         metadata: Optional[Dict[str, Any]] = None,
     ) -> bool:
+        metadata = metadata or {}
         normalized = self._normalize_group_text(text)
         if len(normalized) < 2:
             return False
+        if metadata.get("weak_reference") and self._sanitize_canonical_key(metadata.get("canonical_key")):
+            return self._is_weak_organization_reference(normalized)
+        prefixed_remainder = strip_identity_reference_prefix(normalized)
+        if prefixed_remainder:
+            return False
         if self._looks_like_identifier_like_text(normalized):
+            return False
+        if is_generic_organization_term(normalized):
             return False
         if normalized in self.ORGANIZATION_GENERIC_TERMS:
             return False
@@ -1338,7 +5423,6 @@ class ContextualDesensitizationService:
 
         core = self._strip_organization_suffix(normalized)
         if self._looks_like_organization_name(normalized):
-            metadata = metadata or {}
             if len(core) < 2:
                 anchor_short_name = (
                     bool(metadata.get("definition_alias") or metadata.get("definition_full_text"))
@@ -1360,7 +5444,6 @@ class ContextualDesensitizationService:
         if re.fullmatch(r"[\u4e00-\u9fa5]{2,6}", normalized) is None:
             return False
         if source.startswith("ollama") and source not in {"memory_residual", "residual_repair", "propagate"}:
-            metadata = metadata or {}
             if not (
                 metadata.get("canonical_key")
                 or metadata.get("definition_alias")
@@ -1370,7 +5453,6 @@ class ContextualDesensitizationService:
 
         primary_normalized = self._normalize_group_text(primary_text)
         if primary_normalized and normalized not in primary_normalized and primary_normalized not in normalized:
-            metadata = metadata or {}
             if not (metadata.get("definition_alias") or metadata.get("definition_full_text")):
                 return False
         return True
@@ -1380,10 +5462,12 @@ class ContextualDesensitizationService:
         *,
         entities: List[Dict],
         group_keys: List[str],
+        strategy_key: str = DEFAULT_ANONYMIZATION_STRATEGY,
     ) -> List[Dict[str, Any]]:
         issues: List[Dict[str, Any]] = []
         replacement_sets: Dict[str, set[str]] = {}
         seen_texts: Dict[str, set[str]] = {}
+        strategy_profile = get_anonymization_strategy_profile(strategy_key)
 
         for entity, group_key in zip(entities, group_keys):
             replacement = self._normalize_replacement_text(entity.get("replacement"))
@@ -1415,23 +5499,111 @@ class ContextualDesensitizationService:
                     }
                 )
 
+        for entity, group_key in zip(entities, group_keys):
+            metadata = entity.get("metadata") or {}
+            if metadata.get("memory_conflict"):
+                issues.append(
+                    {
+                        "type": "group_memory_conflict",
+                        "canonical_key": group_key,
+                        "text": str(entity.get("text", "")),
+                        "reasons": list(metadata.get("memory_conflict_reasons", [])),
+                    }
+                )
+
         return issues
 
-    def _harmonize_duplicate_text_replacements(self, entities: List[Dict]) -> List[Dict]:
-        preferred_replacements: Dict[str, str] = {}
+    def _collect_large_document_terminal_issues(
+        self,
+        *,
+        entities: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        issues: List[Dict[str, Any]] = []
+        replacement_to_subjects: Dict[str, set[str]] = {}
+
+        for entity in entities:
+            canonical_key = self._canonical_key_from_entity(entity)
+            metadata = entity.get("metadata") or {}
+            if canonical_key.startswith("ORG_OCC_") or metadata.get("provisional_canonical"):
+                issues.append(
+                    {
+                        "type": "provisional_canonical_key_leak",
+                        "canonical_key": canonical_key,
+                        "text": str(entity.get("text", "")),
+                    }
+                )
+
+            replacement = self._normalize_replacement_text(entity.get("replacement"))
+            if not replacement or not canonical_key:
+                continue
+            family = self.GROUP_FAMILIES.get(str(entity.get("type", "")).strip().upper(), "")
+            if family not in {"person", "organization", "project", "bank", "location", "address", "court"}:
+                continue
+            replacement_to_subjects.setdefault(replacement, set()).add(canonical_key)
+
+        for replacement, canonical_keys in replacement_to_subjects.items():
+            if len(canonical_keys) <= 1:
+                continue
+            issues.append(
+                {
+                    "type": "replacement_reused_across_subjects",
+                    "replacement": replacement,
+                    "canonical_keys": sorted(canonical_keys),
+                }
+            )
+
+        return issues
+
+    def _summarize_large_document_terminal_issues(
+        self,
+        terminal_issues: List[Dict[str, Any]],
+    ) -> str:
+        if not terminal_issues:
+            return ""
+        counts: Dict[str, int] = {}
+        for item in terminal_issues:
+            issue_type = str(item.get("type", "")).strip() or "unknown"
+            counts[issue_type] = counts.get(issue_type, 0) + 1
+        return ", ".join(f"{key}={value}" for key, value in sorted(counts.items()))
+
+    def _harmonize_duplicate_text_replacements(
+        self,
+        entities: List[Dict],
+        *,
+        group_keys: Optional[List[str]] = None,
+        strategy_key: str = DEFAULT_ANONYMIZATION_STRATEGY,
+    ) -> List[Dict]:
+        strategy_profile = get_anonymization_strategy_profile(strategy_key)
+        if strategy_profile.key not in {"symbolic_codes", "serial_roles"}:
+            return [dict(entity) for entity in sorted(entities, key=lambda item: (int(item["start"]), int(item["end"])))]
         ordered_entities = sorted(entities, key=lambda item: (int(item["start"]), int(item["end"])))
-        for entity in ordered_entities:
+        ordered_group_keys: List[str] = []
+        if group_keys and len(group_keys) == len(entities):
+            ordered_group_keys = [
+                key
+                for _, key in sorted(
+                    zip(entities, group_keys),
+                    key=lambda item: (int(item[0]["start"]), int(item[0]["end"])),
+                )
+            ]
+        else:
+            ordered_group_keys = [self._canonical_key_from_entity(entity) for entity in ordered_entities]
+
+        preferred_replacements: Dict[str, str] = {}
+        for entity, group_key in zip(ordered_entities, ordered_group_keys):
             replacement = self._normalize_replacement_text(entity.get("replacement"))
             if not replacement:
                 continue
-            normalized = self._normalize_group_text(str(entity.get("text", "")))
-            preferred_replacements.setdefault(normalized, replacement)
+            normalized_group_key = self._sanitize_canonical_key(group_key)
+            if not normalized_group_key:
+                continue
+            preferred_replacements.setdefault(normalized_group_key, replacement)
 
         harmonized: List[Dict] = []
-        for entity in ordered_entities:
+        for entity, group_key in zip(ordered_entities, ordered_group_keys):
             item = dict(entity)
-            normalized = self._normalize_group_text(str(item.get("text", "")))
-            replacement = preferred_replacements.get(normalized)
+            normalized_group_key = self._sanitize_canonical_key(group_key)
+            replacement = preferred_replacements.get(normalized_group_key, "")
             if replacement and item.get("replacement") != replacement:
                 item["replacement"] = replacement
                 item["replacement_method"] = "contextual_consistent"
@@ -1500,9 +5672,40 @@ class ContextualDesensitizationService:
         entity_memory: Dict[str, Dict[str, Any]],
         consistency_issues: List[Dict[str, Any]],
         residual_hits: List[Dict[str, Any]],
+        max_residual_hit_additions: int = 24,
     ) -> tuple[List[Dict], bool]:
         repaired_entities = [dict(entity) for entity in entities]
         changed = False
+
+        conflict_group_keys = {
+            self._sanitize_canonical_key(item.get("canonical_key"))
+            for item in consistency_issues
+            if item.get("type") == "group_memory_conflict" and self._sanitize_canonical_key(item.get("canonical_key"))
+        }
+        if conflict_group_keys:
+            sanitized_entities: List[Dict[str, Any]] = []
+            for entity in repaired_entities:
+                item = dict(entity)
+                canonical_key = self._canonical_key_from_entity(item)
+                if canonical_key and canonical_key in conflict_group_keys:
+                    metadata = dict(item.get("metadata") or {})
+                    source_layer = self._source_layer(item)
+                    has_definition_anchor = bool(
+                        metadata.get("definition_alias")
+                        or metadata.get("definition_full_text")
+                        or metadata.get("canonical")
+                    )
+                    if source_layer in {"llm_review", "llm_semantic", "unknown", "residual", "propagated"} and not has_definition_anchor:
+                        item.pop("canonical_key", None)
+                        if item.get("canonical_role") in {"PERSON", "ORGANIZATION"}:
+                            item.pop("canonical_role", None)
+                        if metadata.get("canonical_key"):
+                            metadata.pop("canonical_key", None)
+                        if metadata:
+                            item["metadata"] = metadata
+                        changed = True
+                sanitized_entities.append(item)
+            repaired_entities = sanitized_entities
 
         if residual_hits:
             extra_entities = self._materialize_residual_hit_entities(
@@ -1510,6 +5713,7 @@ class ContextualDesensitizationService:
                 residual_hits=residual_hits,
                 entity_memory=entity_memory,
                 existing_entities=repaired_entities,
+                max_added=max_residual_hit_additions,
             )
             if extra_entities:
                 repaired_entities.extend(extra_entities)
@@ -1533,6 +5737,17 @@ class ContextualDesensitizationService:
             for entity, group_key, context in zip(repaired_entities, group_keys, contexts):
                 if entity["type"] in explicit_types or entity["type"] not in self.GROUPABLE_TYPES:
                     continue
+                if entity["type"] == "ALIAS":
+                    alias_replacement = self._resolve_alias_replacement(
+                        entity=entity,
+                        text_groups=groups,
+                        replacements=replacement_map,
+                    )
+                    if alias_replacement and entity.get("replacement") != alias_replacement:
+                        entity["replacement"] = alias_replacement
+                        entity["replacement_method"] = "contextual_repaired"
+                        changed = True
+                        continue
                 replacement = replacement_map.get(group_key)
                 metadata = dict(entity.get("metadata") or {})
                 if replacement:
@@ -1564,7 +5779,11 @@ class ContextualDesensitizationService:
                     entity["replacement_method"] = "contextual_repaired"
                     changed = True
 
-            repaired_entities = self._harmonize_duplicate_text_replacements(repaired_entities)
+            repaired_entities = self._harmonize_duplicate_text_replacements(
+                repaired_entities,
+                group_keys=group_keys,
+                strategy_key=strategy_key,
+            )
 
         return repaired_entities, changed
 
@@ -1575,11 +5794,12 @@ class ContextualDesensitizationService:
         residual_hits: List[Dict[str, Any]],
         entity_memory: Dict[str, Dict[str, Any]],
         existing_entities: List[Dict],
+        max_added: int = 24,
     ) -> List[Dict]:
         occupied = {(int(item["start"]), int(item["end"]), str(item["type"])) for item in existing_entities}
         occupied_ranges = [(int(item["start"]), int(item["end"])) for item in existing_entities]
         additions: List[Dict] = []
-        for hit in residual_hits[:24]:
+        for hit in residual_hits[:max_added]:
             entity_type = str(hit.get("type", ""))
             start = int(hit.get("start", 0))
             end = int(hit.get("end", 0))
@@ -1605,6 +5825,7 @@ class ContextualDesensitizationService:
                         "residual_variant": hit.get("variant", ""),
                         "residual_scan": True,
                         "repair_round": True,
+                        "weak_reference": bool(hit.get("weak_reference")),
                     },
                 }
             )
@@ -1821,7 +6042,14 @@ class ContextualDesensitizationService:
 
         family = self.GROUP_FAMILIES.get(str(entity.get("type", "")), "")
         source_text = str(entity.get("text", ""))
-        role = str(context.get("role", "") or group.get("canonical_role", "") or "")
+        group_canonical_role = str(group.get("canonical_role", "") or "")
+        role = str(
+            context.get("role", "")
+            or self._party_label_from_canonical_role(group_canonical_role)
+            or self._pick_group_role(group)
+            or group.get("role", "")
+            or ""
+        )
         label = str(context.get("label", "") or "")
 
         rendered = ""
@@ -1833,6 +6061,17 @@ class ContextualDesensitizationService:
             )
         elif family == "bank":
             rendered = self._build_official_bank_alias(source_text)
+        elif family == "address":
+            rendered = self._build_official_address_alias(source_text)
+        elif family == "court":
+            if self._is_procedural_court_reference(source_text):
+                rendered = source_text
+            else:
+                rendered = self._build_surface_aware_organization_alias(
+                    source_text=source_text,
+                    role=role,
+                    label=label,
+                )
 
         if not rendered:
             return default_replacement, None
@@ -1882,7 +6121,7 @@ class ContextualDesensitizationService:
         prompt = self._build_llm_prompt(prompt_items)
 
         try:
-            payload = await asyncio.to_thread(ollama.generate_json, prompt, 1200)
+            payload = await ollama.generate_json_async(prompt, 1200)
             parsed = self._parse_llm_replacements(payload)
         except Exception as exc:
             logger.warning("Context-aware LLM anonymization failed: %s", exc)
@@ -1918,43 +6157,25 @@ class ContextualDesensitizationService:
         self,
         *,
         text: str,
-        entities: List[Dict],
-        contexts: List[Dict],
+        prompt_items: List[Dict[str, str]],
+        focus_lines: List[str],
+        subject_catalog: List[Dict[str, Any]],
         llm_model: Optional[str] = None,
+        review_text_override: Optional[str] = None,
     ) -> Dict[str, Any]:
-        prompt_items = []
-        for index, (entity, context) in enumerate(zip(entities, contexts), start=1):
-            prompt_items.append(
-                {
-                    "id": f"E{index}",
-                    "type": entity["type"],
-                    "text": entity["text"],
-                    "label": context.get("label") or "",
-                    "role_hint": context.get("role") or "",
-                    "line": context.get("line") or "",
-                }
-            )
-
-        focus_lines = self._collect_review_focus_lines(
-            text=text,
-            contexts=contexts,
-            max_lines=self._get_review_focus_line_limit(llm_model, text_length=len(text)),
-        )
         prompt = self._build_llm_resolution_prompt(
             text=text,
             prompt_items=prompt_items,
             focus_lines=focus_lines,
+            subject_catalog=subject_catalog,
             llm_model=llm_model,
+            review_text_override=review_text_override,
         )
-        ollama = self._get_ollama_service(llm_model=llm_model)
-        if ollama is None:
-            return {}
-
         try:
-            payload = await asyncio.to_thread(
-                ollama.generate_json,
-                prompt,
-                self._get_resolution_num_predict(llm_model, text_length=len(text)),
+            payload = await self._generate_resolution_payload(
+                prompt=prompt,
+                llm_model=llm_model,
+                text_length=len(review_text_override or text),
             )
         except Exception as exc:
             logger.warning("LLM entity resolution failed: %s", exc)
@@ -1969,22 +6190,33 @@ class ContextualDesensitizationService:
         text: str,
         prompt_items: List[Dict[str, str]],
         focus_lines: List[str],
+        subject_catalog: List[Dict[str, Any]],
         llm_model: Optional[str] = None,
+        review_text_override: Optional[str] = None,
     ) -> str:
         runtime = get_runtime_llm_strategy_profile(
             llm_model or settings.get_default_llm_model(),
-            text_length=len(text),
+            text_length=len(review_text_override or text),
         )
         strategy = runtime.strategy
         items_json = json.dumps(prompt_items, ensure_ascii=False, indent=2)
         focus_json = json.dumps(focus_lines, ensure_ascii=False, indent=2)
-        review_limit = self._get_review_text_limit(llm_model, text_length=len(text))
-        review_text = text if len(text) <= review_limit else text[:review_limit]
-        strategy_note = (
-            "Strategy note: this document uses the local 4B stability strategy. Recover missed entities, "
-            "abbreviation-linked mentions, footer/signature subjects, and full addresses, but keep every "
-            "judgment tied to verbatim text and the supplied focus lines."
-        )
+        subject_json = json.dumps(subject_catalog, ensure_ascii=False, indent=2)
+        source_text = review_text_override or text
+        review_limit = self._get_review_text_limit(llm_model, text_length=len(source_text))
+        review_text = source_text if len(source_text) <= review_limit else source_text[:review_limit]
+        if strategy.key == "review_27b":
+            strategy_note = (
+                "Strategy note: this document uses the dedicated 27B review workflow. Focus on subject "
+                "unification, abbreviation anchors, footer/signature subjects, role-bound names, and dense "
+                "narrative gaps, but keep every judgment tied to verbatim text and the supplied focus lines."
+            )
+        else:
+            strategy_note = (
+                "Strategy note: this document uses the local 4B stability strategy. Recover missed entities, "
+                "abbreviation-linked mentions, footer/signature subjects, and full addresses, but keep every "
+                "judgment tied to verbatim text and the supplied focus lines."
+            )
         return f"""
 You are reviewing entity recognition for a Chinese legal/business document.
 The document may be a contract, application, enforcement paper, pleading, statement, or other formal filing.
@@ -1998,22 +6230,30 @@ Goals:
 5. Prefer full official names and full addresses over shortened mentions when both appear verbatim.
 
 Rules:
-1. Use the same canonical_key for the same subject across full names, account names, repeated mentions, and footer/signature mentions.
-2. If an entity clearly refers to 甲方, use canonical_key PARTY_A. If it refers to 乙方, use PARTY_B. If it refers to 丙方, use PARTY_C.
-3. Recover missed entities from non-standard sections such as 住址/住所/住所地/身份证住址/通讯地址/送达地址, header blocks, footer blocks, signature blocks, account sections, court/institution lines, and dense narrative sections.
-4. In narrative text, pay special attention to short repeated company mentions like “铁鑫公司/荔富公司”, and person names triggered by cues such as “股东”“付款至”“支付给”“个人银行账户”.
-5. Extra entities must appear verbatim in the provided text.
-6. Do not add AMOUNT or DATE as extra entities.
-7. Do not invent abbreviations, aliases, or replacements.
-8. Return strict JSON only in this exact format:
+1. Use the same canonical_key for the same subject across full names, short names, account names, repeated mentions, and footer/signature mentions.
+2. Prioritize the supplied subject catalog. When a detected entity is a short form, shorthand, or weak narrative mention of a catalog subject, reuse that catalog subject's canonical_key instead of inventing a new one.
+3. If an entity clearly refers to 甲方, use canonical_key PARTY_A. If it refers to 乙方, use PARTY_B. If it refers to 丙方, use PARTY_C.
+4. Weak short forms still count as the same subject when the document text strongly supports that inference, especially for company names where the key brand/core name is preserved.
+5. Recover missed entities from non-standard sections such as 住址/住所/住所地/身份证住址/通讯地址/送达地址, header blocks, footer blocks, signature blocks, account sections, court/institution lines, and dense narrative sections.
+6. In narrative text, pay special attention to short repeated organization aliases, relationship-bound person names, and person names near cues such as 股东, 付款至, 支付给, or 个人银行账户.
+7. When a weak company reference such as 本公司, 该公司, 上述公司, 前述公司, 相关公司, or 涉案公司 clearly points to a supplied catalog subject, you may return it as an ORGANIZATION extra_entity, but only by reusing that catalog subject's canonical_key.
+8. Extra entities must appear verbatim in the provided text.
+9. Do not add AMOUNT or DATE as extra entities.
+10. Do not invent abbreviations, aliases, replacements, or new canonical_key families when the subject catalog already provides a plausible target.
+11. Return strict JSON only in this exact format:
 {{
   "entity_updates":[
-    {{"id":"E1","canonical_key":"PARTY_A","canonical_role":"PARTY_A"}}
+    {{"id":"E1","canonical_key":"PARTY_A","canonical_role":"PARTY_A"}},
+    {{"id":"E2","action":"drop"}}
   ],
   "extra_entities":[
     {{"type":"LANDLINE_PHONE","text":"0763—3910858","canonical_key":"PHONE_1","canonical_role":"PHONE"}}
   ]
 }}
+12. Use action="drop" only when the detected entity is clearly a false positive, role/identity label, or wrong-subject span that should be removed from the final result.
+
+Subject catalog:
+{subject_json}
 
 Detected entities:
 {items_json}
@@ -2082,6 +6322,12 @@ Contract text:
             "简称",
             "以下简称",
             "又称",
+            "本公司",
+            "该公司",
+            "上述公司",
+            "前述公司",
+            "相关公司",
+            "涉案公司",
             "签署",
             "签字",
             "证据",
@@ -2172,6 +6418,37 @@ Contract text:
                 return parsed
         return {}
 
+    def _resolution_backend_available(self, *, llm_model: Optional[str] = None) -> bool:
+        if settings.is_high_quality_lowmem_mode():
+            review_service = self._get_lowmem_review_service()
+            return bool(review_service and review_service.installed)
+        ollama = self._get_ollama_service(llm_model=llm_model)
+        return bool(ollama and ollama.available)
+
+    async def _generate_resolution_payload(
+        self,
+        *,
+        prompt: str,
+        llm_model: Optional[str],
+        text_length: int,
+    ) -> Dict[str, Any]:
+        if settings.is_high_quality_lowmem_mode():
+            review_service = self._get_lowmem_review_service()
+            if review_service is None or not review_service.installed:
+                return {}
+            return await review_service.generate_text(
+                prompt,
+                max_tokens=self._get_resolution_num_predict(llm_model, text_length=text_length),
+            )
+
+        ollama = self._get_ollama_service(llm_model=llm_model)
+        if ollama is None:
+            return {}
+        return await ollama.generate_json_async(
+            prompt,
+            self._get_resolution_num_predict(llm_model, text_length=text_length),
+        )
+
     def _sanitize_canonical_key(self, value: Any) -> str:
         if value is None:
             return ""
@@ -2210,6 +6487,12 @@ Contract text:
 
             canonical_key = self._sanitize_canonical_key(item.get("canonical_key"))
             canonical_role = str(item.get("canonical_role", "")).strip().upper()
+            is_weak_org_reference = (
+                entity_type in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME"}
+                and self._is_weak_organization_reference(entity_text)
+            )
+            if is_weak_org_reference and not canonical_key:
+                continue
 
             for start, end in self._find_text_spans(text, entity_text):
                 key = (entity_type, start, end, entity_text)
@@ -2227,6 +6510,8 @@ Contract text:
                     "source": "llm_review",
                     "metadata": {"review": True},
                 }
+                if is_weak_org_reference:
+                    entity["metadata"]["weak_reference"] = True
                 if canonical_key:
                     entity["canonical_key"] = canonical_key
                 if canonical_role in self.RESOLUTION_ROLES:
@@ -2245,7 +6530,30 @@ Contract text:
         if entity_type in {"PERSON", "PERSON_NAME"}:
             return self._looks_like_person_name(normalized)
         if entity_type in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME"}:
-            return any("\u4e00" <= char <= "\u9fff" for char in normalized)
+            normalized_group = self._normalize_group_text(normalized)
+            if not normalized_group:
+                return False
+            if normalized_group in self.NON_ENTITY_FIXED_TERMS:
+                return False
+            if is_identity_reference_term(normalized_group) or is_position_title(normalized_group):
+                return False
+            if self._is_weak_organization_reference(normalized_group):
+                return True
+            if strip_identity_reference_prefix(normalized_group):
+                return False
+            if has_identity_reference_prefix(normalized_group):
+                return False
+            if is_generic_organization_term(normalized_group) or normalized_group in self.ORGANIZATION_GENERIC_TERMS:
+                return False
+            if is_probable_person(normalized_group) and not is_org_like_text(normalized_group):
+                return False
+            if len(normalized_group) > 12 and any(token in normalized_group for token in self.ORGANIZATION_NOISE_FRAGMENTS):
+                return False
+            if len(normalized_group) > 16 and any(token in normalized_group for token in ("的", "是", "至", "了")):
+                return False
+            if re.fullmatch(r"[\u4e00-\u9fa5A-Za-z0-9]{2,8}", normalized_group):
+                return looks_like_organization_short_name(normalized_group) or is_org_like_text(normalized_group)
+            return any("\u4e00" <= char <= "\u9fff" for char in normalized_group)
         if entity_type == "BANK_NAME":
             return "银行" in normalized
         if entity_type == "LOCATION":
@@ -2264,6 +6572,9 @@ Contract text:
         if entity_type == "EMAIL_ADDRESS":
             return "@" in normalized
         return True
+
+    def _is_weak_organization_reference(self, text: str) -> bool:
+        return self._normalize_group_text(text) in self.WEAK_ORGANIZATION_REFERENCES
 
     def _find_exact_spans(self, text: str, target: str) -> List[int]:
         positions: List[int] = []
@@ -2484,28 +6795,45 @@ Entities:
             end = len(text)
         return text[anchor:end].strip()
 
-    def _extract_label(self, *candidates: str) -> str:
-        for candidate in candidates:
-            normalized = candidate.replace("\u3000", " ").strip()
-            if not normalized:
+    def _extract_label(self, before: str = "", previous_line: str = "") -> str:
+        current_label = self._extract_inline_label(before)
+        if current_label:
+            return current_label
+
+        previous_label = self._extract_standalone_label(previous_line)
+        if previous_label:
+            return previous_label
+        return ""
+
+    def _extract_inline_label(self, candidate: str) -> str:
+        normalized = candidate.replace("\u3000", " ").strip()
+        if not normalized:
+            return ""
+
+        match = re.search(r"([\u4e00-\u9fa5A-Za-z0-9（）()]{1,18})\s*[:：]\s*$", normalized)
+        if match:
+            return match.group(1)
+
+        best_label = ""
+        best_index = -1
+        for label in self.ROLE_LABELS:
+            index = normalized.rfind(label)
+            if index == -1 or index < best_index:
                 continue
+            tail = normalized[index + len(label) :].strip()
+            if tail and not re.fullmatch(r"[\s:：，,、；;（）()【】\[\]\"“”'`-]*", tail):
+                continue
+            best_label = label
+            best_index = index
+        return best_label
 
-            best_label = ""
-            best_index = -1
-            for label in self.ROLE_LABELS:
-                index = normalized.rfind(label)
-                if index > best_index:
-                    best_label = label
-                    best_index = index
-            if best_label:
-                return best_label
-
-            match = re.search(r"([\u4e00-\u9fa5A-Za-z0-9（）()]+)\s*[:：]\s*$", normalized)
-            if match:
-                return match.group(1)
-
-            if normalized in self.ROLE_LABELS:
-                return normalized
+    def _extract_standalone_label(self, candidate: str) -> str:
+        normalized = candidate.replace("\u3000", " ").strip()
+        if not normalized or len(normalized) > 24:
+            return ""
+        stripped = normalized.rstrip(":：")
+        if stripped in self.ROLE_LABELS:
+            return stripped
         return ""
 
     def _infer_role(
@@ -2520,6 +6848,7 @@ Entities:
         core_text = f"{before} {label} {after}"
         window_text = f"{previous_line} {core_text} {next_line}"
         nearest_role = self._infer_party_role_from_before(before)
+        explicit_label = str(label or "").strip()
 
         if label in {"工程地址", "项目地址"}:
             return "项目地址"
@@ -2539,13 +6868,13 @@ Entities:
 
         if nearest_role:
             return nearest_role
-        if label in {"甲方", "乙方", "丙方"}:
-            return label
-        if any(token in core_text for token in ["甲方", "委托方", "发包人", "采购人"]):
+        if explicit_label in {"甲方", "乙方", "丙方"}:
+            return explicit_label
+        if explicit_label in {"委托方", "发包人", "采购人"}:
             return "甲方"
-        if any(token in core_text for token in ["乙方", "受托方", "承包人", "供应商"]):
+        if explicit_label in {"受托方", "承包人", "供应商"}:
             return "乙方"
-        if "收款单位" in core_text:
+        if explicit_label == "收款单位":
             return "收款"
         if entity_type in {"PERSON", "PERSON_NAME"}:
             if "法定代表人" in core_text:
@@ -2592,7 +6921,7 @@ Entities:
             return "structured_label"
         if "definition" in source or metadata.get("definition_alias") or metadata.get("definition_full_text"):
             return "definition_anchor"
-        if source == "llm_review" or metadata.get("review"):
+        if source in {"llm_review", "qwen_fragment_review", "qwen_heavy_arbitration"} or metadata.get("review"):
             return "llm_review"
         if "ollama" in source or source == "llm":
             return "llm_semantic"
@@ -2669,6 +6998,10 @@ Entities:
         family = self.GROUP_FAMILIES.get(entity["type"])
         other_family = self.GROUP_FAMILIES.get(other_entity["type"])
         if family != other_family:
+            if family == "alias" and self._alias_matches_entity(entity, other_entity):
+                return True
+            if other_family == "alias" and self._alias_matches_entity(other_entity, entity):
+                return True
             if {
                 self.GROUP_FAMILIES.get(entity["type"]),
                 self.GROUP_FAMILIES.get(other_entity["type"]),
@@ -2695,6 +7028,13 @@ Entities:
                 return False
             if not self._is_valid_organization_variant(other_entity["text"], primary_text=entity["text"]):
                 return False
+            if self._is_parallel_short_org_enumeration(
+                entity=entity,
+                context=context,
+                other_entity=other_entity,
+                other_context=other_context,
+            ):
+                return False
 
         if family == "organization" and self._share_organization_identity(entity["text"], other_entity["text"]):
             return True
@@ -2711,12 +7051,88 @@ Entities:
             return any(token in longer for token in ["项目", "工程", "标段"])
         return False
 
+    def _is_parallel_short_org_enumeration(
+        self,
+        *,
+        entity: Dict,
+        context: Dict,
+        other_entity: Dict,
+        other_context: Dict,
+    ) -> bool:
+        left = self._normalize_group_text(str(entity.get("text", "") or ""))
+        right = self._normalize_group_text(str(other_entity.get("text", "") or ""))
+        if not left or not right or left == right:
+            return False
+        if not (looks_like_organization_short_name(left) and looks_like_organization_short_name(right)):
+            return False
+        line = str(context.get("line") or "")
+        other_line = str(other_context.get("line") or "")
+        if not line or line != other_line:
+            return False
+        connectors = ("、", "，", ",", "及", "以及", "和", "与", "/")
+        if not any(token in line for token in connectors):
+            return False
+        left_pos = line.find(str(entity.get("text", "")))
+        right_pos = line.find(str(other_entity.get("text", "")))
+        if left_pos < 0 or right_pos < 0:
+            return False
+        start = min(left_pos, right_pos)
+        end = max(left_pos + len(str(entity.get("text", ""))), right_pos + len(str(other_entity.get("text", ""))))
+        between = line[start:end]
+        return any(token in between for token in connectors)
+
+    def _alias_matches_entity(self, alias_entity: Dict, target_entity: Dict) -> bool:
+        alias_text = self._normalize_group_text(str(alias_entity.get("text", "") or ""))
+        target_text = str(target_entity.get("text", "") or "")
+        target_norm = self._normalize_group_text(target_text)
+        target_family = self.GROUP_FAMILIES.get(str(target_entity.get("type", "")).upper(), "")
+        if not alias_text or not target_norm or target_family not in {"organization", "project"}:
+            return False
+        if alias_text == target_norm:
+            return True
+
+        metadata = alias_entity.get("metadata") or {}
+        canonical_text = str(
+            metadata.get("canonical")
+            or metadata.get("definition_full_text")
+            or metadata.get("definition_alias")
+            or ""
+        ).strip()
+        if not canonical_text:
+            return False
+
+        if target_family == "organization":
+            return self._share_organization_identity(canonical_text, target_text)
+        if target_family == "project":
+            canonical_norm = self._normalize_group_text(canonical_text)
+            return bool(
+                canonical_norm
+                and (canonical_norm in target_norm or target_norm in canonical_norm)
+                and any(token in (canonical_norm + target_norm) for token in ("项目", "工程", "标段"))
+            )
+        return False
+
     def _canonical_key_from_entity(self, entity: Dict) -> str:
         canonical_key = self._sanitize_canonical_key(entity.get("canonical_key"))
+        if self._is_transient_canonical_key(canonical_key):
+            canonical_key = ""
         if canonical_key:
             return canonical_key
         metadata = entity.get("metadata") or {}
-        return self._sanitize_canonical_key(metadata.get("canonical_key"))
+        metadata_key = self._sanitize_canonical_key(metadata.get("canonical_key"))
+        if self._is_transient_canonical_key(metadata_key):
+            return ""
+        return metadata_key
+
+    def _is_transient_canonical_key(self, value: Any) -> bool:
+        canonical_key = self._sanitize_canonical_key(value)
+        if not canonical_key:
+            return False
+        return canonical_key.startswith("ORG_OCC_") or canonical_key == "ORG_SHORT"
+
+    def _has_stable_canonical_key(self, entity: Dict) -> bool:
+        canonical_key = self._canonical_key_from_entity(entity)
+        return bool(canonical_key and not self._is_transient_canonical_key(canonical_key))
 
     def _share_person_identity(self, left: str, right: str) -> bool:
         if len(left) != len(right):
@@ -2738,10 +7154,25 @@ Entities:
 
         left_aliases = self._derive_organization_identity_aliases(left)
         right_aliases = self._derive_organization_identity_aliases(right)
-        return right_norm in left_aliases or left_norm in right_aliases
+        if right_norm in left_aliases or left_norm in right_aliases:
+            return True
+
+        # Allow reviewed or definition-backed short references and company-like
+        # variants to converge on the same organization identity when they share
+        # a stable business core, while still relying on enumeration/context
+        # guards elsewhere to stop unrelated parallel short names from merging.
+        left_companyish = left_norm.removesuffix("公司")
+        right_companyish = right_norm.removesuffix("公司")
+        if len(left_companyish) >= 2 and len(right_companyish) >= 2:
+            if left_companyish == right_companyish:
+                return True
+            if left_companyish in right_companyish or right_companyish in left_companyish:
+                return True
+        return False
 
     def _derive_organization_identity_aliases(self, text: str) -> set[str]:
-        normalized = self._normalize_group_text(text)
+        alias_source = re.sub(r"[（(][^）)]{1,12}[）)]", "", text or "")
+        normalized = self._normalize_group_text(alias_source or text)
         if len(normalized) < 4:
             return (
                 {normalized}
@@ -2750,40 +7181,61 @@ Entities:
             )
 
         aliases = {normalized}
+        company_like = self._looks_like_company_subject(normalized)
+        business_like = any(token in normalized for token in self.ORGANIZATION_BUSINESS_SUFFIXES)
         region_stripped = re.sub(
             r"^(?:[\u4e00-\u9fa5]{2,9}(?:省|市|区|县|镇|乡|街道))+",
             "",
             normalized,
         )
-        core = self._strip_organization_suffix(region_stripped)
-        brand = re.sub(
-            r"(科技|工程|建设|贸易|实业|发展|咨询|服务|管理|材料|电力|能源|建筑|环保|智能|信息|网络|电子|机械|设备|制造)$",
+        compact_region_stripped = re.sub(
+            rf"^(?:{'|'.join(map(re.escape, self.UNSUFFIXED_REGION_PREFIXES))})",
+            "",
+            region_stripped,
+        )
+        core = self._strip_organization_suffix(compact_region_stripped or region_stripped)
+        brand = self._strip_organization_business_suffix(core)
+        compact_core = re.sub(
+            r"^(?:北京|上海|广州|深圳|天津|重庆|杭州|南京|苏州|成都|武汉|西安|长沙|郑州|青岛|宁波|佛山|东莞|厦门|福州|济南|合肥|昆明|南宁|贵阳|南昌|海口|太原|沈阳|长春|哈尔滨|石家庄|呼和浩特|乌鲁木齐|拉萨|银川|西宁)",
             "",
             core,
         )
-        compact_brand = re.sub(
-            r"^(?:北京|上海|广州|深圳|天津|重庆|杭州|南京|苏州|成都|武汉|西安|长沙|郑州|青岛|宁波|佛山|东莞|厦门|福州|济南|合肥|昆明|南宁|贵阳|南昌|海口|太原|沈阳|长春|哈尔滨|石家庄|呼和浩特|乌鲁木齐|拉萨|银川|西宁)",
-            "",
-            brand,
+        compact_brand = self._strip_organization_business_suffix(
+            re.sub(
+                r"^(?:北京|上海|广州|深圳|天津|重庆|杭州|南京|苏州|成都|武汉|西安|长沙|郑州|青岛|宁波|佛山|东莞|厦门|福州|济南|合肥|昆明|南宁|贵阳|南昌|海口|太原|沈阳|长春|哈尔滨|石家庄|呼和浩特|乌鲁木齐|拉萨|银川|西宁)",
+                "",
+                brand,
+            )
         )
 
-        for candidate in [region_stripped]:
+        for candidate in [region_stripped, compact_region_stripped]:
             candidate = self._normalize_group_text(candidate)
             if len(candidate) >= 2:
                 aliases.add(candidate)
-        for candidate in [core, brand, compact_brand]:
+        for candidate in [core, compact_core, brand, compact_brand]:
             candidate = self._normalize_group_text(candidate)
             if 2 <= len(candidate) <= 12:
                 aliases.add(candidate)
-                aliases.add(self._normalize_group_text(f"{candidate}公司"))
+                if company_like:
+                    aliases.add(self._normalize_group_text(f"{candidate}公司"))
+                    min_prefix_size = 4 if business_like else 2
+                    for size in (2, 3, 4, 5, 6):
+                        if size < min_prefix_size:
+                            continue
+                        if len(candidate) > size:
+                            aliases.add(candidate[:size])
+                            aliases.add(self._normalize_group_text(f"{candidate[:size]}公司"))
 
-        if self._looks_like_company_subject(normalized):
-            tail_source = self._normalize_group_text(compact_brand or brand or core)
-            for size in (2, 3, 4):
+        if company_like:
+            tail_source = self._normalize_group_text(compact_brand or compact_core or brand or core)
+            min_tail_size = 4 if business_like else 2
+            for size in (2, 3, 4, 5, 6):
+                if size < min_tail_size:
+                    continue
                 if len(tail_source) <= size:
                     continue
                 candidate = tail_source[-size:]
-                if re.fullmatch(r"[\u4e00-\u9fa5]{2,4}", candidate):
+                if re.fullmatch(r"[\u4e00-\u9fa5]{2,6}", candidate):
                     aliases.add(candidate)
                     aliases.add(self._normalize_group_text(f"{candidate}公司"))
 
@@ -2815,10 +7267,42 @@ Entities:
         label = context.get("label", "")
         if label in {"甲方", "乙方", "丙方"}:
             return label
-        window_text = context.get("window_text", "")
-        for token in ["甲方", "乙方", "丙方"]:
-            if token in window_text:
-                return token
+        return ""
+
+    def _party_label_from_canonical_role(self, canonical_role: str) -> str:
+        normalized = str(canonical_role or "").strip().upper()
+        if normalized == "PARTY_A":
+            return "甲方"
+        if normalized == "PARTY_B":
+            return "乙方"
+        if normalized == "PARTY_C":
+            return "丙方"
+        return ""
+
+    def _get_lowmem_review_service(self):
+        if self._lowmem_review_service is None:
+            from app.services.qwen_fragment_review_service import QwenFragmentReviewService
+
+            self._lowmem_review_service = QwenFragmentReviewService()
+        return self._lowmem_review_service
+
+    def _pick_group_canonical_role(self, group: Dict) -> str:
+        canonical_roles = [
+            str(entity.get("canonical_role", "")).strip().upper()
+            for entity in group["entities"]
+            if str(entity.get("canonical_role", "")).strip().upper() in self.RESOLUTION_ROLES
+        ]
+        if canonical_roles:
+            return canonical_roles[0]
+
+        for context in group["contexts"]:
+            party_role = self._party_role_from_context(context)
+            if party_role == "甲方":
+                return "PARTY_A"
+            if party_role == "乙方":
+                return "PARTY_B"
+            if party_role == "丙方":
+                return "PARTY_C"
         return ""
 
     def _pick_group_role(self, group: Dict) -> str:
@@ -2923,13 +7407,28 @@ Entities:
         group_label = self._pick_group_label(group)
         family = self.GROUP_FAMILIES.get(entity_type, entity_type.lower())
         strategy_profile = get_anonymization_strategy_profile(strategy_key)
+        if strategy_profile.key == "symbolic_codes":
+            family = self._resolve_symbolic_codes_family(
+                entity_type=entity_type,
+                source_text=source_text,
+                role=group_role,
+                label=group_label,
+                default_family=family,
+            )
 
         if family == "person":
             if strategy_profile.key == "serial_roles":
                 return self._next_scoped_alias("人员", alias_state, style="serial", always_append=True)
+            if strategy_profile.key == "symbolic_codes":
+                return self._next_symbolic_person_alias(alias_state)
             return self._build_person_alias(source_text)
+        if family == "alias":
+            if strategy_profile.key == "symbolic_codes":
+                return self._mask_surface_value(source_text)
+            return source_text
         if family == "organization":
             return self._build_organization_alias(
+                entity_type,
                 group_role,
                 group_label,
                 source_text,
@@ -2939,6 +7438,8 @@ Entities:
         if family == "bank":
             if strategy_profile.key == "official":
                 return self._build_official_bank_alias(source_text)
+            if strategy_profile.key == "symbolic_codes":
+                return self._mask_surface_value(source_text)
             return self._build_role_alias(
                 group_role,
                 "开户行",
@@ -2946,34 +7447,77 @@ Entities:
                 always_append=group_role not in {"甲方", "乙方", "丙方"},
             )
         if family == "project":
+            if strategy_profile.key == "symbolic_codes":
+                return self._next_symbolic_project_alias(alias_state)
             return self._next_letter_alias("项目", alias_state)
         if family == "location":
             if strategy_profile.key == "official" and self._should_preserve_location_verbatim(source_text):
                 return source_text
+            if strategy_profile.key == "symbolic_codes":
+                return self._next_symbolic_location_alias(alias_state)
             return self._next_letter_alias("地区", alias_state)
+        if family == "address":
+            if strategy_profile.key == "official":
+                return self._build_official_address_alias(source_text)
+            if strategy_profile.key == "symbolic_codes":
+                return self._next_symbolic_location_alias(alias_state)
+            return self._next_letter_alias("地址", alias_state)
+        if family == "court":
+            if self._is_procedural_court_reference(source_text):
+                return source_text
+            if strategy_profile.key == "symbolic_codes":
+                return self._next_symbolic_official_org_alias(alias_state)
+            rendered = self._build_surface_aware_organization_alias(
+                source_text=source_text,
+                role=group_role,
+                label=group_label,
+            )
+            return rendered or self._next_letter_alias("法院", alias_state)
         if family == "position":
+            if strategy_profile.key == "symbolic_codes":
+                return self._mask_surface_value(source_text)
             return source_text
         if family == "contract_no":
+            if strategy_profile.key == "symbolic_codes":
+                return self._mask_surface_value(source_text)
             return self._mask_identifier(
                 source_text,
                 metadata=group["primary_entity"].get("metadata") or {},
             )
         if family == "project_code":
+            if strategy_profile.key == "symbolic_codes":
+                return self._mask_surface_value(source_text)
             return self._next_letter_alias("项目代号", alias_state)
         if family == "product":
+            if strategy_profile.key == "symbolic_codes":
+                return self._mask_surface_value(source_text)
             return self._next_letter_alias("产品", alias_state)
         if family == "term":
+            if strategy_profile.key == "symbolic_codes":
+                return self._mask_surface_value(source_text)
             return self._next_letter_alias("术语", alias_state)
         if family == "phone":
+            if strategy_profile.key == "symbolic_codes":
+                return self._mask_surface_value(source_text)
             return self._mask_identifier(source_text)
         if family == "bank_card":
+            if strategy_profile.key == "symbolic_codes":
+                return self._mask_surface_value(source_text)
             return self._mask_identifier(source_text)
         if family == "id_card":
+            if strategy_profile.key == "symbolic_codes":
+                return self._mask_surface_value(source_text)
             return self._mask_identifier(source_text)
         if family == "credit_code":
+            if strategy_profile.key == "symbolic_codes":
+                return self._mask_surface_value(source_text)
             return self._mask_identifier(source_text)
         if family == "email":
+            if strategy_profile.key == "symbolic_codes":
+                return self._mask_surface_value(source_text)
             return self._next_letter_alias("邮箱", alias_state)
+        if strategy_profile.key == "symbolic_codes":
+            return self._mask_surface_value(source_text)
         return source_text
 
     def _build_person_alias(
@@ -2989,6 +7533,7 @@ Entities:
 
     def _build_organization_alias(
         self,
+        entity_type: str,
         role: str,
         label: str,
         source_text: str,
@@ -2997,10 +7542,15 @@ Entities:
         strategy_key: str = DEFAULT_ANONYMIZATION_STRATEGY,
     ) -> str:
         strategy_profile = get_anonymization_strategy_profile(strategy_key)
+        is_official_institution = self._is_official_institution_name(source_text, role=role, label=label)
         if self._looks_like_person_name(source_text):
+            if strategy_profile.key == "symbolic_codes" and is_official_institution:
+                return self._next_symbolic_official_org_alias(alias_state)
             if strategy_profile.key == "serial_roles":
                 return self._next_scoped_alias("人员", alias_state, style="serial", always_append=True)
-            return self._build_person_alias(source_text)
+            if strategy_profile.key == "symbolic_codes":
+                return self._next_symbolic_private_org_alias(alias_state)
+            return self._next_letter_alias("单位", alias_state)
 
         if strategy_profile.key == "serial_roles":
             party_role = role if role in {"甲方", "乙方", "丙方"} else ""
@@ -3009,6 +7559,11 @@ Entities:
             if role == "收款" or label == "收款单位":
                 return self._next_scoped_alias("收款单位", alias_state, style="serial", always_append=True)
             return self._next_scoped_alias("单位", alias_state, style="serial", always_append=True)
+
+        if strategy_profile.key == "symbolic_codes":
+            if is_official_institution:
+                return self._next_symbolic_official_org_alias(alias_state)
+            return self._next_symbolic_private_org_alias(alias_state)
 
         readable_alias = self._build_surface_aware_organization_alias(
             source_text=source_text,
@@ -3025,6 +7580,111 @@ Entities:
             return self._next_letter_alias("收款单位", alias_state)
         return self._next_letter_alias("单位", alias_state)
 
+    def _resolve_alias_replacement(
+        self,
+        *,
+        entity: Dict[str, Any],
+        text_groups: Dict[str, Dict[str, Any]],
+        replacements: Dict[str, str],
+    ) -> str:
+        metadata = entity.get("metadata") or {}
+        canonical_text = str(metadata.get("canonical") or metadata.get("definition_full_text") or "").strip()
+        if not canonical_text:
+            return ""
+
+        canonical_norm = self._normalize_group_text(canonical_text)
+        if not canonical_norm:
+            return ""
+
+        for group_key, group in text_groups.items():
+            primary_text = str(group.get("primary_entity", {}).get("text", "") or "")
+            primary_norm = self._normalize_group_text(primary_text)
+            if canonical_norm == primary_norm:
+                return replacements.get(group_key, "")
+
+            source_texts = {
+                self._normalize_group_text(str(value))
+                for value in group.get("source_texts", set())
+                if value
+            }
+            if canonical_norm in source_texts:
+                return replacements.get(group_key, "")
+
+        return ""
+
+    def _is_official_institution_name(
+        self,
+        source_text: str,
+        *,
+        role: str = "",
+        label: str = "",
+    ) -> bool:
+        normalized = self._normalize_group_text(source_text)
+        if not normalized:
+            return False
+
+        official_tokens = (
+            "人民法院",
+            "中级人民法院",
+            "高级人民法院",
+            "最高人民法院",
+            "人民检察院",
+            "最高人民检察院",
+            "人民政府",
+            "市政府",
+            "区政府",
+            "县政府",
+            "司法局",
+            "公安局",
+            "派出所",
+            "税务局",
+            "财政局",
+            "自然资源局",
+            "市场监督管理局",
+            "监督管理局",
+            "管理委员会",
+            "仲裁委员会",
+            "委员会",
+            "办事处",
+            "街道办",
+            "街道办事处",
+        )
+        if any(token in normalized for token in official_tokens):
+            return True
+
+        official_labels = {
+            "法院名称",
+            "仲裁机构",
+            "政府机构",
+            "行政机关",
+            "主管部门",
+        }
+        if label in official_labels:
+            return True
+
+        if role in {"法院", "仲裁机构", "政府机构"}:
+            return True
+        return False
+
+    def _resolve_symbolic_codes_family(
+        self,
+        *,
+        entity_type: str,
+        source_text: str,
+        role: str,
+        label: str,
+        default_family: str,
+    ) -> str:
+        if self._is_official_institution_name(source_text, role=role, label=label):
+            return "court"
+        if (
+            entity_type == "PROJECT"
+            or label in {"项目名称", "工程名称"}
+            or role in {"PROJECT", "检测项目", "风电项目"}
+        ):
+            return "project"
+        return default_family
+
     def _build_role_alias(
         self,
         role: str,
@@ -3038,7 +7698,35 @@ Entities:
         return self._next_scoped_alias(prefix, alias_state, style="letter", always_append=always_append)
 
     def _looks_like_organization_name(self, text: str) -> bool:
-        return any(token in text for token in ["公司", "中心", "集团", "银行", "研究院", "事务所", "支行", "分行", "院", "局", "所"])
+        return any(
+            token in text
+            for token in [
+                "公司",
+                "中心",
+                "集团",
+                "银行",
+                "研究院",
+                "研究所",
+                "事务所",
+                "支行",
+                "分行",
+                "商行",
+                "合作社",
+                "工作室",
+                "经营部",
+                "门市部",
+                "营业部",
+                "办事处",
+                "基金会",
+                "联合会",
+                "学校",
+                "医院",
+                "协会",
+                "院",
+                "局",
+                "所",
+            ]
+        )
 
     def _looks_like_person_name(self, text: str) -> bool:
         return re.fullmatch(r"[\u4e00-\u9fa5\u00b7]{2,8}", text) is not None
@@ -3169,7 +7857,9 @@ Entities:
         suffix = text[matched_index:]
         segments = self._split_location_segments(prefix)
         if len(segments) <= 1:
-            return text
+            if segments:
+                return f"{self._mask_administrative_segment(segments[0])}{prefix[len(segments[0]):]}{suffix}"
+            return f"某{suffix}"
 
         target_index = -1
         city_seen = False
@@ -3188,6 +7878,63 @@ Entities:
         masked_segments[target_index] = self._mask_administrative_segment(masked_segments[target_index])
         rebuilt_prefix = "".join(masked_segments) + prefix[len("".join(segments)) :]
         return f"{rebuilt_prefix}{suffix}"
+
+    @staticmethod
+    def _is_procedural_court_reference(source_text: str) -> bool:
+        normalized = re.sub(r"\s+", "", source_text or "")
+        return normalized in {
+            "一审法院",
+            "二审法院",
+            "原审法院",
+            "再审法院",
+            "执行法院",
+            "上级法院",
+            "下级法院",
+            "本院",
+            "贵院",
+        }
+
+    def _build_official_address_alias(self, source_text: str) -> str:
+        normalized = re.sub(r"\s+", "", source_text or "")
+        if not normalized:
+            return "某市某区某路某号"
+
+        segments = self._split_location_segments(normalized)
+        consumed = "".join(segments)
+        tail = normalized[len(consumed) :]
+        if not segments:
+            prefix = self._extract_region_prefix(normalized)
+            if prefix:
+                segments = self._split_location_segments(prefix)
+                consumed = "".join(segments)
+                tail = normalized[len(consumed) :]
+
+        masked_segments = list(segments)
+        if masked_segments:
+            target_index = len(masked_segments) - 1
+            for index, segment in enumerate(masked_segments):
+                if self._classify_location_segment(segment) == "local":
+                    target_index = index
+            masked_segments[target_index] = self._mask_administrative_segment(masked_segments[target_index])
+
+        detail = self._address_detail_placeholder(tail or normalized)
+        prefix_text = "".join(masked_segments)
+        if prefix_text:
+            return f"{prefix_text}{detail}"
+        return detail
+
+    @staticmethod
+    def _address_detail_placeholder(text: str) -> str:
+        normalized = re.sub(r"\s+", "", text or "")
+        if any(token in normalized for token in ("路", "街", "大道", "道", "巷")):
+            return "某路某号"
+        if any(token in normalized for token in ("栋", "室", "房", "铺", "单元")):
+            return "某楼某室"
+        if any(token in normalized for token in ("村", "组", "社")):
+            return "某村某组"
+        if "号" in normalized:
+            return "某号"
+        return "某路某号"
 
     def _build_generic_institution_alias(self, source_text: str) -> str:
         for suffix in [
@@ -3343,6 +8090,8 @@ Entities:
         replacement_value = str(replacement or "")
         if family == "position":
             return bool(source_value) and replacement_value == source_value
+        if family == "court" and self._is_procedural_court_reference(source_value):
+            return replacement_value == source_value
         if family != "location":
             return False
         return replacement_value == source_value and self._should_preserve_location_verbatim(source_value)
@@ -3440,24 +8189,110 @@ Entities:
             return prefix
         return f"{prefix}{suffix}"
 
-    def _to_alpha(self, index: int) -> str:
+    def _next_symbolic_person_alias(
+        self,
+        alias_state: Dict[str, Dict[str, int]],
+    ) -> str:
+        return self._next_symbolic_alias("person_symbolic", alias_state, style="lower_letter")
+
+    def _next_symbolic_organization_alias(
+        self,
+        alias_state: Dict[str, Dict[str, int]],
+    ) -> str:
+        return self._next_symbolic_alias("organization_symbolic", alias_state, style="greek")
+
+    def _next_symbolic_private_org_alias(
+        self,
+        alias_state: Dict[str, Dict[str, int]],
+    ) -> str:
+        return self._next_symbolic_alias("organization_symbolic_private", alias_state, style="greek")
+
+    def _next_symbolic_official_org_alias(
+        self,
+        alias_state: Dict[str, Dict[str, int]],
+    ) -> str:
+        return self._next_symbolic_alias("organization_symbolic_official", alias_state, style="official_greek")
+
+    def _next_symbolic_location_alias(
+        self,
+        alias_state: Dict[str, Dict[str, int]],
+    ) -> str:
+        return f"{self._next_symbolic_alias('location_symbolic', alias_state, style='cn')}地"
+
+    def _next_symbolic_project_alias(
+        self,
+        alias_state: Dict[str, Dict[str, int]],
+    ) -> str:
+        return f"PROJECT-{self._next_symbolic_alias('project_symbolic', alias_state, style='upper_letter')}"
+
+    def _next_symbolic_alias(
+        self,
+        scope: str,
+        alias_state: Dict[str, Dict[str, int]],
+        *,
+        style: str,
+    ) -> str:
+        counters = alias_state["counters"]
+        count = counters.get(scope, 0) + 1
+        counters[scope] = count
+        return self._render_symbolic_index(count - 1, style=style)
+
+    def _render_symbolic_index(self, index: int, *, style: str) -> str:
+        if style == "lower_letter":
+            return self._to_alpha(index, alphabet=self.LOWER_LETTERS).lower()
+        if style == "upper_letter":
+            return self._to_alpha(index, alphabet=self.LETTERS)
+        if style == "greek":
+            return self._to_greek_alias(index)
+        if style == "official_greek":
+            return self._to_official_greek_symbol(index)
+        if style == "cn":
+            return self._to_cn_serial(index)
+        return self._to_alpha(index)
+
+    def _to_alpha(self, index: int, *, alphabet: Optional[str] = None) -> str:
         if index < 0:
             return "A"
 
+        letters = alphabet or self.LETTERS
         result = ""
-        base = len(self.LETTERS)
+        base = len(letters)
         current = index
         while True:
-            result = self.LETTERS[current % base] + result
+            result = letters[current % base] + result
             current = current // base - 1
             if current < 0:
                 break
         return result
 
+    def _to_greek_alias(self, index: int) -> str:
+        if index < 0:
+            return self.GREEK_ALIASES[0]
+        base = len(self.GREEK_ALIASES)
+        prefix = self.GREEK_ALIASES[index % base]
+        round_index = index // base
+        if round_index == 0:
+            return prefix
+        return f"{prefix}{round_index + 1}"
+
+    def _to_official_greek_symbol(self, index: int) -> str:
+        if index < 0:
+            return self.OFFICIAL_GREEK_SYMBOLS[0]
+        base = len(self.OFFICIAL_GREEK_SYMBOLS)
+        prefix = self.OFFICIAL_GREEK_SYMBOLS[index % base]
+        round_index = index // base
+        if round_index == 0:
+            return prefix
+        return f"{prefix}{round_index + 1}"
+
     def _to_cn_serial(self, index: int) -> str:
         if 0 <= index < len(self.CN_SERIALS):
             return self.CN_SERIALS[index]
         return f"第{index + 1}"
+
+    def _mask_surface_value(self, source_text: str) -> str:
+        value = str(source_text or "")
+        return "".join("*" if not char.isspace() else char for char in value)
 
     def _build_structured_replacement(
         self,
@@ -3470,10 +8305,26 @@ Entities:
         source_text = entity["text"]
 
         if entity_type == "AMOUNT":
-            return None
+            return source_text
         if entity_type == "DATE":
-            return None
+            return self._preserve_year_only_date(source_text)
         return None
+
+    def _preserve_year_only_date(self, source_text: str) -> str:
+        normalized = str(source_text or "").strip()
+        if not normalized:
+            return normalized
+        year_match = re.search(r"((?:19|20)\d{2})", normalized)
+        if not year_match:
+            return "[日期]"
+        year = year_match.group(1)
+        if "年" in normalized:
+            return f"{year}年**月**日"
+        separator = "/" if "/" in normalized else "-"
+        tail = f"{separator}**{separator}**"
+        if re.fullmatch(r"\d{4}[./-]\d{1,2}$", normalized):
+            tail = f"{separator}**"
+        return f"{year}{tail}"
 
     def _build_amount_cluster_values(
         self,
@@ -3890,9 +8741,11 @@ Entities:
     def _stable_seed(self, value: str) -> int:
         return int(hashlib.md5(value.encode("utf-8")).hexdigest()[:8], 16)
 
-    def _get_ollama_service(self, llm_model: Optional[str] = None) -> Optional[OllamaLLMService]:
+    def _get_ollama_service(self, llm_model: Optional[str] = None) -> Optional[Any]:
         if settings.LLM_BACKEND.lower() != "ollama":
             return None
+        from app.services.ollama_service import OllamaLLMService
+
         model_name = llm_model or settings.OLLAMA_MODEL
         if model_name not in self._ollama_services:
             self._ollama_services[model_name] = OllamaLLMService(

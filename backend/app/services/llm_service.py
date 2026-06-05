@@ -62,9 +62,9 @@ class LLMNERService:
 {text}
 
 请识别以下类型的敏感信息：
-1. PERSON: 人名（如：张三、李四、王经理）
-2. ORGANIZATION: 公司/组织名称（如：北京科技有限公司、XX银行）
-3. LOCATION: 地址（如：北京市朝阳区XX路XX号）
+1. PERSON: 人名（如：合同正文中逐字出现的自然人姓名）
+2. ORGANIZATION: 公司/组织名称（如：合同正文中逐字出现的公司、银行或机构名称）
+3. LOCATION: 地址（如：合同正文中逐字出现的完整地址）
 4. POSITION: 职位（如：法定代表人、总经理、董事长）
 
 要求：
@@ -73,10 +73,10 @@ class LLMNERService:
 - start和end是字符在原文中的位置（从0开始计数）
 - 确保位置准确
 
-返回格式示例：
+返回格式：
 {{"entities": [
-    {{"type": "PERSON", "text": "张三", "start": 10, "end": 12}},
-    {{"type": "ORGANIZATION", "text": "北京科技有限公司", "start": 20, "end": 30}}
+    {{"type": "PERSON", "text": "原文中的姓名", "start": 10, "end": 15}},
+    {{"type": "ORGANIZATION", "text": "原文中的机构名称", "start": 20, "end": 30}}
 ]}}
 
 只返回JSON，不要其他内容："""

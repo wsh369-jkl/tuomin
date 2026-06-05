@@ -15,10 +15,23 @@
       </template>
 
       <el-form label-width="160px">
-        <el-form-item label="默认启用大模型识别">
+        <el-form-item label="默认处理线路">
+          <el-radio-group v-model="settings.desensitize_mode_default" @change="handleModeChange">
+            <el-radio-button
+              v-for="option in desensitizeModeOptions"
+              :key="option.value"
+              :label="option.value"
+            >
+              {{ option.label }}
+            </el-radio-button>
+          </el-radio-group>
+          <div class="form-tip">{{ selectedModeDescription }}</div>
+        </el-form-item>
+
+        <el-form-item :label="isHighQualityWorkflow ? '默认启用高质量识别' : '默认启用大模型识别'">
           <el-switch v-model="settings.use_llm_default" />
         </el-form-item>
-        <el-form-item label="默认识别模型">
+        <el-form-item :label="isHighQualityWorkflow ? '默认精审模型（按需）' : '默认识别模型'">
           <el-select
             v-model="settings.llm_model_default"
             class="full-width"
@@ -34,13 +47,18 @@
             />
           </el-select>
           <div class="form-tip">
-            {{ selectedModelDescription || '新任务会默认使用这个模型，识别页里仍然可以在开始前临时切换。' }}
+            {{
+              selectedModelDescription ||
+              (isHighQualityWorkflow
+                ? '小 Qwen 只在需要时做片段补漏。'
+                : '新任务默认使用本地识别模型。')
+            }}
           </div>
         </el-form-item>
         <el-form-item label="默认启用自定义规则">
           <el-switch v-model="settings.use_custom_default" />
         </el-form-item>
-        <el-form-item label="默认隐名策略">
+        <el-form-item label="默认隐名线路">
           <el-radio-group v-model="settings.anonymization_strategy_default">
             <el-radio-button
               v-for="option in anonymizationStrategyOptions"
@@ -238,8 +256,10 @@ import type { EngineInfo, LLMModelListResponse, LLMModelOption } from '@/api/des
 import type { ConfigTemplate } from '@/api/history'
 import {
   defaultAppSettings,
+  desensitizeModeOptions,
   loadAppSettings,
   normalizeAppSettings,
+  normalizeDesensitizeMode,
   saveAppSettings
 } from '@/utils/settings'
 
@@ -277,15 +297,40 @@ const anonymizationStrategyOptions = [
     value: 'serial_roles',
     label: '甲乙丙主体策略',
     description: '人物和主体优先改成甲乙丙类称谓，区分更直观，适合快速阅读。'
+  },
+  {
+    value: 'symbolic_codes',
+    label: '编码隐名线',
+    description: '人名改成 a/b/c/d，机构改成 alpha/beta/gamma，地名改成甲地/乙地，并对同一主体保持稳定编码。'
   }
 ]
-const modelOptions = computed(() => modelCatalog.value?.models || [])
+const selectedModeDescription = computed(
+  () =>
+    desensitizeModeOptions.find((item) => item.value === settings.value.desensitize_mode_default)
+      ?.description || ''
+)
+const isHighQualityWorkflow = computed(() =>
+  ['local_high_quality', 'high_quality_lowmem'].includes(settings.value.desensitize_mode_default)
+)
+const modelOptions = computed(() => {
+  const models = modelCatalog.value?.models || []
+  if (!isHighQualityWorkflow.value) {
+    return models
+  }
+  return models.filter((item) => ['review', 'review_fallback'].includes(item.role || item.tier))
+})
 const selectedModelOption = computed(() =>
   modelOptions.value.find((item) => item.name === settings.value.llm_model_default) || null
 )
 const selectedModelDescription = computed(() => {
   if (!selectedModelOption.value) {
     return ''
+  }
+  if (settings.value.desensitize_mode_default === 'local_high_quality') {
+    return 'PDF 前置线用 GLM-OCR 作为正文主输出，VL 只兜底质量门禁未通过的少量页面。'
+  }
+  if (settings.value.desensitize_mode_default === 'high_quality_lowmem') {
+    return '按低内存工作流调度，小模型主召回，Qwen 只审风险片段。'
   }
   return `${selectedModelOption.value.strategy_label}：${selectedModelOption.value.strategy_description}`
 })
@@ -340,7 +385,7 @@ const syncSelectedModel = (preferredModel?: string | null) => {
 
 const loadModelCatalog = async () => {
   try {
-    modelCatalog.value = await getAvailableModels()
+    modelCatalog.value = await getAvailableModels(settings.value.desensitize_mode_default)
     syncSelectedModel(settings.value.llm_model_default)
   } catch (error) {
     ElMessage.error('加载模型列表失败')
@@ -350,15 +395,31 @@ const loadModelCatalog = async () => {
 const formatModelLabel = (model: LLMModelOption) => {
   const status = model.installed ? '已安装' : '未安装'
   const defaultTag = model.is_default ? ' / 默认' : ''
-  return `${model.name} (${model.strategy_label} / ${status}${defaultTag})`
+  const roleKey = model.role || model.tier
+  const roleMap: Record<string, string> = {
+    primary_ie: '中文实体模型',
+    primary_ner: '中文 NER',
+    secondary_ner: '第二路 NER',
+    review: '按需精审',
+    review_fallback: '低内存兜底精审'
+  }
+  const roleTag = isHighQualityWorkflow.value && roleMap[roleKey] ? ` / ${roleMap[roleKey]}` : ''
+  return `${model.name} (${model.strategy_label}${roleTag} / ${status}${defaultTag})`
 }
 
 const loadRuntimeInfo = async () => {
   try {
-    engineInfo.value = await getEngineInfo()
+    engineInfo.value = await getEngineInfo(settings.value.desensitize_mode_default)
   } catch (error) {
     ElMessage.error('加载运行时信息失败')
   }
+}
+
+const handleModeChange = async () => {
+  settings.value.desensitize_mode_default = normalizeDesensitizeMode(
+    settings.value.desensitize_mode_default
+  )
+  await Promise.all([loadRuntimeInfo(), loadModelCatalog()])
 }
 
 const loadTemplateList = async () => {
@@ -379,9 +440,9 @@ const saveSettings = async () => {
   }
 }
 
-const resetSettings = () => {
+const resetSettings = async () => {
   settings.value = normalizeAppSettings(defaultAppSettings)
-  syncSelectedModel(settings.value.llm_model_default)
+  await Promise.all([loadRuntimeInfo(), loadModelCatalog()])
   syncOperatorConfigText()
   saveAppSettings(settings.value)
   ElMessage.success('已恢复默认设置')
@@ -393,7 +454,7 @@ const applyTemplate = async (template: ConfigTemplate, showMessage = true) => {
     template_id: template.id,
     template_name: template.name
   })
-  syncSelectedModel(settings.value.llm_model_default)
+  await Promise.all([loadRuntimeInfo(), loadModelCatalog()])
   syncOperatorConfigText()
   saveAppSettings(settings.value)
 

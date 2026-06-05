@@ -10,6 +10,11 @@ ENV/
 
 # Virtual environments
 backend/venv/
+backend/ocr_venv/
+backend/mlx_vlm_venv/
+backend/ppstructure_recovery_venv/
+.mac-build-fast-venv/
+.mac-build-venv/
 
 # Frontend
 frontend/node_modules/
@@ -20,11 +25,23 @@ backend/uploads/
 backend/outputs/
 backend/logs/
 backend/models/
+backend/tmp/
+backend/pdf_word_audit/
+backend/pdf_normalized/
+backend/local_pdf_frontline_checkpoints/
+backend/desensitize.db
+backend/pdf-word-audit-*.json
+backend/pdf-word-audit-v4-*.json
+backend/local-pdf-frontline-*.json
+backend/mlx_vlm_server.log
+backend/mlx_vlm_server.pid
+tmp/
 
 # Build outputs
 build_artifacts/
 release/
 release-macos/
+release-macos-high-quality/
 release-linux/
 release_layout_pdf/
 release_ocr_pdf/

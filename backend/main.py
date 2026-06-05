@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import runpy
+import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -11,7 +13,22 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
-from app.api import custom, desensitize, history
+
+def _maybe_run_packaged_worker() -> bool:
+    if len(sys.argv) < 4 or sys.argv[1] != "--worker-module":
+        return False
+
+    module_name = sys.argv[2]
+    sys.argv = [module_name, *sys.argv[3:]]
+    runpy.run_module(module_name, run_name="__main__", alter_sys=True)
+    return True
+
+
+if _maybe_run_packaged_worker():
+    raise SystemExit(0)
+
+
+from app.api import assistant, custom, desensitize, history, pdf_word_audit, review
 from app.core.config import settings
 from app.core.runtime_security import ensure_private_file
 
@@ -81,6 +98,9 @@ app.add_middleware(
 )
 
 app.include_router(desensitize.router, prefix=settings.API_V1_PREFIX)
+app.include_router(assistant.router, prefix=settings.API_V1_PREFIX)
+app.include_router(review.router, prefix=settings.API_V1_PREFIX)
+app.include_router(pdf_word_audit.router, prefix=settings.API_V1_PREFIX)
 app.include_router(custom.router, prefix=settings.API_V1_PREFIX)
 app.include_router(history.router, prefix=settings.API_V1_PREFIX)
 

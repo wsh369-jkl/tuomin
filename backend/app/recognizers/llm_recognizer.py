@@ -70,9 +70,15 @@ class LLMRecognizer(BaseRecognizer):
         if not self.enabled:
             return []
 
+        progress_callback = kwargs.get("progress_callback")
         try:
             llm_service = self._get_llm_service(llm_model=llm_model)
-            llm_entities = await asyncio.to_thread(llm_service.extract_entities, text)
+            if hasattr(llm_service, "set_progress_callback"):
+                llm_service.set_progress_callback(progress_callback)
+            if hasattr(llm_service, "extract_entities_async"):
+                llm_entities = await llm_service.extract_entities_async(text)
+            else:
+                llm_entities = await asyncio.to_thread(llm_service.extract_entities, text)
             model_key = (
                 llm_model or settings.OLLAMA_MODEL
                 if settings.LLM_BACKEND.lower() == "ollama"
@@ -85,6 +91,9 @@ class LLMRecognizer(BaseRecognizer):
         except Exception as exc:
             logger.error("LLM recognition failed: %s", exc)
             return []
+        finally:
+            if "llm_service" in locals() and hasattr(llm_service, "set_progress_callback"):
+                llm_service.set_progress_callback(None)
 
         results: List[RecognizerResult] = []
         for entity in llm_entities:

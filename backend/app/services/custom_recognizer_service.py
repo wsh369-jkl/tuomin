@@ -15,22 +15,8 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_PAYLOAD = {
-    "patterns": [
-        {
-            "name": "PROJECT_CODE",
-            "description": "项目代号",
-            "regex": "PROJ-\\d{4}-\\d{3}",
-            "score": 0.9,
-            "context": ["项目", "代号", "编号"],
-        }
-    ],
-    "keywords": {
-        "COMPANY_NAME": {
-            "description": "特定公司名称",
-            "keywords": ["XX科技有限公司", "XX贸易有限公司"],
-            "score": 0.95,
-        }
-    },
+    "patterns": [],
+    "keywords": {},
 }
 
 

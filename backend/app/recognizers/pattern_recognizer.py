@@ -16,6 +16,21 @@ from app.core.recognizer_base import BaseRecognizer, RecognizerResult
 
 logger = logging.getLogger(__name__)
 IDENTIFIER_LABEL_PATTERN = build_spaced_label_pattern(ALL_IDENTIFIER_LABELS)
+ID_CARD_LABELS = ("身份证号码", "身份证号", "公民身份号码", "公民身份证号码")
+CREDIT_CODE_LABELS = ("统一社会信用代码", "社会信用代码", "信用代码")
+ACCOUNT_NUMBER_LABELS = (
+    "银行账号",
+    "银行账户",
+    "账号",
+    "帐号",
+    "账户号码",
+    "账户号",
+    "账户",
+    "收款账号",
+    "收款账户",
+    "付款账号",
+    "付款账户",
+)
 
 
 class PatternRecognizer(BaseRecognizer):
@@ -73,21 +88,37 @@ class PatternRecognizer(BaseRecognizer):
                 start, end, matched_text = self._extract_match(match, group_name)
                 if start >= end or not matched_text:
                     continue
+                if entity_type == "COURT":
+                    start, end, matched_text = self._trim_legal_authority_match(
+                        start=start,
+                        matched_text=matched_text,
+                    )
+                    if start >= end or not matched_text:
+                        continue
+                resolved_entity_type, start, end, matched_text = self._resolve_contextual_numeric_entity(
+                    text=text,
+                    entity_type=entity_type,
+                    start=start,
+                    end=end,
+                )
+                if start >= end or not matched_text:
+                    continue
 
                 metadata = {"pattern": regex.pattern}
                 if "label" in match.re.groupindex:
                     label_value = (match.group("label") or "").strip()
                     if label_value:
                         metadata["label"] = label_value
-                if entity_type == "CONTRACT_NO":
+                if resolved_entity_type == "CONTRACT_NO":
                     metadata["identifier_kind"] = self._resolve_identifier_kind(
                         matched_text,
                         metadata.get("label"),
                     )
+                score = float(self.patterns.get(resolved_entity_type, {}).get("score", score))
 
                 results.append(
                     RecognizerResult(
-                        entity_type=entity_type,
+                        entity_type=resolved_entity_type,
                         start=start,
                         end=end,
                         score=score,
@@ -127,6 +158,55 @@ class PatternRecognizer(BaseRecognizer):
     def _resolve_identifier_kind(value: str, label: Optional[str]) -> str:
         return resolve_identifier_kind(value=value, label=label)
 
+    def _resolve_contextual_numeric_entity(
+        self,
+        *,
+        text: str,
+        entity_type: str,
+        start: int,
+        end: int,
+    ) -> tuple[str, int, int, str]:
+        if entity_type != "CN_BANK_CARD":
+            return entity_type, start, end, text[start:end]
+
+        if self._has_context_label(text=text, start=start, labels=CREDIT_CODE_LABELS):
+            return "CN_CREDIT_CODE", start, end, text[start:end]
+
+        if self._has_context_label(text=text, start=start, labels=ID_CARD_LABELS):
+            if end < len(text) and text[end] in {"X", "x"}:
+                end += 1
+            return "CN_ID_CARD", start, end, text[start:end]
+
+        matched_text = text[start:end]
+        digit_count = len(re.sub(r"\D", "", matched_text))
+        if digit_count == 20 and not self._has_context_label(
+            text=text,
+            start=start,
+            labels=ACCOUNT_NUMBER_LABELS,
+        ):
+            return entity_type, start, end, ""
+
+        return entity_type, start, end, text[start:end]
+
+    @staticmethod
+    def _has_context_label(*, text: str, start: int, labels: tuple[str, ...]) -> bool:
+        prefix = re.sub(r"\s+", "", text[max(0, start - 24) : start])
+        return any(label in prefix for label in labels)
+
+    @staticmethod
+    def _trim_legal_authority_match(*, start: int, matched_text: str) -> tuple[int, int, str]:
+        value = matched_text
+        for separator in ("根据", "依据", "不服", "此致", "提交", "向", "至", "由"):
+            index = value.rfind(separator)
+            if index < 0:
+                continue
+            candidate = value[index + len(separator) :]
+            if re.search(r"(?:人民法院|仲裁委员会|人民检察院)$", candidate):
+                start += index + len(separator)
+                value = candidate
+                break
+        return start, start + len(value), value
+
 
 class ChinesePatternRecognizer(PatternRecognizer):
     """Regex recognizer for common structured entities in Chinese contracts."""
@@ -138,7 +218,7 @@ class ChinesePatternRecognizer(PatternRecognizer):
                 "score": 0.95,
             },
             "CN_PHONE": {
-                "regex": r"(?<!\d)1[3-9]\d{9}(?!\d)",
+                "regex": r"(?<!\d)1[3-9]\d(?:[ \t\u00a0\-－—–]?\d{4}){2}(?!\d)",
                 "score": 0.92,
             },
             "LANDLINE_PHONE": {
@@ -150,8 +230,12 @@ class ChinesePatternRecognizer(PatternRecognizer):
                 "score": 0.95,
             },
             "CN_BANK_CARD": {
-                "regex": r"(?<!\d)\d{16,19}(?!\d)",
+                "regex": r"(?<!\d)\d{16,20}(?!\d)",
                 "score": 0.9,
+            },
+            "COURT": {
+                "regex": r"[\u4e00-\u9fa5]{2,40}(?:人民法院|仲裁委员会|人民检察院)",
+                "score": 0.88,
             },
             "EMAIL_ADDRESS": {
                 "regex": r"(?<![\w.-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![\w.-])",

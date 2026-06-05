@@ -11,7 +11,7 @@ from app.core.pipeline_manager import PipelineManager
 from app.core.recognizer_registry import RecognizerRegistry
 from app.recognizers.contract_recognizer import ContractFieldRecognizer
 from app.recognizers.custom_recognizer import CustomRecognizer
-from app.recognizers.llm_recognizer import LLMRecognizer
+from app.recognizers.high_quality_lowmem_recognizer import HighQualityLowMemoryRecognizer
 from app.recognizers.pattern_recognizer import ChinesePatternRecognizer
 
 logger = logging.getLogger(__name__)
@@ -45,12 +45,15 @@ class DesensitizationEngine:
         logger.info("Desensitization engine initialized.")
 
     def _register_default_recognizers(self) -> None:
-        default_recognizers = [
-            LLMRecognizer(),
+        from app.recognizers.llm_recognizer import LLMRecognizer
+
+        default_recognizers = [LLMRecognizer()]
+        default_recognizers.extend([
             ContractFieldRecognizer(),
             ChinesePatternRecognizer(),
             CustomRecognizer(),
-        ]
+            HighQualityLowMemoryRecognizer(),
+        ])
         for recognizer in default_recognizers:
             self.recognizer_registry.add_recognizer(recognizer)
 
@@ -66,6 +69,9 @@ class DesensitizationEngine:
         use_llm: bool = True,
         use_custom: bool = True,
         llm_model: Optional[str] = None,
+        source_metadata: Optional[Dict] = None,
+        source_structure: Optional[Dict] = None,
+        progress_callback=None,
     ) -> List[Dict]:
         logger.info(
             "Analyze requested, text_length=%s, use_llm=%s, use_custom=%s",
@@ -74,17 +80,26 @@ class DesensitizationEngine:
             use_custom,
         )
 
-        recognizer_names: List[str] = ["contract", "regex"]
-        if use_llm:
-            recognizer_names.insert(0, "llm")
-        if use_custom:
-            recognizer_names.append("custom")
+        if use_llm and settings.is_high_quality_desensitize_mode():
+            recognizer_names = ["regex", "contract"]
+            if use_custom:
+                recognizer_names.append("custom")
+            recognizer_names.append("high_quality_lowmem")
+        else:
+            recognizer_names = ["contract", "regex"]
+            if use_llm:
+                recognizer_names.insert(0, "llm")
+            if use_custom:
+                recognizer_names.append("custom")
 
         return await self.pipeline_manager.analyze(
             text=text,
             entities=entities,
             recognizer_names=recognizer_names,
             llm_model=llm_model,
+            source_metadata=source_metadata,
+            source_structure=source_structure,
+            progress_callback=progress_callback,
         )
 
     async def anonymize(
@@ -109,6 +124,8 @@ class DesensitizationEngine:
         operator_config: Optional[Dict[str, Dict]] = None,
         llm_model: Optional[str] = None,
         anonymization_strategy: Optional[str] = None,
+        source_metadata: Optional[Dict] = None,
+        source_structure: Optional[Dict] = None,
     ) -> List[Dict]:
         return await self.pipeline_manager.prepare_entities_for_anonymization(
             text=text,
@@ -117,6 +134,8 @@ class DesensitizationEngine:
             operator_config=operator_config,
             llm_model=llm_model,
             anonymization_strategy=anonymization_strategy,
+            source_metadata=source_metadata,
+            source_structure=source_structure,
         )
 
     async def analyze_and_anonymize(
@@ -128,6 +147,8 @@ class DesensitizationEngine:
         operator_config: Optional[Dict[str, Dict]] = None,
         llm_model: Optional[str] = None,
         anonymization_strategy: Optional[str] = None,
+        source_metadata: Optional[Dict] = None,
+        source_structure: Optional[Dict] = None,
     ) -> Dict:
         detected_entities = await self.analyze(
             text=text,
@@ -135,6 +156,8 @@ class DesensitizationEngine:
             use_llm=use_llm,
             use_custom=use_custom,
             llm_model=llm_model,
+            source_metadata=source_metadata,
+            source_structure=source_structure,
         )
         detected_entities = await self.prepare_entities_for_anonymization(
             text=text,
@@ -143,6 +166,8 @@ class DesensitizationEngine:
             operator_config=operator_config,
             llm_model=llm_model,
             anonymization_strategy=anonymization_strategy,
+            source_metadata=source_metadata,
+            source_structure=source_structure,
         )
         anonymized_text = await self.anonymize(
             text=text,
@@ -178,6 +203,7 @@ class DesensitizationEngine:
             "version": "2.1.0",
             "architecture": "registry_pipeline",
             "llm_backend": settings.LLM_BACKEND,
+            "desensitize_mode": settings.get_effective_desensitize_mode(),
             "llm_model": (
                 settings.OLLAMA_MODEL
                 if settings.LLM_BACKEND.lower() == "ollama"

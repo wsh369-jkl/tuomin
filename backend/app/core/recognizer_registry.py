@@ -128,7 +128,11 @@ class RecognizerRegistry:
         all_results = []
         for recognizer in recognizers:
             try:
-                results = await recognizer.analyze(text, entities, **kwargs)
+                results = await recognizer.analyze(
+                    text,
+                    entities,
+                    **{**kwargs, "existing_results": list(all_results)},
+                )
                 all_results.extend(results)
                 logger.debug(f"识别器 {recognizer.name} 识别到 {len(results)} 个实体")
             except Exception as e:

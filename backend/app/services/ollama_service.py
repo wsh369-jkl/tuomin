@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
 import os
 import re
 from collections import Counter
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
+import httpx
 import requests
 
 from app.core.identifier_rules import ALL_IDENTIFIER_LABELS, compact_text, label_matches, looks_like_case_number
 from app.core.llm_strategy import get_llm_strategy_profile, get_runtime_llm_strategy_profile
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -624,6 +627,7 @@ class OllamaLLMService:
         self.timeout = timeout
         self.num_ctx = num_ctx or int(os.getenv("OLLAMA_NUM_CTX", "4096"))
         self.last_extract_metadata: Dict[str, Any] = {}
+        self.progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None
         self.available = self._check_connection()
 
         logger.info("Initialized Ollama service: %s (%s)", self.base_url, self.model)
@@ -640,21 +644,58 @@ class OllamaLLMService:
     def get_last_extract_metadata(self) -> Dict[str, Any]:
         return dict(self.last_extract_metadata)
 
+    def set_progress_callback(self, callback: Optional[Callable[[Dict[str, Any]], None]]) -> None:
+        self.progress_callback = callback
+
+    def _emit_progress(
+        self,
+        *,
+        stage: str,
+        current: int = 0,
+        total: int = 0,
+        message: str = "",
+    ) -> None:
+        if self.progress_callback is None:
+            return
+
+        try:
+            self.progress_callback(
+                {
+                    "stage": stage,
+                    "current": current,
+                    "total": total,
+                    "message": message,
+                }
+            )
+        except Exception:
+            logger.debug("Failed to emit LLM progress update", exc_info=True)
+
+    def _run_async(self, coroutine):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coroutine)
+        raise RuntimeError("Synchronous Ollama helper cannot run inside an active event loop.")
+
     def extract_entities(self, text: str) -> List[Dict]:
+        return self._run_async(self.extract_entities_async(text))
+
+    async def extract_entities_async(self, text: str) -> List[Dict]:
         self.last_extract_metadata = {}
         logger.info("Ollama recognition started, text_length=%s", len(text))
 
         if not text.strip():
             return []
 
-        if not self._check_connection():
+        if not await self._check_connection_async():
             self.available = False
             logger.warning("Ollama is unavailable, skip LLM recognition.")
             return []
 
         indexed_lines = self._build_indexed_lines(text)
         profile = self._get_model_profile(text_length=len(text), line_count=len(indexed_lines))
-        document_context = self._build_document_context(text, profile)
+        self._emit_progress(stage="prepare", current=1, total=1, message="正在准备识别策略...")
+        document_context = await self._build_document_context_async(text, profile)
         definition_hints = self._extract_definition_hints(text, indexed_lines)
         if definition_hints:
             document_context["definition_hints"] = definition_hints
@@ -673,7 +714,10 @@ class OllamaLLMService:
                 pass_name="base",
             )
             try:
-                payload = self._call_ollama(prompt, num_predict=profile["extract_num_predict"])
+                payload = await self._call_ollama_async(
+                    prompt,
+                    num_predict=profile["extract_num_predict"],
+                )
                 chunk_entities = self._parse_response(
                     payload=payload,
                     chunk_text=chunk["text"],
@@ -686,13 +730,27 @@ class OllamaLLMService:
                     len(chunks),
                     len(chunk_entities),
                 )
+                self._emit_progress(
+                    stage="base",
+                    current=chunk_index,
+                    total=len(chunks),
+                    message=f"正在识别正文第 {chunk_index}/{len(chunks)} 段...",
+                )
             except Exception as exc:
                 logger.error("Ollama chunk %s failed: %s", chunk_index, exc)
 
+        review_27b_workflow = self._is_review_27b_workflow(profile)
         recall_passes_used: List[str] = []
         specialized_passes_used: List[str] = []
         repetition_hotspots: List[Dict[str, Any]] = []
-        if profile["targeted_recall_passes"] > 0:
+        preliminary_entities = self._deduplicate_entities(
+            self._refine_entities(
+                text,
+                entities,
+                document_context=document_context,
+            )
+        )
+        if profile["targeted_recall_passes"] > 0 and not review_27b_workflow:
             recall_snippets = self._build_targeted_recall_snippets(
                 text,
                 document_context=document_context,
@@ -707,7 +765,10 @@ class OllamaLLMService:
                     focus_instruction=snippet["instruction"],
                 )
                 try:
-                    payload = self._call_ollama(prompt, num_predict=profile["recall_num_predict"])
+                    payload = await self._call_ollama_async(
+                        prompt,
+                        num_predict=profile["recall_num_predict"],
+                    )
                     snippet_entities = self._parse_response(
                         payload=payload,
                         chunk_text=snippet["text"],
@@ -722,6 +783,12 @@ class OllamaLLMService:
                         snippet["name"],
                         len(snippet_entities),
                     )
+                    self._emit_progress(
+                        stage="recall",
+                        current=recall_index,
+                        total=len(recall_snippets),
+                        message=f"正在执行重点补查 {recall_index}/{len(recall_snippets)}...",
+                    )
                 except Exception as exc:
                     logger.error(
                         "Ollama recall pass %s (%s) failed: %s",
@@ -731,37 +798,44 @@ class OllamaLLMService:
                     )
 
         if profile["specialized_passes"] and profile["high_risk_block_limit"] > 0:
-            high_risk_blocks = self._schedule_high_risk_blocks(
-                text,
-                indexed_lines,
-                max_chars=profile["recall_snippet_size"],
-                max_blocks=profile["high_risk_block_limit"],
-            )
-            preliminary_entities = self._deduplicate_entities(
-                self._refine_entities(
-                    text,
-                    entities,
+            if review_27b_workflow:
+                specialized_snippets = self._build_review_27b_snippets(
+                    text=text,
+                    indexed_lines=indexed_lines,
                     document_context=document_context,
+                    preliminary_entities=preliminary_entities,
+                    definition_hints=definition_hints,
+                    profile=profile,
                 )
-            )
-            repetition_hotspots = self._build_repetition_hotspot_blocks(
-                text,
-                indexed_lines,
-                preliminary_entities,
-                max_chars=profile["recall_snippet_size"],
-                max_blocks=max(2, min(6, profile["high_risk_block_limit"])),
-            )
-            if repetition_hotspots:
-                high_risk_blocks = self._merge_ranked_blocks(
-                    high_risk_blocks,
-                    repetition_hotspots,
+            else:
+                high_risk_blocks = self._schedule_high_risk_blocks(
+                    text,
+                    indexed_lines,
+                    max_chars=profile["recall_snippet_size"],
                     max_blocks=profile["high_risk_block_limit"],
                 )
-            specialized_snippets = self._build_specialized_recall_snippets(
-                high_risk_blocks,
-                definitions=definition_hints,
-                max_extra_passes=profile["complexity_extra_passes"],
-            )
+                repetition_hotspots = self._build_repetition_hotspot_blocks(
+                    text,
+                    indexed_lines,
+                    preliminary_entities,
+                    max_chars=profile["recall_snippet_size"],
+                    max_blocks=max(2, min(6, profile["high_risk_block_limit"])),
+                )
+                if repetition_hotspots:
+                    high_risk_blocks = self._merge_ranked_blocks(
+                        high_risk_blocks,
+                        repetition_hotspots,
+                        max_blocks=profile["high_risk_block_limit"],
+                    )
+                specialized_snippets = self._build_specialized_recall_snippets(
+                    high_risk_blocks,
+                    definitions=definition_hints,
+                    max_extra_passes=profile["complexity_extra_passes"],
+                    max_total_passes=profile["specialized_pass_limit"],
+                )
+            stage_name = "deep_review" if review_27b_workflow else "specialized"
+            stage_label = "定向精审" if review_27b_workflow else "专项复查"
+            source_name = "ollama_review_27b" if review_27b_workflow else "ollama_specialized"
             for snippet_index, snippet in enumerate(specialized_snippets, start=1):
                 prompt = self._build_prompt(
                     snippet["text"],
@@ -770,34 +844,48 @@ class OllamaLLMService:
                     focus_instruction=snippet["instruction"],
                 )
                 try:
-                    payload = self._call_ollama(prompt, num_predict=profile["recall_num_predict"])
+                    payload = await self._call_ollama_async(
+                        prompt,
+                        num_predict=profile["recall_num_predict"],
+                    )
                     snippet_entities = self._parse_response(
                         payload=payload,
                         chunk_text=snippet["text"],
                         chunk_start=int(snippet["start"]),
                     )
                     for entity in snippet_entities:
-                        entity["source"] = "ollama_specialized"
+                        entity["source"] = source_name
                         entity.setdefault("metadata", {})
                         entity["metadata"]["pass_name"] = snippet["name"]
                         entity["metadata"]["risk_categories"] = list(snippet.get("categories", []))
+                        if review_27b_workflow:
+                            entity["metadata"]["workflow"] = "review_27b"
                     entities.extend(snippet_entities)
                     specialized_passes_used.append(snippet["name"])
                     logger.info(
-                        "Ollama specialized pass %s/%s (%s) finished, entities=%s",
+                        "Ollama %s pass %s/%s (%s) finished, entities=%s",
+                        "review_27b" if review_27b_workflow else "specialized",
                         snippet_index,
                         len(specialized_snippets),
                         snippet["name"],
                         len(snippet_entities),
                     )
+                    self._emit_progress(
+                        stage=stage_name,
+                        current=snippet_index,
+                        total=len(specialized_snippets),
+                        message=f"正在执行{stage_label} {snippet_index}/{len(specialized_snippets)}...",
+                    )
                 except Exception as exc:
                     logger.error(
-                        "Ollama specialized pass %s (%s) failed: %s",
+                        "Ollama %s pass %s (%s) failed: %s",
+                        "review_27b" if review_27b_workflow else "specialized",
                         snippet_index,
                         snippet["name"],
                         exc,
                     )
 
+        self._emit_progress(stage="finalize", current=1, total=1, message="正在整理识别结果...")
         refined_entities = self._refine_entities(
             text,
             entities,
@@ -872,7 +960,8 @@ class OllamaLLMService:
             "entity_count": len(deduplicated),
             "structured_backfill": bool(profile["prefer_llm_first"]),
             "prose_backfill": bool(profile["prefer_llm_first"]),
-            "quality_mode": "stable_high_recall",
+            "quality_mode": "review_targeted_precision" if review_27b_workflow else "stable_high_recall",
+            "workflow_variant": "review_27b" if review_27b_workflow else "precision_4b",
             "runtime_budget_tier": profile["runtime_budget_tier"],
             "runtime_budget_label": profile["runtime_budget_label"],
         }
@@ -886,13 +975,13 @@ class OllamaLLMService:
         )
         return deduplicated
 
-    def _build_document_context(self, text: str, profile: Dict[str, Any]) -> Dict[str, Any]:
+    async def _build_document_context_async(self, text: str, profile: Dict[str, Any]) -> Dict[str, Any]:
         indexed_lines = self._build_indexed_lines(text)
         heuristic = self._infer_document_type_from_rules(text, indexed_lines)
         llm_choice = {}
 
         if profile["prefer_llm_first"]:
-            llm_choice = self._classify_document_type(
+            llm_choice = await self._classify_document_type_async(
                 indexed_lines=indexed_lines,
                 heuristic=heuristic,
                 num_predict=profile["classify_num_predict"],
@@ -912,6 +1001,9 @@ class OllamaLLMService:
             self.DOCUMENT_TYPE_PROMPT_HINTS["other"],
         )
         return selected
+
+    def _build_document_context(self, text: str, profile: Dict[str, Any]) -> Dict[str, Any]:
+        return self._run_async(self._build_document_context_async(text, profile))
 
     def _infer_document_type_from_rules(
         self,
@@ -973,9 +1065,24 @@ class OllamaLLMService:
         heuristic: Dict[str, Any],
         num_predict: int,
     ) -> Dict[str, Any]:
+        return self._run_async(
+            self._classify_document_type_async(
+                indexed_lines=indexed_lines,
+                heuristic=heuristic,
+                num_predict=num_predict,
+            )
+        )
+
+    async def _classify_document_type_async(
+        self,
+        *,
+        indexed_lines: List[Dict[str, Any]],
+        heuristic: Dict[str, Any],
+        num_predict: int,
+    ) -> Dict[str, Any]:
         prompt = self._build_document_classification_prompt(indexed_lines, heuristic)
         try:
-            payload = self.generate_json(prompt, num_predict=num_predict)
+            payload = await self.generate_json_async(prompt, num_predict=num_predict)
         except Exception as exc:
             logger.warning("Document type classification failed: %s", exc)
             return {}
@@ -1700,6 +1807,7 @@ Footer excerpt:
         *,
         definitions: List[Dict[str, Any]],
         max_extra_passes: int,
+        max_total_passes: int,
     ) -> List[Dict[str, Any]]:
         if not blocks:
             return []
@@ -1709,6 +1817,9 @@ Footer excerpt:
         definition_categories = {"definition"} if definitions else set()
 
         for pass_name, config in self.SPECIALIZED_PASS_LIBRARY.items():
+            if max_total_passes > 0 and len(snippets) >= max_total_passes:
+                break
+
             categories = set(config["categories"]) | definition_categories
             matching_blocks = [
                 block
@@ -1723,6 +1834,8 @@ Footer excerpt:
                 budget += min(max_extra_passes, 2)
 
             for block in matching_blocks[:budget]:
+                if max_total_passes > 0 and len(snippets) >= max_total_passes:
+                    break
                 key = (pass_name, block["normalized"])
                 if key in seen:
                     continue
@@ -2125,6 +2238,130 @@ Footer excerpt:
 
         return chunks
 
+    def _is_review_27b_workflow(self, profile: Dict[str, Any]) -> bool:
+        return str(profile.get("engine_strategy", "")).strip() == "review_27b"
+
+    def _build_extraction_strategy_note(self, strategy_key: str) -> str:
+        if strategy_key == "review_27b":
+            return (
+                "Because this is the dedicated 27B review workflow, prefer one accurate full-pass extraction "
+                "followed by narrow gap checks around high-risk blocks, repeated mentions, abbreviation anchors, "
+                "and role-bound subjects. Avoid broad duplicate recall and keep every recovery grounded in visible text."
+            )
+        return (
+            "Because this is the local 4B stability strategy, prioritize verbatim recall within the provided text "
+            "block, abbreviation-linked mentions, split addresses, cross-page repeated subjects, and residual "
+            "entities hidden in dense narrative paragraphs. Keep every recovery grounded in visible evidence."
+        )
+
+    def _should_run_compact_review_27b_follow_up(
+        self,
+        *,
+        preliminary_entities: List[Dict[str, Any]],
+        definition_hints: List[Dict[str, Any]],
+    ) -> bool:
+        if not preliminary_entities:
+            return True
+        if not definition_hints:
+            return False
+
+        normalize = lambda value: re.sub(r"\s+", "", str(value or "")).strip()
+        normalized_entities = {
+            normalize(entity.get("text", ""))
+            for entity in preliminary_entities
+            if str(entity.get("text", "")).strip()
+        }
+        lightweight_aliases = {
+            normalize(token)
+            for token in (self.ORGANIZATION_LABEL_TOKENS + self.LEGAL_PARTY_LABEL_TOKENS)
+        }
+
+        for item in definition_hints:
+            alias = normalize(item.get("alias", ""))
+            full_text = normalize(item.get("full_text", ""))
+            if full_text and full_text not in normalized_entities:
+                return True
+            if alias and alias not in lightweight_aliases:
+                return True
+        return False
+
+    def _build_review_27b_snippets(
+        self,
+        *,
+        text: str,
+        indexed_lines: List[Dict[str, Any]],
+        document_context: Dict[str, Any],
+        preliminary_entities: List[Dict[str, Any]],
+        definition_hints: List[Dict[str, Any]],
+        profile: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        budget_tier = str(profile.get("runtime_budget_tier") or "").strip().lower()
+        max_chars = max(0, int(profile.get("recall_snippet_size") or 0))
+        max_blocks = max(0, int(profile.get("high_risk_block_limit") or 0))
+        max_total_passes = max(0, int(profile.get("specialized_pass_limit") or 0))
+        if max_chars <= 0 or max_total_passes <= 0:
+            return []
+
+        if budget_tier == "review_compact":
+            if not self._should_run_compact_review_27b_follow_up(
+                preliminary_entities=preliminary_entities,
+                definition_hints=definition_hints,
+            ):
+                return []
+            compact_text = text if len(text) <= max_chars else text[:max_chars]
+            if not compact_text.strip():
+                return []
+            return [
+                {
+                    "name": "precision_gap_review",
+                    "instruction": (
+                        "Review this short document once for any missed verbatim organizations, persons, "
+                        "locations, role-bound names, abbreviation-linked mentions, and footer/signature subjects. "
+                        "Recover only genuinely missed items."
+                    ),
+                    "text": compact_text,
+                    "start": 0,
+                    "categories": ["definition", "relation", "organization", "person", "address", "footer"],
+                }
+            ]
+
+        high_risk_blocks = self._schedule_high_risk_blocks(
+            text,
+            indexed_lines,
+            max_chars=max_chars,
+            max_blocks=max_blocks,
+        )
+        repetition_hotspots = self._build_repetition_hotspot_blocks(
+            text,
+            indexed_lines,
+            preliminary_entities,
+            max_chars=max_chars,
+            max_blocks=max(1, min(4, max_blocks)),
+        )
+        if repetition_hotspots:
+            high_risk_blocks = self._merge_ranked_blocks(
+                high_risk_blocks,
+                repetition_hotspots,
+                max_blocks=max_blocks,
+            )
+
+        snippets = self._build_specialized_recall_snippets(
+            high_risk_blocks,
+            definitions=definition_hints,
+            max_extra_passes=max(0, int(profile.get("complexity_extra_passes") or 0)),
+            max_total_passes=max_total_passes,
+        )
+        if snippets:
+            return snippets
+
+        fallback_snippets = self._build_targeted_recall_snippets(
+            text,
+            document_context=document_context,
+            max_snippets=1,
+            max_chars=max_chars,
+        )
+        return fallback_snippets[:1]
+
     def _build_prompt(
         self,
         text: str,
@@ -2177,11 +2414,7 @@ Footer excerpt:
                 "联系人",
             ]
         )
-        strategy_note = (
-            "Because this is the local 4B stability strategy, prioritize verbatim recall within the provided text "
-            "block, abbreviation-linked mentions, split addresses, cross-page repeated subjects, and residual "
-            "entities hidden in dense narrative paragraphs. Keep every recovery grounded in visible evidence."
-        )
+        strategy_note = self._build_extraction_strategy_note(strategy.key)
         pass_note = (
             "This is the primary full-text extraction pass."
             if pass_name == "base"
@@ -2225,7 +2458,7 @@ Rules:
 3. For LOCATION, pay special attention to full addresses after labels such as 住址, 身份证住址, 住所, 住所地, 通讯地址, 送达地址, 注册地址, 办公地址, 工程地址, 项目地址.
 4. If a line contains a person or organization and then an address label, extract both the subject and the full address value.
 5. Also inspect signature areas, footer blocks, table-like rows, account sections, header blocks, and repeated mentions outside standard labels.
-6. In dense narrative prose, explicitly recover short repeated company mentions and person names bound to relationships or actions, such as “铁鑫公司”, “荔富公司”, “股东石志伟”, and “付款至温荔燕个人银行账户”.
+6. In dense narrative prose, explicitly recover short repeated organization aliases and person names bound to relationships or actions, especially near cues such as 股东, 付款至, 支付给, 转账, and 个人银行账户.
 7. If one line contains multiple different subjects, return each subject separately instead of merging them into one long span.
 8. If the same subject appears in both a full name and a shorter repeated form, prefer the more complete form when it appears verbatim, but still return the shorter form if it also appears verbatim and should be anonymized separately.
 9. Do not return phone numbers, bank card numbers, ID cards, emails, or amounts here. Those are handled by rule-based recognizers.
@@ -2234,7 +2467,7 @@ Rules:
 12. Do not explain your answer.
 13. If your model has a thinking mode, keep the reasoning hidden and still output only the final JSON object.
 14. Output strict JSON in this exact shape:
-{{"entities":[{{"type":"PROJECT","text":"示例项目名称"}}]}}
+{{"entities":[{{"type":"PROJECT","text":"原文中逐字出现的项目名称"}}]}}
 15. {strategy_note}
 
 Text:
@@ -2247,6 +2480,28 @@ Text:
         self,
         prompt: str,
         num_predict: int = 768,
+        images: Optional[List[bytes]] = None,
+    ) -> Dict[str, Any]:
+        payload = self._build_generate_payload(
+            prompt,
+            num_predict=num_predict,
+            images=images,
+        )
+        response = requests.post(
+            f"{self.base_url}/api/generate",
+            json=payload,
+            timeout=self.timeout,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"Ollama API returned HTTP {response.status_code}")
+
+        return response.json()
+
+    def _build_generate_payload(
+        self,
+        prompt: str,
+        *,
+        num_predict: int,
         images: Optional[List[bytes]] = None,
     ) -> Dict[str, Any]:
         payload = {
@@ -2262,27 +2517,56 @@ Text:
                 "num_ctx": self.num_ctx,
             },
         }
+        if settings.is_review_capable_ollama_model(self.model):
+            payload["think"] = False
         if images:
             payload["images"] = [
                 base64.b64encode(image_bytes).decode("ascii")
                 for image_bytes in images
                 if image_bytes
             ]
+        return payload
 
-        response = requests.post(
-            f"{self.base_url}/api/generate",
-            json=payload,
-            timeout=self.timeout,
+    async def generate_json_async(
+        self,
+        prompt: str,
+        num_predict: int = 768,
+        images: Optional[List[bytes]] = None,
+    ) -> Dict[str, Any]:
+        payload = self._build_generate_payload(
+            prompt,
+            num_predict=num_predict,
+            images=images,
         )
+        timeout = httpx.Timeout(self.timeout)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(f"{self.base_url}/api/generate", json=payload)
         if response.status_code != 200:
             raise RuntimeError(f"Ollama API returned HTTP {response.status_code}")
-
         return response.json()
 
     def _call_ollama(self, prompt: str, num_predict: int = 768) -> Dict[str, Any]:
         return self.generate_json(prompt, num_predict)
 
+    async def _call_ollama_async(self, prompt: str, num_predict: int = 768) -> Dict[str, Any]:
+        return await self.generate_json_async(prompt, num_predict)
+
     def extract_document_text_from_image(
+        self,
+        image_bytes: bytes,
+        *,
+        page_number: int | None = None,
+        total_pages: int | None = None,
+    ) -> Dict[str, Any]:
+        return self._run_async(
+            self.extract_document_text_from_image_async(
+                image_bytes,
+                page_number=page_number,
+                total_pages=total_pages,
+            )
+        )
+
+    async def extract_document_text_from_image_async(
         self,
         image_bytes: bytes,
         *,
@@ -2292,17 +2576,19 @@ Text:
         if not image_bytes:
             return {"text": "", "quality": "low", "warnings": ["empty_image_input"]}
 
-        if not self._check_connection():
+        if not await self._check_connection_async():
             self.available = False
             raise RuntimeError("Ollama is unavailable for OCR.")
 
+        review_ocr = settings.is_review_capable_ollama_model(self.model)
         prompt = self._build_document_ocr_prompt(
             page_number=page_number,
             total_pages=total_pages,
+            review_ocr=review_ocr,
         )
-        payload = self.generate_json(
+        payload = await self.generate_json_async(
             prompt,
-            num_predict=2200,
+            num_predict=1200 if review_ocr else 2200,
             images=[image_bytes],
         )
         parsed = self._load_json_object(payload, required_keys={"text"})
@@ -2312,8 +2598,11 @@ Text:
 
         text = self._normalize_document_page_text(parsed.get("text", ""))
         blocks = self._normalize_document_blocks(parsed.get("blocks"))
+        lines = self._normalize_document_lines(parsed.get("lines"), fallback_blocks=blocks)
         if not text and blocks:
             text = self._blocks_to_text(blocks)
+        if not text and lines:
+            text = self._lines_to_text(lines)
         warnings = parsed.get("warnings")
         if not isinstance(warnings, list):
             warnings = []
@@ -2323,14 +2612,24 @@ Text:
             "quality": str(parsed.get("quality", "unknown")).strip().lower() or "unknown",
             "layout": str(parsed.get("layout", "plain_text")).strip().lower() or "plain_text",
             "blocks": blocks,
+            "lines": lines,
             "warnings": [str(item).strip() for item in warnings if str(item).strip()],
         }
+
+    async def _check_connection_async(self) -> bool:
+        try:
+            async with httpx.AsyncClient(timeout=2) as client:
+                response = await client.get(f"{self.base_url}/api/tags")
+            return response.status_code == 200
+        except Exception:
+            return False
 
     def _build_document_ocr_prompt(
         self,
         *,
         page_number: int | None,
         total_pages: int | None,
+        review_ocr: bool = False,
     ) -> str:
         page_label = ""
         if page_number is not None and total_pages is not None:
@@ -2338,24 +2637,44 @@ Text:
         elif page_number is not None:
             page_label = f" This is page {page_number}."
 
+        if review_ocr:
+            return (
+                "You are reconstructing a Chinese contract or legal document page from a PDF image with a "
+                "dedicated 27B OCR workflow."
+                f"{page_label}\n"
+                "Return only strict JSON in this exact shape:\n"
+                '{"text":"...", "quality":"high|medium|low", "layout":"plain_text|mixed", '
+                '"lines":[{"text":"...", "bbox":[0,0,1000,1000]}], "warnings":["..."]}\n'
+                "Rules:\n"
+                "1. Transcribe visible text faithfully in reading order. Do not summarize, rewrite, or translate.\n"
+                "2. Preserve names, addresses, dates, punctuation, numbers, and line breaks when readable.\n"
+                "3. In lines, emit one entry per visible text line. Use tight page-relative integer bboxes from 0 to 1000.\n"
+                "4. If the page is partly unreadable, keep readable text and use [UNREADABLE] only where necessary.\n"
+                "5. Do not emit blocks, tables, or extra structure beyond text, quality, layout, lines, and warnings.\n"
+                "6. Output JSON only."
+            )
+
         return (
             "You are reconstructing a Chinese contract or legal document page from a PDF image."
             f"{page_label}\n"
             "Read the page carefully and return only strict JSON in this exact shape:\n"
             '{"text":"...", "quality":"high|medium|low", "layout":"plain_text|table_like|mixed", '
             '"blocks":[{"type":"title|paragraph|line|table|spacer","text":"...",'
-            '"align":"left|center|right","indent":0,"rows":[["..."]],"blank_before":0}],"warnings":["..."]}\n'
+            '"align":"left|center|right","indent":0,"rows":[["..."]],"blank_before":0}],'
+            '"lines":[{"text":"...", "bbox":[0,0,1000,1000]}],"warnings":["..."]}\n'
             "Rules:\n"
             "1. Transcribe visible text faithfully. Do not summarize, rewrite, or translate.\n"
             "2. Preserve reading order from top to bottom, left to right.\n"
             "3. Keep clause numbers, punctuation, dates, amounts, names, contract numbers, and addresses exactly when readable.\n"
             "4. Preserve paragraph boundaries with newline characters.\n"
             "5. Use blocks to preserve layout: short centered headings should be title blocks; normal lines should be line or paragraph blocks; tables should be table blocks with rows.\n"
-            "6. For blank lines or large visual gaps, you may emit spacer blocks with blank_before or type=spacer.\n"
-            "7. If the page contains tables, keep each row and each cell separate in rows.\n"
-            "8. If some characters are unreadable, use [UNREADABLE] in that position instead of guessing.\n"
-            "9. Do not add content that is not visible in the image.\n"
-            "10. Output JSON only."
+            "6. In lines, list every visible text line or table row in reading order. Use tab separators between cells when a row is table-like.\n"
+            "7. Every line bbox must be a tight box around that line, using page-relative integers from 0 to 1000: [left, top, right, bottom].\n"
+            "8. For blank lines or large visual gaps, you may emit spacer blocks with blank_before or type=spacer.\n"
+            "9. If the page contains tables, keep each row and each cell separate in rows.\n"
+            "10. If some characters are unreadable, use [UNREADABLE] in that position instead of guessing.\n"
+            "11. Do not add content that is not visible in the image.\n"
+            "12. Output JSON only."
         )
 
     def _normalize_document_page_text(self, text: Any) -> str:
@@ -2444,10 +2763,61 @@ Text:
                     "align": align,
                     "indent": indent_value,
                     "blank_before": blank_before_value,
+                    "bbox": self._normalize_relative_bbox(item.get("bbox")),
                 }
             )
 
         return normalized_blocks
+
+    def _normalize_document_lines(
+        self,
+        lines: Any,
+        *,
+        fallback_blocks: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        normalized_lines: List[Dict[str, Any]] = []
+        if isinstance(lines, list):
+            for item in lines:
+                if not isinstance(item, dict):
+                    continue
+                text = self._normalize_document_page_text(item.get("text", ""))
+                bbox = self._normalize_relative_bbox(item.get("bbox"))
+                if not text or bbox is None:
+                    continue
+                normalized_lines.append({"text": text, "bbox": bbox})
+
+        if normalized_lines:
+            return normalized_lines
+
+        fallback_lines: List[Dict[str, Any]] = []
+        for block in fallback_blocks or []:
+            if not isinstance(block, dict):
+                continue
+            text = self._normalize_document_page_text(block.get("text", ""))
+            bbox = self._normalize_relative_bbox(block.get("bbox"))
+            if not text or bbox is None:
+                continue
+            fallback_lines.append({"text": text, "bbox": bbox})
+        return fallback_lines
+
+    def _normalize_relative_bbox(self, bbox: Any) -> Optional[List[float]]:
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            return None
+
+        try:
+            numeric = [float(value) for value in bbox]
+        except (TypeError, ValueError):
+            return None
+
+        max_value = max(abs(value) for value in numeric)
+        if max_value > 1.5:
+            scale = 1000.0 if max_value > 10 else 100.0
+            numeric = [value / scale for value in numeric]
+
+        left, top, right, bottom = [min(max(value, 0.0), 1.0) for value in numeric]
+        if right <= left or bottom <= top:
+            return None
+        return [round(left, 5), round(top, 5), round(right, 5), round(bottom, 5)]
 
     def _blocks_to_text(self, blocks: List[Dict[str, Any]]) -> str:
         parts: List[str] = []
@@ -2473,6 +2843,13 @@ Text:
 
         return "\n".join(parts).strip()
 
+    def _lines_to_text(self, lines: List[Dict[str, Any]]) -> str:
+        return "\n".join(
+            self._normalize_document_page_text(item.get("text", ""))
+            for item in lines
+            if self._normalize_document_page_text(item.get("text", ""))
+        ).strip()
+
     def _get_model_profile(
         self,
         *,
@@ -2497,6 +2874,7 @@ Text:
             "prefer_llm_first": strategy.prefer_llm_first,
             "high_risk_block_limit": strategy.high_risk_block_limit,
             "specialized_passes": strategy.specialized_passes,
+            "specialized_pass_limit": strategy.specialized_pass_limit,
             "complexity_extra_passes": strategy.complexity_extra_passes,
             "enable_definition_recall": strategy.enable_definition_recall,
             "enable_residual_scan": strategy.enable_residual_scan,

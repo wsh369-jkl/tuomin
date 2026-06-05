@@ -15,16 +15,16 @@ class RegexService:
     PATTERNS: Dict[str, Dict[str, object]] = {
         "CN_ID_CARD": {
             "regex": (
-                r"(?:[1-9]\d{5}(?:18|19|20)\d{2}(?:0[1-9]|1[0-2])"
+                r"(?<!\d)(?:[1-9]\d{5}(?:18|19|20)\d{2}(?:0[1-9]|1[0-2])"
                 r"(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]"
-                r"|[1-9]\d{5}\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3})"
+                r"|[1-9]\d{5}\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3})(?!\d)"
             ),
             "score": 0.95,
             "name": "Chinese ID card",
             "priority": 1,
         },
         "CN_PHONE": {
-            "regex": r"1[3-9]\d{9}",
+            "regex": r"(?<!\d)1[3-9]\d(?:[ \t\u00a0\-－—–]?\d{4}){2}(?!\d)",
             "score": 0.90,
             "name": "Chinese mobile phone",
             "priority": 2,
@@ -36,7 +36,7 @@ class RegexService:
             "priority": 1,
         },
         "CN_BANK_CARD": {
-            "regex": r"\d{16,19}",
+            "regex": r"(?<!\d)\d{16,20}(?!\d)",
             "score": 0.85,
             "name": "Bank card",
             "priority": 4,
@@ -57,6 +57,19 @@ class RegexService:
 
     CREDIT_CODE_LABELS = ["统一社会信用代码", "社会信用代码", "信用代码"]
     ID_CARD_LABELS = ["身份证号码", "身份证号", "公民身份号码", "公民身份证号码"]
+    ACCOUNT_NUMBER_LABELS = [
+        "银行账号",
+        "银行账户",
+        "账号",
+        "帐号",
+        "账户号码",
+        "账户号",
+        "账户",
+        "收款账号",
+        "收款账户",
+        "付款账号",
+        "付款账户",
+    ]
 
     def __init__(self) -> None:
         logger.info("Initializing regex recognizer...")
@@ -209,6 +222,16 @@ class RegexService:
         ):
             if end < len(text) and text[end] in {"X", "x"}:
                 end += 1
+
+        matched_text = text[start:end]
+        if entity_type == "CN_BANK_CARD":
+            digit_count = len(re.sub(r"\D", "", matched_text))
+            if digit_count == 20 and not self._has_context_label(
+                text=text,
+                start=start,
+                labels=self.ACCOUNT_NUMBER_LABELS,
+            ):
+                return start, end, ""
 
         return start, end, text[start:end]
 

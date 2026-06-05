@@ -1,197 +1,218 @@
 # 合同脱敏系统
 
-本项目是一个本地运行的合同脱敏系统，后端基于 FastAPI，前端基于 Vue 3 + Element Plus，识别链路已经统一到新的脱敏引擎。
+本项目当前定位为一个 `macOS 本地客户端` 形态的合同脱敏成品。
 
-截至 2026-03-08，本轮修复后已经完成并验证的主流程包括：
+## 一键启动
 
-- 单文件上传 -> 敏感实体识别 -> 脱敏处理 -> 结果下载
-- 批量文件上传 -> 批量识别结果查看
-- 自定义关键词规则与正则规则的新增、编辑、删除、测试
-- 历史记录、任务详情、统计信息查看
-- 系统设置、默认识别开关、高级 `operator_config`、配置模板管理
-- 开发模式桌面启动器联动后端与前端
+直接双击仓库根目录的 [start.command](/Users/wendyhan/Desktop/contract-desensitize/start.command) 即可进入系统。
 
-## 技术架构
+首次运行时会自动完成这些准备工作：
 
+- 创建 `backend/venv`
+- 安装后端依赖
+- 当前端静态资源缺失时自动构建 `frontend/dist`
+- 启动本地桌面启动器，并自动打开系统入口
+
+系统默认以本地运行方式工作：
+
+- 前端界面由后端内嵌或开发态代理提供
+- 后端服务运行在本机 `127.0.0.1`
+- 大模型能力默认走本地 `Ollama`
+- 文档、日志、数据库都保存在本机私有目录
+
+当前产品已经收敛，不再包含批量处理页和历史记录页。
+
+## 当前架构
+
+- `desktop/`
+  - Python 桌面启动器
+  - 负责探测 Ollama、启动后端、打开浏览器入口
+  - macOS 打包后会生成 `.app`
 - `backend/`
   - FastAPI API
-  - 新脱敏引擎
-  - 自定义规则服务
-  - 历史记录与模板存储
+  - 脱敏引擎、识别器注册表、操作器注册表
+  - 文档解析、上下文替换、导出
 - `frontend/`
-  - Vue 3
-  - Vue Router
-  - Element Plus
-- `desktop/`
-  - Python 启动器
-  - 启动后端并在开发模式下拉起前端页面
+  - Vue 3 + Element Plus
+  - 当前保留的页面：
+    - 启动检查
+    - 文档脱敏
+    - 自定义规则
+    - 系统设置
+- `build/`
+  - PyInstaller 打包脚本
+  - macOS DMG 打包脚本
 
-## 当前支持能力
+## 当前功能
 
-### 文件输入
+### 文档输入
 
-- `PDF`（文本型 PDF）
+- `PDF`
+  - 优先抽取原生文本
+  - 对低文本页可按配置触发 OCR 回退
 - `DOCX`
 - `TXT`
 
 ### 识别来源
 
-- 内置规则识别
+- 合同字段标签识别
+- 正则规则识别
 - 自定义关键词 / 正则规则
-- LLM 识别（默认使用 Ollama）
+- LLM 语义识别
 
-### 脱敏操作
+### 脱敏输出
 
-- `mask`
-- `replace`
-- `redact`
-- `hash`
-- `encrypt`
+- `DOCX`
+  - 尽量保留结构和格式
+- `TXT`
+- `PDF`
+  - 当前导出为重建后的 `DOCX`
+  - 无法重建时回退为 `TXT`
 
-### 可用页面
+### 当前前端页面
 
-- 文档脱敏
-- 批量处理
-- 自定义规则
-- 历史记录
-- 系统设置
+- `启动检查`
+  - 检查 Ollama、固定模型和运行环境状态
+- `文档脱敏`
+  - 上传文档、识别实体、生成脱敏结果、下载导出文件
+- `自定义规则`
+  - 管理关键词规则和正则规则
+- `系统设置`
+  - 默认识别配置、匿名策略、模板管理、运行时信息
 
-## 当前限制
+## 固定运行路线
 
-- 暂不支持扫描版 PDF/OCR
-- 暂不支持旧版 `.doc`
-- 批量处理当前为同步串行处理，结果一次性返回
-- 批量处理前端目前只支持多文件上传，不支持文件夹或压缩包入口
-- 若 Ollama 不可用，系统仍可启动，但 LLM 识别会退化为空结果
-
-## 快速开始
-
-### 方式 1：完整启动
-
-```bat
-install_dependencies.bat
-start_all.bat
-```
-
-启动后访问：
-
-- 前端：<http://localhost:5173>
-- 后端：<http://localhost:8000>
-- API 文档：<http://localhost:8000/docs>
-
-### 方式 2：分别启动
-
-```bat
-start_backend.bat
-start_frontend.bat
-```
-
-### 方式 3：启动桌面入口
-
-```bat
-start_desktop.bat
-```
-
-说明：
-
-- 后端脚本会优先使用 `backend\venv\Scripts\python.exe`
-- 如果虚拟环境不存在，脚本会自动创建
-- 前端若未安装依赖，脚本会自动执行 `npm install`
-
-## LLM 配置
-
-默认使用 Ollama：
+当前成品路线默认锁定本地稳定模型：
 
 ```env
 LLM_BACKEND=ollama
-OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_BASE_URL=http://127.0.0.1:11434
 OLLAMA_MODEL=qwen3.5:4b
 ```
 
-如果需要本地拉取模型，可以使用：
+如果本机未安装模型，可执行：
 
-```bat
-download_ollama_model.bat
-```
-
-或者手动执行：
-
-```bat
+```bash
 ollama pull qwen3.5:4b
 ```
 
-注意：`backend/.env` 会覆盖代码中的默认值。
+或在打包产物中运行：
 
-## 页面说明
-
-### 文档脱敏
-
-- 上传单个合同文件
-- 配置是否启用大模型和自定义规则
-- 查看实体列表、文本预览、统计信息
-- 执行脱敏并下载结果
-
-### 批量处理
-
-- 一次上传多个文件
-- 使用默认识别配置批量执行分析
-- 查看每个文件的实体结果和统计摘要
-
-### 自定义规则
-
-- 管理关键词规则
-- 管理正则规则
-- 为规则填写说明、上下文、评分
-- 用测试文本即时验证规则效果
-
-### 历史记录
-
-- 查看任务列表
-- 查看任务详情
-- 查看任务统计
-- 删除历史记录
-
-### 系统设置
-
-- 设置默认识别开关
-- 编辑高级 `operator_config`
-- 保存、应用、删除配置模板
-- 查看当前引擎与模型信息
-
-## 目录结构
-
-```text
-contract-desensitize/
-├─ backend/                 后端服务
-├─ frontend/                前端界面
-├─ desktop/                 桌面启动器
-├─ install_dependencies.bat 依赖安装脚本
-├─ start_all.bat            一键启动前后端
-├─ start_backend.bat        启动后端
-├─ start_frontend.bat       启动前端
-├─ start_desktop.bat        启动桌面入口
-├─ FEATURE_STATUS.md        当前功能状态
-└─ README.md                项目说明
+```bash
+./download_ollama_model.command
 ```
 
-## 已验证项
+## macOS 客户端打包
 
-本轮修复已完成以下验证：
+### 1. 准备依赖
 
-- 前端构建通过：`frontend\npm run build`
-- 后端测试脚本通过：
-  - `backend\tests\test_custom.py`
-  - `backend\tests\test_presidio.py`
-  - `backend\tests\test_hybrid.py`
-- API 主流程通过：
-  - 上传文件
-  - 分析实体
-  - 执行脱敏
-  - 查询历史任务
+后端依赖：
 
-## 后续可继续增强
+```bash
+python3 -m pip install -r backend/requirements.txt
+python3 -m pip install -r build/requirements-build.txt
+```
 
-- OCR 与扫描件支持
-- 更完整的格式保留
-- 批量任务异步队列
-- 更细粒度的前端脱敏策略编辑器
+前端依赖：
+
+```bash
+cd frontend
+npm install
+cd ..
+```
+
+### 2. 生成发布目录
+
+```bash
+python3 build/build.py
+```
+
+输出目录：
+
+```text
+release-macos/
+```
+
+其中会包含：
+
+- `contract-desensitize.app`
+- `start.command`
+- `download_ollama_model.command`
+- `USAGE.txt`
+- `MAC_QUICK_START.txt`
+
+### 3. 生成 DMG
+
+```bash
+python3 build/package_macos_installer.py
+```
+
+输出文件：
+
+```text
+release-macos/ContractDesensitize-macOS.dmg
+```
+
+### 4. 生成对外分发元数据
+
+```bash
+python3 build/prepare_macos_distribution.py
+```
+
+附加产物：
+
+- `release-macos/ContractDesensitize-macOS-portable.tar.gz`
+- `release-macos/DISTRIBUTION_MANIFEST.txt`
+- `release-macos/SHA256SUMS.txt`
+
+建议对外分发时优先发送：
+
+- `ContractDesensitize-macOS.dmg`
+
+内部备份或手工回传时可附带：
+
+- `ContractDesensitize-macOS-portable.tar.gz`
+- `SHA256SUMS.txt`
+
+## 开发模式
+
+### 启动后端
+
+```bash
+cd backend
+python3 main.py
+```
+
+### 启动前端
+
+```bash
+cd frontend
+npm run dev
+```
+
+开发态默认地址：
+
+- 前端：`http://127.0.0.1:5173`
+- 后端：`http://127.0.0.1:8000`
+- API 文档：`http://127.0.0.1:8000/docs`
+
+## 当前限制
+
+- 不支持旧版 `.doc`
+- 扫描版 PDF 的效果仍依赖 OCR 与模型状态
+- 任务状态当前以进程内任务表为主，不是完整的持久化任务中心
+- 产品已去除批量处理和历史记录页面
+
+## 仓库说明
+
+仓库里仍可能存在一些历史文档或 Windows 辅助脚本，它们不代表当前主交付路径。当前以本 README、`build/build.py` 和 macOS 打包脚本为准。
+
+## 对外分发建议
+
+如果要发给其他 Mac 用户直接安装使用，建议目标形态是：
+
+1. 已签名
+2. 已 notarize
+3. 已 staple 的 `ContractDesensitize-macOS.dmg`
+
+仓库中的 GitHub Actions macOS workflow 已经按这个方向准备，可在打 `v*` tag 时直接生成发布资产。

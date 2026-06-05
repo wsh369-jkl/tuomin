@@ -3,8 +3,8 @@
     <el-container>
       <el-aside width="220px" class="layout-aside">
         <div class="logo">
-          <h2>合同脱敏系统</h2>
-          <p>Stable 4B Runtime</p>
+          <h2>{{ highQualityOnly ? '合同脱敏系统' : '本地文档工作台' }}</h2>
+          <p>{{ highQualityOnly ? 'High Quality Low Memory' : 'Text Desensitize / Lawyer Assist' }}</p>
         </div>
 
         <el-menu
@@ -14,22 +14,46 @@
           text-color="#cbd5e1"
           active-text-color="#f8fafc"
         >
-          <el-menu-item index="/setup">
-            <el-icon><Monitor /></el-icon>
-            <span>启动检查</span>
-          </el-menu-item>
-          <el-menu-item index="/desensitize">
-            <el-icon><Document /></el-icon>
-            <span>文档脱敏</span>
-          </el-menu-item>
-          <el-menu-item index="/custom-rules">
-            <el-icon><SetUp /></el-icon>
-            <span>自定义规则</span>
-          </el-menu-item>
-          <el-menu-item index="/settings">
-            <el-icon><Tools /></el-icon>
-            <span>系统设置</span>
-          </el-menu-item>
+          <template v-if="highQualityOnly">
+            <el-menu-item index="/desensitize">
+              <el-icon><Document /></el-icon>
+              <span>高质量脱敏</span>
+            </el-menu-item>
+          </template>
+          <template v-else>
+            <el-menu-item index="/workspace">
+              <el-icon><Grid /></el-icon>
+              <span>工作台</span>
+            </el-menu-item>
+            <el-menu-item-group title="功能分区">
+              <el-menu-item index="/desensitize">
+                <el-icon><Document /></el-icon>
+                <span>文本脱敏</span>
+              </el-menu-item>
+              <el-menu-item index="/assistant">
+                <el-icon><Reading /></el-icon>
+                <span>律师协助</span>
+              </el-menu-item>
+              <el-menu-item index="/pdf-word-audit">
+                <el-icon><Tickets /></el-icon>
+                <span>转 Word 核查</span>
+              </el-menu-item>
+            </el-menu-item-group>
+            <el-menu-item-group title="系统">
+              <el-menu-item index="/setup">
+                <el-icon><Monitor /></el-icon>
+                <span>启动检查</span>
+              </el-menu-item>
+              <el-menu-item index="/custom-rules">
+                <el-icon><SetUp /></el-icon>
+                <span>自定义规则</span>
+              </el-menu-item>
+              <el-menu-item index="/settings">
+                <el-icon><Tools /></el-icon>
+                <span>系统设置</span>
+              </el-menu-item>
+            </el-menu-item-group>
+          </template>
         </el-menu>
       </el-aside>
 
@@ -38,7 +62,7 @@
           <div class="header-content">
             <div>
               <h3>{{ currentTitle }}</h3>
-              <p>当前界面已围绕 4B 稳定运行、跨平台联通和高质量脱敏流程进行收敛。</p>
+              <p>{{ currentDescription }}</p>
             </div>
           </div>
         </el-header>
@@ -55,7 +79,7 @@
             </template>
             <div class="runtime-banner-body">
               <span>{{ runtimeStatus.recommended_action }}</span>
-              <el-button link type="primary" @click="goToSetup">去完成启动检查</el-button>
+              <el-button v-if="!highQualityOnly" link type="primary" @click="goToSetup">去完成启动检查</el-button>
             </div>
           </el-alert>
           <router-view />
@@ -68,15 +92,19 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Document, Monitor, SetUp, Tools } from '@element-plus/icons-vue'
+import { Document, Grid, Monitor, Reading, SetUp, Tickets, Tools } from '@element-plus/icons-vue'
 import { getRuntimeStatus, type RuntimeStatusResponse } from '@/api/desensitize'
 
 const route = useRoute()
 const router = useRouter()
 const runtimeStatus = ref<RuntimeStatusResponse | null>(null)
+const highQualityOnly = import.meta.env.VITE_HIGH_QUALITY_ONLY === '1'
 
 const activeMenu = computed(() => route.path)
 const currentTitle = computed(() => (route.meta.title as string) || '')
+const currentDescription = computed(
+  () => (route.meta.description as string) || '当前页面正在使用本地文档工作台。'
+)
 
 const refreshRuntimeStatus = async () => {
   try {
@@ -155,6 +183,14 @@ onUnmounted(() => {
 .el-menu-item {
   margin: 6px 10px;
   border-radius: 10px;
+}
+
+.el-menu :deep(.el-menu-item-group__title) {
+  padding: 14px 20px 6px;
+  color: #64748b;
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
 
 .el-menu-item.is-active {
