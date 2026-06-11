@@ -5,7 +5,7 @@
 - 文本脱敏：上传 TXT、DOCX、PDF 后完成主体识别、脱敏替换、结果导出和脱敏目录生成。
 - PDF 转 Word 核查：上传原始 PDF 和 WPS 转换后的 DOCX，对转换底稿进行 OCR/版面/文本一致性复核，并输出带批注的 Word 文档、审查报告和证据包。
 
-系统默认在本机运行，后端绑定 `127.0.0.1`，运行数据、上传文件、输出文件、任务状态和日志均保存在本地目录，不作为源码提交内容。
+系统默认在本机运行，后端绑定 `127.0.0.1`，文档解析、识别、审查、脱敏和导出都在本地服务中完成。
 
 ## 功能概览
 
@@ -175,34 +175,12 @@ http://127.0.0.1:5173
 
 开发服务器默认将 `/api` 代理到后端 `http://127.0.0.1:8000`。
 
-## 运行数据和 Git 仓库边界
-
-以下内容属于本地运行数据，不应提交到 GitHub：
-
-- `backend/uploads/`
-- `backend/outputs/`
-- `backend/logs/`
-- `backend/task_state/`
-- `backend/desensitize.db`
-- `backend/analysis-review-*.json`
-- `backend/pdf_word_audit/`
-- `backend/pdf_normalized/`
-- `backend/tmp/`
-- `backend/models/`
-- `.env`
-- `backend/.env`
-- `*.log`
-- `*.pid`
-
-这些路径已经通过 `.gitignore` 排除。对于曾经被 Git 跟踪过的运行数据，需要使用 `git rm --cached` 从索引中移除，保留本地文件但不再上传。
-
 ## 当前限制
 
 - 不支持旧版 `.doc` 文件直接处理，需要先转换为 `.docx`。
 - 扫描版 PDF 的识别质量依赖本机 OCR、页面质量和模型配置。
 - PDF 转 Word 核查只对 WPS 转换 DOCX 写入批注和证据，不把审查建议直接改写进正文。
 - 本地任务状态用于运行期恢复和状态展示，不等同于完整的云端任务历史系统。
-- 仓库中可能保留历史设计文档或旧路线文档，当前实际功能以代码、根 README 和前端工作台入口为准。
 
 ## 项目定位
 
