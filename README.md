@@ -22,6 +22,7 @@
 - 数字类内容按默认数字脱敏策略处理，日期和金额等可按规则保留。
 - 识别阶段包含规则召回、结构回填、主体台账、边界修复、上下文分组、模型复核和最终导出。
 - 导出脱敏文件，并同时生成脱敏目录，目录展示实际参与脱敏的替换项。
+- 大文件模式会先按文档页数预路由，再按页分组执行默认脱敏线；各组完成后合并全局主体目录，统一主体编号和替换值，再按总目录回写分组文件并合并最终导出。
 
 核心设计：
 
@@ -30,6 +31,7 @@
 - `backend/app/services/contextual_desensitization_service.py`：上下文分组、替换编号和最终脱敏实体准备。
 - `backend/app/processors/document_exporter.py`：脱敏文件和目录导出。
 - `backend/app/processors/docx_xml_utils.py`：DOCX 可见文本抽取、精确回写和包级 XML 处理。
+- `backend/app/workers/process_worker.py`：后台任务执行入口，大文件模式在这里完成分页分组、分组默认线处理、全局目录合并、分组回写和最终文件合并。
 
 ### PDF 转 Word 核查
 
