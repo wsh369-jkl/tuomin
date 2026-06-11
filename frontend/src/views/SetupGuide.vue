@@ -247,7 +247,6 @@ const commandHint = computed(() => {
 
   if (isHighQualityLowmem.value) {
     return [
-      'python3 backend/bin/download_lowmem_models.py',
       runtimeStatus.value?.download_hint || '模型目录：-',
       '中文实体模型：uer/roberta-base-finetuned-cluener2020-chinese',
       '中文 NER：p988744/eland-ner-zh',
@@ -257,10 +256,10 @@ const commandHint = computed(() => {
   }
 
   if (platform === 'windows') {
-    return `download_ollama_model.bat\nollama pull ${modelName}`
+    return `ollama pull ${modelName}`
   }
   if (platform === 'macos') {
-    return `./download_ollama_model.command\nollama pull ${modelName}`
+    return `ollama pull ${modelName}`
   }
   return `ollama pull ${modelName}`
 })

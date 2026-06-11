@@ -108,18 +108,13 @@ def platform_label() -> str:
 def installer_hint() -> str:
     current_platform = platform_label()
     if current_platform == "windows":
-        return "请先运行安装包，然后从桌面快捷方式或开始菜单启动客户端。"
+        return "请先启动后端服务和前端开发服务。"
     if current_platform == "macos":
-        return "首次建议运行 start.command 完成授权，之后可直接打开 contract-desensitize.app。"
-    return "请先运行打包目录中的启动脚本或主程序。"
+        return "请先启动后端服务和前端开发服务。"
+    return "请先启动后端服务和前端开发服务。"
 
 
 def download_hint(model_name: str) -> str:
-    current_platform = platform_label()
-    if current_platform == "windows":
-        return f"可运行 download_ollama_model.bat，或手动执行：ollama pull {model_name}"
-    if current_platform == "macos":
-        return f"可运行 download_ollama_model.command，或手动执行：ollama pull {model_name}"
     return f"请手动执行：ollama pull {model_name}"
 
 

@@ -66,14 +66,10 @@ contract-desensitize/
 │   ├── app/rules/            # 默认脱敏规则层
 │   ├── app/services/         # 脱敏服务、模型服务、PDF 转 Word 审查服务
 │   └── app/workers/          # 后台任务 worker
-├── frontend/                 # Vue 3 + TypeScript + Element Plus 前端
-├── desktop/                  # macOS 本地启动器
-├── build/                    # 打包脚本和发布构建工具
-├── script/                   # 本地构建/运行辅助脚本
-└── start.command             # macOS 一键启动入口
+└── frontend/                 # Vue 3 + TypeScript + Element Plus 前端
 ```
 
-后端负责文档解析、实体识别、模型审查、脱敏替换、PDF 转 Word 核查、结果导出和证据产物生成。前端提供工作台、文本脱敏、PDF 转 Word 核查、自定义规则和系统设置页面。桌面启动器用于 macOS 本地客户端形态。
+后端负责文档解析、实体识别、模型审查、脱敏替换、PDF 转 Word 核查、结果导出和证据产物生成。前端提供工作台、文本脱敏、PDF 转 Word 核查、自定义规则和系统设置页面。
 
 ## 前端页面
 
@@ -143,17 +139,7 @@ PDF 转 Word 核查相关：
 
 ## 本地运行
 
-### 一键启动
-
-macOS 下可直接双击仓库根目录的：
-
-```text
-start.command
-```
-
-一键启动脚本会按需准备后端虚拟环境、安装依赖、构建前端静态资源并启动本地服务。
-
-### 开发模式启动后端
+### 启动后端
 
 ```bash
 cd backend
@@ -173,7 +159,7 @@ API 文档：
 http://127.0.0.1:8000/docs
 ```
 
-### 开发模式启动前端
+### 启动前端
 
 ```bash
 cd frontend
@@ -188,44 +174,6 @@ http://127.0.0.1:5173
 ```
 
 开发服务器默认将 `/api` 代理到后端 `http://127.0.0.1:8000`。
-
-## 构建和打包
-
-安装构建依赖：
-
-```bash
-python3 -m pip install -r backend/requirements.txt
-python3 -m pip install -r build/requirements-build.txt
-cd frontend
-npm install
-cd ..
-```
-
-构建前端：
-
-```bash
-cd frontend
-npm run build
-cd ..
-```
-
-生成 macOS 发布目录：
-
-```bash
-python3 build/build.py
-```
-
-生成 macOS 安装包：
-
-```bash
-python3 build/package_macos_installer.py
-```
-
-发布产物通常位于：
-
-```text
-release-macos/
-```
 
 ## 运行数据和 Git 仓库边界
 

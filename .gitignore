@@ -31,6 +31,7 @@ backend/pdf_normalized/
 backend/local_pdf_frontline_checkpoints/
 backend/task_state/
 backend/desensitize.db
+backend/analysis-primary-*.json
 backend/analysis-review-*.json
 backend/pdf-word-audit-*.json
 backend/pdf-word-audit-v4-*.json
@@ -56,11 +57,14 @@ release_updated/
 backend/.env
 
 # Test caches
+backend/tests/
 .pytest_cache/
 .coverage
 htmlcov/
 
 # IDE / OS
+.codex/
+.github/
 .vscode/
 .idea/
 *.swp
