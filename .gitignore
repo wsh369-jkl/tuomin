@@ -29,15 +29,19 @@ backend/tmp/
 backend/pdf_word_audit/
 backend/pdf_normalized/
 backend/local_pdf_frontline_checkpoints/
+backend/task_state/
 backend/desensitize.db
+backend/analysis-review-*.json
 backend/pdf-word-audit-*.json
 backend/pdf-word-audit-v4-*.json
 backend/local-pdf-frontline-*.json
 backend/mlx_vlm_server.log
 backend/mlx_vlm_server.pid
+backend_server.pid
 tmp/
 
 # Build outputs
+/*.zip
 build_artifacts/
 release/
 release-macos/

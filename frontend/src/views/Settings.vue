@@ -15,23 +15,10 @@
       </template>
 
       <el-form label-width="160px">
-        <el-form-item label="默认处理线路">
-          <el-radio-group v-model="settings.desensitize_mode_default" @change="handleModeChange">
-            <el-radio-button
-              v-for="option in desensitizeModeOptions"
-              :key="option.value"
-              :label="option.value"
-            >
-              {{ option.label }}
-            </el-radio-button>
-          </el-radio-group>
-          <div class="form-tip">{{ selectedModeDescription }}</div>
-        </el-form-item>
-
-        <el-form-item :label="isHighQualityWorkflow ? '默认启用高质量识别' : '默认启用大模型识别'">
+        <el-form-item label="默认启用高质量识别">
           <el-switch v-model="settings.use_llm_default" />
         </el-form-item>
-        <el-form-item :label="isHighQualityWorkflow ? '默认精审模型（按需）' : '默认识别模型'">
+        <el-form-item label="默认精审模型（按需）">
           <el-select
             v-model="settings.llm_model_default"
             class="full-width"
@@ -49,9 +36,7 @@
           <div class="form-tip">
             {{
               selectedModelDescription ||
-              (isHighQualityWorkflow
-                ? '小 Qwen 只在需要时做片段补漏。'
-                : '新任务默认使用本地识别模型。')
+              '小 Qwen 只在需要时做片段补漏。'
             }}
           </div>
         </el-form-item>
@@ -256,10 +241,8 @@ import type { EngineInfo, LLMModelListResponse, LLMModelOption } from '@/api/des
 import type { ConfigTemplate } from '@/api/history'
 import {
   defaultAppSettings,
-  desensitizeModeOptions,
   loadAppSettings,
   normalizeAppSettings,
-  normalizeDesensitizeMode,
   saveAppSettings
 } from '@/utils/settings'
 
@@ -304,19 +287,8 @@ const anonymizationStrategyOptions = [
     description: '人名改成 a/b/c/d，机构改成 alpha/beta/gamma，地名改成甲地/乙地，并对同一主体保持稳定编码。'
   }
 ]
-const selectedModeDescription = computed(
-  () =>
-    desensitizeModeOptions.find((item) => item.value === settings.value.desensitize_mode_default)
-      ?.description || ''
-)
-const isHighQualityWorkflow = computed(() =>
-  ['local_high_quality', 'high_quality_lowmem'].includes(settings.value.desensitize_mode_default)
-)
 const modelOptions = computed(() => {
   const models = modelCatalog.value?.models || []
-  if (!isHighQualityWorkflow.value) {
-    return models
-  }
   return models.filter((item) => ['review', 'review_fallback'].includes(item.role || item.tier))
 })
 const selectedModelOption = computed(() =>
@@ -326,13 +298,7 @@ const selectedModelDescription = computed(() => {
   if (!selectedModelOption.value) {
     return ''
   }
-  if (settings.value.desensitize_mode_default === 'local_high_quality') {
-    return 'PDF 前置线用 GLM-OCR 作为正文主输出，VL 只兜底质量门禁未通过的少量页面。'
-  }
-  if (settings.value.desensitize_mode_default === 'high_quality_lowmem') {
-    return '按低内存工作流调度，小模型主召回，Qwen 只审风险片段。'
-  }
-  return `${selectedModelOption.value.strategy_label}：${selectedModelOption.value.strategy_description}`
+  return '按低内存工作流调度，小模型主召回，Qwen 只审风险片段。'
 })
 const selectedAnonymizationDescription = computed(() => {
   return (
@@ -403,7 +369,7 @@ const formatModelLabel = (model: LLMModelOption) => {
     review: '按需精审',
     review_fallback: '低内存兜底精审'
   }
-  const roleTag = isHighQualityWorkflow.value && roleMap[roleKey] ? ` / ${roleMap[roleKey]}` : ''
+  const roleTag = roleMap[roleKey] ? ` / ${roleMap[roleKey]}` : ''
   return `${model.name} (${model.strategy_label}${roleTag} / ${status}${defaultTag})`
 }
 
@@ -413,13 +379,6 @@ const loadRuntimeInfo = async () => {
   } catch (error) {
     ElMessage.error('加载运行时信息失败')
   }
-}
-
-const handleModeChange = async () => {
-  settings.value.desensitize_mode_default = normalizeDesensitizeMode(
-    settings.value.desensitize_mode_default
-  )
-  await Promise.all([loadRuntimeInfo(), loadModelCatalog()])
 }
 
 const loadTemplateList = async () => {

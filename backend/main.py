@@ -28,7 +28,7 @@ if _maybe_run_packaged_worker():
     raise SystemExit(0)
 
 
-from app.api import assistant, custom, desensitize, history, pdf_word_audit, review
+from app.api import custom, desensitize, history, pdf_word_audit
 from app.core.config import settings
 from app.core.runtime_security import ensure_private_file
 
@@ -72,11 +72,18 @@ def _frontend_available() -> bool:
 
 def _is_reserved_path(full_path: str) -> bool:
     reserved_paths = {"health", "docs", "redoc", "openapi.json"}
+    frontend_routes = {"workspace", "setup", "desensitize", "pdf-word-audit", "custom-rules", "settings"}
+    first_segment = full_path.split("/", 1)[0]
     return (
         full_path in reserved_paths
         or full_path.startswith("api/")
         or full_path.startswith("docs/")
         or full_path.startswith("redoc/")
+        or (
+            not full_path.startswith("assets/")
+            and "." not in first_segment
+            and first_segment not in frontend_routes
+        )
     )
 
 
@@ -98,8 +105,6 @@ app.add_middleware(
 )
 
 app.include_router(desensitize.router, prefix=settings.API_V1_PREFIX)
-app.include_router(assistant.router, prefix=settings.API_V1_PREFIX)
-app.include_router(review.router, prefix=settings.API_V1_PREFIX)
 app.include_router(pdf_word_audit.router, prefix=settings.API_V1_PREFIX)
 app.include_router(custom.router, prefix=settings.API_V1_PREFIX)
 app.include_router(history.router, prefix=settings.API_V1_PREFIX)
@@ -161,8 +166,12 @@ async def frontend_spa(full_path: str):
 async def startup_event():
     logger.info("Starting %s v%s", settings.APP_NAME, settings.APP_VERSION)
     logger.info("Binding host: %s", settings.APP_HOST)
+    logger.info("Desensitize mode: %s", settings.get_effective_desensitize_mode())
     logger.info("LLM backend: %s", settings.LLM_BACKEND)
-    logger.info("Ollama model: %s", settings.OLLAMA_MODEL)
+    if settings.is_high_quality_desensitize_mode():
+        logger.info("Review model: %s (%s)", settings.REVIEW_MODEL, settings.REVIEW_BACKEND)
+    elif settings.LLM_BACKEND.lower() == "ollama":
+        logger.info("Ollama model: %s", settings.OLLAMA_MODEL)
     logger.info("Runtime root: %s", settings.RUNTIME_ROOT)
     logger.info("Client assets: %s", settings.FRONTEND_DIST_DIR)
     logger.info("Client available: %s", _frontend_available())

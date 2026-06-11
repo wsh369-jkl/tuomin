@@ -19,17 +19,22 @@ from app.services.lowmem_entity_utils import (
     infer_semantic_type,
     is_identity_reference_term,
     is_generic_organization_term,
+    is_non_subject_action_or_function_term,
+    is_non_subject_generic_org_reference,
     is_org_like_text,
     is_position_title,
+    is_probable_person,
     looks_like_organization_short_name,
     make_entity,
     remap_results_to_source,
     sanitize_recognition_text,
     strip_identity_reference_prefix,
+    subject_noun_gate,
 )
 from app.services.lowmem_memory import release_runtime_memory
 from app.services.lowmem_model_assets import build_model_asset
 from app.services.hf_token_classifier import HFTokenClassificationPipeline
+from app.services.legal_text_segmenter import iter_legal_text_segments
 
 
 class ChineseUIEService:
@@ -378,30 +383,7 @@ class ChineseUIEService:
         return results
 
     def _iter_segments(self, text: str, *, max_chars: int = 420) -> Iterable[tuple[str, int]]:
-        cursor = 0
-        for raw_line in text.splitlines(keepends=True):
-            line_start = cursor
-            cursor += len(raw_line)
-            line = raw_line.rstrip("\r\n")
-            if not line.strip():
-                continue
-            if len(line) <= max_chars:
-                yield line, line_start
-                continue
-            start = 0
-            while start < len(line):
-                end = min(len(line), start + max_chars)
-                if end < len(line):
-                    split_at = max(
-                        line.rfind("。", start, end),
-                        line.rfind("；", start, end),
-                        line.rfind("，", start, end),
-                        line.rfind(" ", start, end),
-                    )
-                    if split_at > start + 40:
-                        end = split_at + 1
-                yield line[start:end], line_start + start
-                start = end
+        yield from iter_legal_text_segments(text, max_chars=max_chars, overlap_chars=80, min_split_chars=60)
 
     def _modelscope_schema(self) -> dict[str, None]:
         return {label: None for label in self.SCHEMA}
@@ -490,23 +472,18 @@ class ChineseUIEService:
         if normalized in self.NON_VALUE_TERMS:
             return None
         if entity_type == "PERSON":
-            if is_identity_reference_term(normalized) or is_position_title(normalized):
-                return None
-            if is_org_like_text(normalized):
-                return None
-            if any(token in normalized for token in self.ADDRESS_TOKENS):
-                return None
-            if not re.fullmatch(r"[\u4e00-\u9fa5]{2,8}(?:·[\u4e00-\u9fa5]{2,8})?", normalized):
+            if not subject_noun_gate("PERSON", normalized)[0]:
                 return None
         if entity_type in {"ADDRESS", "LOCATION"}:
             if self.DATE_LIKE.fullmatch(normalized) or normalized in self.NON_VALUE_TERMS:
                 return None
             if entity_type == "ADDRESS" and not any(token in normalized for token in self.ADDRESS_TOKENS):
                 return None
-        if entity_type in {"ORGANIZATION", "COURT"}:
-            if is_identity_reference_term(normalized) or is_position_title(normalized):
+            if not subject_noun_gate("LOCATION", normalized)[0]:
                 return None
-            if re.fullmatch(r"[\u4e00-\u9fa5]{2,8}(?:·[\u4e00-\u9fa5]{2,8})?", normalized) and not is_org_like_text(normalized):
+        if entity_type in {"ORGANIZATION", "COURT"}:
+            gate_type = "GOVERNMENT" if entity_type == "COURT" else "ORGANIZATION"
+            if not subject_noun_gate(gate_type, normalized)[0]:
                 return None
         if entity_type == "POSITION" and normalized in self.NON_VALUE_TERMS:
             return None
@@ -600,14 +577,12 @@ class ChineseUIEService:
         if self.DATE_LIKE.fullmatch(normalized):
             return False
         if entity_type == "PERSON":
-            return not is_identity_reference_term(normalized) and not is_org_like_text(normalized)
+            return subject_noun_gate("PERSON", normalized)[0]
         if entity_type in {"ORGANIZATION", "COURT"}:
-            if is_identity_reference_term(normalized) or is_position_title(normalized):
-                return False
-            if re.fullmatch(r"[\u4e00-\u9fa5]{2,8}(?:·[\u4e00-\u9fa5]{2,8})?", normalized) and not is_org_like_text(normalized):
-                return False
+            gate_type = "GOVERNMENT" if entity_type == "COURT" else "ORGANIZATION"
+            return subject_noun_gate(gate_type, normalized)[0]
         if entity_type == "ADDRESS":
-            return any(token in normalized for token in self.ADDRESS_TOKENS)
+            return any(token in normalized for token in self.ADDRESS_TOKENS) and subject_noun_gate("LOCATION", normalized)[0]
         return True
 
     def _expected_label_entity_type(self, label: str) -> str:
@@ -694,6 +669,8 @@ class ChineseUIEService:
         end = start + len(value)
 
         if entity_type in {"ORGANIZATION", "COURT"}:
+            if is_non_subject_generic_org_reference(value) or is_non_subject_action_or_function_term(value):
+                return None
             org_trimmed = self._trim_to_semantic_org_value(value)
             if org_trimmed != value:
                 delta = len(value) - len(org_trimmed)
@@ -743,7 +720,8 @@ class ChineseUIEService:
             return None
         if len(normalized) > 16 and any(token in normalized for token in ("的", "是", "至", "了")):
             return None
-        return (start, end) if len(normalized) >= 2 else None
+        gate_type = "GOVERNMENT" if entity_type == "COURT" else "ORGANIZATION"
+        return (start, end) if len(normalized) >= 2 and subject_noun_gate(gate_type, normalized)[0] else None
 
     def _trim_to_semantic_org_value(self, value: str) -> str:
         cleaned = value.strip(self.TRAILING_PUNCTUATION)

@@ -19,6 +19,12 @@ from app.core.recognizer_base import RecognizerResult
 from app.core.config import desensitize_mode_context, settings
 from app.recognizers.high_quality_lowmem_recognizer import HighQualityLowMemoryRecognizer
 from app.services.contextual_desensitization_service import ContextualDesensitizationService
+from app.services.qwen_fragment_review_service import QwenFragmentReviewService
+from app.services.review_input_compactor import compact_recognizer_results_for_review
+from app.services.risk_snippet_scheduler import RiskSnippet
+
+_ledger_adjudication_completion = HighQualityLowMemoryRecognizer._ledger_adjudication_completion
+SHORT_ORG_PUBLICATION_FILTER_VERSION = "2026-06-10-structure-ambiguous-short-org-v1"
 
 
 def _result_from_dict(item: Dict[str, Any]) -> Optional[RecognizerResult]:
@@ -33,6 +39,16 @@ def _result_from_dict(item: Dict[str, Any]) -> Optional[RecognizerResult]:
         return None
     if not entity_type or not text or start < 0 or end <= start:
         return None
+    metadata = dict(item.get("metadata") if isinstance(item.get("metadata"), dict) else {})
+    for metadata_key in (
+        "canonical_key",
+        "canonical_role",
+        "replacement",
+        "replacement_method",
+        "source_layer",
+    ):
+        if metadata_key not in metadata and item.get(metadata_key) is not None:
+            metadata[metadata_key] = item.get(metadata_key)
     return RecognizerResult(
         entity_type=entity_type,
         start=start,
@@ -40,7 +56,7 @@ def _result_from_dict(item: Dict[str, Any]) -> Optional[RecognizerResult]:
         score=score,
         text=text,
         source=source,
-        metadata=item.get("metadata") if isinstance(item.get("metadata"), dict) else {},
+        metadata=metadata,
     )
 
 
@@ -69,6 +85,43 @@ def _entity_statistics(entities: List[Dict[str, Any]]) -> Dict[str, Dict[str, ob
     return stats
 
 
+def _structure_short_org_counts(entities: Iterable[Dict[str, Any]]) -> Dict[str, int]:
+    counts = {
+        "total": 0,
+        "ambiguous": 0,
+        "confirmed": 0,
+        "review_backed": 0,
+    }
+    for entity in entities or []:
+        if not isinstance(entity, dict):
+            continue
+        metadata = entity.get("metadata") if isinstance(entity.get("metadata"), dict) else {}
+        source = str(entity.get("source") or "").strip()
+        source_layer = str(metadata.get("source_layer") or "").strip()
+        trigger = str(metadata.get("trigger") or "").strip()
+        if not metadata.get("short_org_candidate"):
+            continue
+        if source != "rule_organization_context" and not (source_layer == "structure" and "short_org" in trigger):
+            continue
+        counts["total"] += 1
+        status = str(
+            metadata.get("subject_ledger_status")
+            or metadata.get("subject_ledger_subject_status")
+            or ""
+        ).strip()
+        if status == "ambiguous_short_subject":
+            counts["ambiguous"] += 1
+        elif status:
+            counts["confirmed"] += 1
+        if (
+            metadata.get("review")
+            or str(metadata.get("source_layer") or "").strip().lower() == "llm_review"
+            or source in {"qwen_fragment_review", "qwen_heavy_arbitration"}
+        ):
+            counts["review_backed"] += 1
+    return counts
+
+
 def _validate_and_expand(text: str, results: List[RecognizerResult]) -> List[RecognizerResult]:
     manager = object.__new__(PipelineManager)
     validated = manager._validate_results(results, text)
@@ -78,6 +131,16 @@ def _validate_and_expand(text: str, results: List[RecognizerResult]) -> List[Rec
 
 def _results_from_entity_dicts(items: Iterable[Dict[str, Any]]) -> List[RecognizerResult]:
     return _results_from_payload(items)
+
+
+def _write_progress(progress_path: str | None, payload: Dict[str, object]) -> None:
+    if not progress_path:
+        return
+    path = Path(progress_path)
+    try:
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def _postprocess_final_entities(
@@ -107,6 +170,7 @@ def _postprocess_final_entities(
 async def _run(payload: Dict[str, Any]) -> Dict[str, Any]:
     with desensitize_mode_context(payload.get("desensitize_mode")):
         text = str(payload.get("text") or "")
+        progress_path = str(payload.get("progress_path") or "").strip() or None
         source_metadata = payload.get("source_metadata") if isinstance(payload.get("source_metadata"), dict) else None
         source_structure = payload.get("source_structure") if isinstance(payload.get("source_structure"), dict) else None
         entities_filter = payload.get("entities_filter")
@@ -117,17 +181,36 @@ async def _run(payload: Dict[str, Any]) -> Dict[str, Any]:
         review_surface_entities = _results_from_payload(payload.get("review_entities") or [])
         if not review_surface_entities:
             review_surface_entities = list(primary_entities)
+        primary_entity_input_count = len(primary_entities)
+        review_surface_input_count = len(review_surface_entities)
+        review_surface_entities = compact_recognizer_results_for_review(review_surface_entities)
         primary_metadata = dict(payload.get("analysis_metadata") or {})
         recognizer = HighQualityLowMemoryRecognizer()
+        ordinary_review_budget_getter = getattr(recognizer, "_ordinary_review_budget", None)
+        ordinary_review_budget = (
+            int(ordinary_review_budget_getter())
+            if callable(ordinary_review_budget_getter)
+            else max(1, int(settings.MID_REVIEW_MAX_SNIPPETS or settings.REVIEW_MAX_SNIPPETS or 1))
+        )
 
-        snippets = recognizer.snippet_scheduler.build_snippets(text, review_surface_entities)
+        snippets = recognizer.snippet_scheduler.build_snippets(
+            text,
+            review_surface_entities,
+            source_structure=source_structure,
+            max_snippets=ordinary_review_budget,
+        )
         review_snippets = recognizer._select_review_snippets_requiring_semantic_recovery(
             snippets,
             review_surface_entities,
         )
         review_trigger_reasons = sorted({snippet.risk_reason for snippet in review_snippets})
         metadata = dict(primary_metadata)
+        recognizer.last_rule_first_metadata = dict(primary_metadata)
         stage_counts = dict(metadata.get("stage_counts") or {})
+        stage_counts["review_worker_primary_input_count"] = primary_entity_input_count
+        stage_counts["review_worker_primary_compacted_count"] = len(primary_entities)
+        stage_counts["review_worker_surface_input_count"] = review_surface_input_count
+        stage_counts["review_worker_surface_compacted_count"] = len(review_surface_entities)
         quality_flags = list(metadata.get("quality_flags") or [])
         requires_manual_review = bool(metadata.get("requires_manual_review"))
         review_result = None
@@ -142,43 +225,94 @@ async def _run(payload: Dict[str, Any]) -> Dict[str, Any]:
             "qwen_rejected_entities": 0,
         }
 
-        results = list(review_surface_entities)
-        review_available = recognizer.review_service.installed
-        if settings.ENABLE_QWEN_REVIEW and review_snippets and review_available:
+        results = list(primary_entities)
+        review_available = bool(recognizer.review_service.installed)
+        review_metadata: dict[str, Any] = {}
+        final_adjudication = getattr(recognizer, "_final_deterministic_adjudication_decisions", None)
+        deterministic_review_decisions = (
+            final_adjudication(results)
+            if callable(final_adjudication)
+            else {"rejections": [], "entities": []}
+        )
+        deterministic_review_rejections = list(deterministic_review_decisions.get("rejections") or [])
+        deterministic_review_entity_rows = list(deterministic_review_decisions.get("entities") or [])
+        deterministic_review_entities = []
+        if deterministic_review_entity_rows:
+            materialize_candidates = getattr(recognizer.review_service, "_materialize_candidates", None)
+            materializer = recognizer.review_service if callable(materialize_candidates) else QwenFragmentReviewService()
+            deterministic_review_entities = materializer._materialize_candidates(
+                text,
+                {"entities": deterministic_review_entity_rows},
+                RiskSnippet(
+                    "final_subject_adjudication",
+                    "final_subject:deterministic_worker",
+                    0,
+                    len(text),
+                    text,
+                ),
+                source_name="review_deterministic_decision",
+            )
+        if deterministic_review_rejections:
+            before_review_count = len(results)
+            results = recognizer._apply_review_rejections(results, deterministic_review_rejections)
+            deterministic_rejected_count = max(0, before_review_count - len(results))
+            stage_counts["final_deterministic_adjudication_rejected"] = deterministic_rejected_count
+            if deterministic_rejected_count:
+                quality_flags.append("final_deterministic_adjudication_applied")
+        if deterministic_review_entities:
+            canonicalize_default_results = getattr(recognizer, "_canonicalize_default_results", None)
+            results.extend(
+                canonicalize_default_results(deterministic_review_entities)
+                if callable(canonicalize_default_results)
+                else deterministic_review_entities
+            )
+            stage_counts["final_deterministic_adjudication_entities"] = len(deterministic_review_entities)
+            quality_flags.append("final_deterministic_adjudication_entities_applied")
+        if settings.ENABLE_QWEN_REVIEW and review_available and review_snippets:
             review_result = await recognizer.review_service.review(
                 text,
                 review_snippets,
                 existing_entities=review_surface_entities,
+                max_snippets=ordinary_review_budget,
+                progress_callback=lambda payload: _write_progress(progress_path, payload),
             )
+            review_metadata = dict(getattr(review_result, "metadata", {}) or {})
             qwen_contribution = recognizer._measure_qwen_contribution(
                 review_surface_entities,
                 review_result.entities,
                 review_result.raw_candidate_count,
             )
+            qwen_contribution["qwen_rejected_entities"] = len(review_result.rejected_entities)
             if review_result.rejected_entities:
-                before_reject_count = len(results)
+                before_review_count = len(results)
                 results = recognizer._apply_review_rejections(results, review_result.rejected_entities)
-                rejected_count = max(0, before_reject_count - len(results))
-                qwen_contribution["qwen_rejected_entities"] = rejected_count
-                if rejected_count:
-                    qwen_contribution["qwen_value_level"] = "corrective"
-                    quality_flags.append("qwen_rejections_applied")
-            results.extend(review_result.entities)
+                rejected_review_count = max(0, before_review_count - len(results))
+                if rejected_review_count:
+                    requires_manual_review = True
+                    quality_flags.append("review_rejections_applied")
+            ledger_decisions = list(review_metadata.get("ledger_conflict_decisions") or [])
+            if ledger_decisions:
+                results = recognizer._apply_ledger_adjudication_decisions(results, ledger_decisions)
+                recognizer._apply_resolved_subject_ledger_metadata(ledger_decisions)
+                metadata.update(recognizer.last_rule_first_metadata)
+                quality_flags.append("ledger_conflict_adjudication_applied")
+                if any(bool(item.get("requires_manual_review")) for item in ledger_decisions):
+                    requires_manual_review = True
+                    quality_flags.append("ledger_conflict_manual_review_required")
+            if review_result.entities:
+                results.extend(review_result.entities)
             requires_manual_review = requires_manual_review or review_result.requires_manual_review
             if review_result.error:
                 quality_flags.append(f"review_warning:{review_result.error}")
-            if review_result.arbitration_used:
-                quality_flags.append("heavy_arbitration_used")
-            if review_result.arbitration_error:
-                quality_flags.append(f"arbitration_warning:{review_result.arbitration_error}")
-        elif settings.ENABLE_QWEN_REVIEW and not review_available:
+            if not review_result.model_used:
+                requires_manual_review = True
+                quality_flags.append("review_model_not_used")
+        elif settings.ENABLE_QWEN_REVIEW and review_available:
+            review_skipped_reason = "no_review_snippets"
+        elif settings.ENABLE_QWEN_REVIEW:
             requires_manual_review = True
             quality_flags.append("review_model_missing")
             review_skipped_reason = "review_model_missing"
-        elif settings.ENABLE_QWEN_REVIEW and snippets and not review_snippets:
-            review_skipped_reason = "primary_pipeline_sufficient"
-        elif settings.ENABLE_QWEN_REVIEW:
-            review_skipped_reason = "no_risk_snippets"
         else:
             review_skipped_reason = "review_disabled"
 
@@ -186,11 +320,65 @@ async def _run(payload: Dict[str, Any]) -> Dict[str, Any]:
         stage_counts["primary_review_surface"] = len(review_surface_entities)
         stage_counts["primary_fallback_entities"] = len(primary_entities)
         stage_counts["risk_snippets"] = len(snippets)
+        stage_counts["docx_structure_snippets"] = sum(
+            1 for snippet in snippets if snippet.risk_reason.startswith("docx_structure:")
+        )
+        stage_counts["docx_table_cell_snippets"] = sum(
+            1 for snippet in snippets if snippet.snippet_type == "docx_table_cell_block"
+        )
         stage_counts["review_snippets_selected"] = len(review_snippets)
+        stage_counts["docx_structure_snippets_selected"] = sum(
+            1 for snippet in review_snippets if str(snippet.risk_reason or "").startswith("docx_structure:")
+        )
+        stage_counts["docx_table_cell_snippets_selected"] = sum(
+            1 for snippet in review_snippets if str(snippet.snippet_type or "") == "docx_table_cell_block"
+        )
         stage_counts["qwen_raw_candidates"] = int(qwen_contribution["qwen_raw_candidates"])
         stage_counts["qwen_review"] = len(review_result.entities) if review_result else 0
         stage_counts["qwen_new_after_merge"] = int(qwen_contribution["qwen_new_entities_after_merge"])
         stage_counts["qwen_rejected"] = int(qwen_contribution.get("qwen_rejected_entities") or 0)
+        stage_counts["ledger_conflict_decisions"] = int(
+            review_metadata.get("ledger_conflict_decision_count") or 0
+        ) if review_result else 0
+        stage_counts["ledger_conflict_snippets"] = int(
+            review_metadata.get("ledger_conflict_snippet_count") or 0
+        ) if review_result else sum(
+            1
+            for snippet in review_snippets
+            if str(snippet.snippet_type or "") == "ledger_conflict_adjudication"
+            or str(snippet.risk_reason or "").startswith("subject_ledger:")
+        )
+        if review_result:
+            stage_counts["review_scheduled_ledger_snippets"] = int(
+                review_metadata.get("review_scheduled_ledger_snippet_count") or 0
+            )
+            stage_counts["review_scheduled_standard_snippets"] = int(
+                review_metadata.get("review_scheduled_standard_snippet_count") or 0
+            )
+            stage_counts["review_deterministic_rejections"] = int(
+                review_metadata.get("review_deterministic_rejection_count") or 0
+            )
+            stage_counts["review_deterministic_entity_decisions"] = int(
+                review_metadata.get("review_deterministic_entity_decision_count") or 0
+            )
+            stage_counts["review_deterministic_entities"] = int(
+                review_metadata.get("review_deterministic_entity_count") or 0
+            )
+            stage_counts["review_entity_decision_rejections"] = int(
+                review_metadata.get("review_entity_decision_rejection_count") or 0
+            )
+            stage_counts["review_entity_decision_entities"] = int(
+                review_metadata.get("review_entity_decision_entity_count") or 0
+            )
+        resolved_subject_ledger_summary = dict(
+            metadata.get("resolved_subject_ledger_summary") or {}
+        )
+        stage_counts["resolved_subject_ledger_review_queue"] = int(
+            resolved_subject_ledger_summary.get("review_queue_count") or 0
+        )
+        stage_counts["resolved_subject_ledger_unresolved_subjects"] = int(
+            resolved_subject_ledger_summary.get("unresolved_subject_count") or 0
+        )
         stage_counts["post_review_merged"] = len(merged)
 
         if settings.ALIAS_PROPAGATION:
@@ -201,30 +389,9 @@ async def _run(payload: Dict[str, Any]) -> Dict[str, Any]:
             if alias_added:
                 quality_flags.append("alias_propagation_applied")
 
-        if settings.ENABLE_QWEN_REVIEW and review_available:
-            quality_gate_snippets = recognizer._build_final_quality_gate_snippets(text, merged)
-            stage_counts["quality_gate_snippets_selected"] = len(quality_gate_snippets)
-            if quality_gate_snippets:
-                gate_result = await recognizer.review_service.review(
-                    text,
-                    quality_gate_snippets,
-                    existing_entities=merged,
-                    max_snippets=len(quality_gate_snippets),
-                )
-                stage_counts["quality_gate_review"] = len(gate_result.entities)
-                if gate_result.rejected_entities:
-                    before_gate_count = len(merged)
-                    merged = recognizer._apply_review_rejections(merged, gate_result.rejected_entities)
-                    rejected_gate_count = max(0, before_gate_count - len(merged))
-                    stage_counts["quality_gate_rejected"] = rejected_gate_count
-                    if rejected_gate_count:
-                        quality_flags.append("quality_gate_rejections_applied")
-                if gate_result.entities:
-                    merged = recognizer.merge_service.merge([*merged, *gate_result.entities])
-                    quality_flags.append("quality_gate_entities_added")
-                requires_manual_review = requires_manual_review or gate_result.requires_manual_review
-                if gate_result.error:
-                    quality_flags.append(f"quality_gate_warning:{gate_result.error}")
+        stage_counts["quality_gate_snippets_selected"] = 0
+        stage_counts["quality_gate_review"] = 0
+        stage_counts["quality_gate_rejected"] = 0
 
         if recognizer._needs_quality_review(text, merged):
             requires_manual_review = True
@@ -233,6 +400,12 @@ async def _run(payload: Dict[str, Any]) -> Dict[str, Any]:
         if entities_filter:
             merged = recognizer._filter_entities(merged, entities_filter)
 
+        project_default_public_results = getattr(recognizer, "_project_default_public_results", None)
+        merged = (
+            project_default_public_results(merged)
+            if callable(project_default_public_results)
+            else list(merged)
+        )
         final_results = _validate_and_expand(text, merged)
         final_entities = [result.to_dict() for result in final_results]
         contextual_service = ContextualDesensitizationService(
@@ -241,7 +414,7 @@ async def _run(payload: Dict[str, Any]) -> Dict[str, Any]:
         final_entities = await contextual_service.refine_recognition_entities(
             text=text,
             entities=final_entities,
-            use_llm=bool(review_available),
+            use_llm=False,
             llm_model=(
                 review_result.model_name
                 if review_result and review_result.model_name
@@ -251,7 +424,9 @@ async def _run(payload: Dict[str, Any]) -> Dict[str, Any]:
             source_structure=source_structure,
             progress_callback=None,
         )
+        structure_short_org_before_postprocess = _structure_short_org_counts(final_entities)
         final_entities = _postprocess_final_entities(contextual_service, text, final_entities)
+        structure_short_org_after_postprocess = _structure_short_org_counts(final_entities)
         contextual_quality_metadata = contextual_service.get_last_quality_metadata()
         contextual_quality_passed = bool(contextual_quality_metadata.get("quality_gate_passed", True))
         contextual_quality_reason = str(contextual_quality_metadata.get("quality_gate_reason") or "").strip()
@@ -259,38 +434,29 @@ async def _run(payload: Dict[str, Any]) -> Dict[str, Any]:
             requires_manual_review = True
             quality_flags.append("contextual_quality_gate_failed")
 
-        final_gate_result = None
-        if settings.ENABLE_QWEN_REVIEW and review_available:
-            final_gate_input = _results_from_entity_dicts(final_entities)
-            final_quality_gate_snippets = recognizer._build_final_quality_gate_snippets(text, final_gate_input)
-            stage_counts["final_quality_gate_snippets_selected"] = len(final_quality_gate_snippets)
-            if final_quality_gate_snippets:
-                final_gate_result = await recognizer.review_service.review(
-                    text,
-                    final_quality_gate_snippets,
-                    existing_entities=final_gate_input,
-                    max_snippets=len(final_quality_gate_snippets),
-                )
-                stage_counts["final_quality_gate_review"] = len(final_gate_result.entities)
-                if final_gate_result.rejected_entities:
-                    before_final_gate_count = len(final_gate_input)
-                    final_gate_input = recognizer._apply_review_rejections(final_gate_input, final_gate_result.rejected_entities)
-                    rejected_final_gate_count = max(0, before_final_gate_count - len(final_gate_input))
-                    stage_counts["final_quality_gate_rejected"] = rejected_final_gate_count
-                    if rejected_final_gate_count:
-                        quality_flags.append("final_quality_gate_rejections_applied")
-                if final_gate_result.entities:
-                    final_gate_input = recognizer.merge_service.merge([*final_gate_input, *final_gate_result.entities])
-                    quality_flags.append("final_quality_gate_entities_added")
-                if final_gate_result.error:
-                    quality_flags.append(f"final_quality_gate_warning:{final_gate_result.error}")
-                requires_manual_review = requires_manual_review or final_gate_result.requires_manual_review
-                final_entities = [result.to_dict() for result in _validate_and_expand(text, final_gate_input)]
-                final_entities = _postprocess_final_entities(contextual_service, text, final_entities)
-
         if settings.REVIEW_UNLOAD_AFTER_TASK:
             recognizer.review_service.unload()
         stage_counts["final"] = len(final_entities)
+        stage_counts["structure_short_org_before_postprocess"] = int(
+            structure_short_org_before_postprocess.get("total") or 0
+        )
+        stage_counts["structure_short_org_ambiguous_before_postprocess"] = int(
+            structure_short_org_before_postprocess.get("ambiguous") or 0
+        )
+        stage_counts["structure_short_org_after_postprocess"] = int(
+            structure_short_org_after_postprocess.get("total") or 0
+        )
+        stage_counts["structure_short_org_ambiguous_after_postprocess"] = int(
+            structure_short_org_after_postprocess.get("ambiguous") or 0
+        )
+        removed_structure_short_org = max(
+            0,
+            int(structure_short_org_before_postprocess.get("total") or 0)
+            - int(structure_short_org_after_postprocess.get("total") or 0),
+        )
+        stage_counts["structure_short_org_removed_by_publication_filter"] = removed_structure_short_org
+        if removed_structure_short_org:
+            quality_flags.append("structure_short_org_publication_filter_applied")
 
         blocking_quality_flags = [
             item
@@ -298,50 +464,126 @@ async def _run(payload: Dict[str, Any]) -> Dict[str, Any]:
             if item.startswith(
                 (
                     "review_warning:",
-                    "quality_gate_warning:",
-                    "final_quality_gate_warning:",
-                    "arbitration_warning:",
                     "review_model_missing",
                     "quality_anomaly",
                 )
             )
         ]
+        ledger_decision_count = int(stage_counts.get("ledger_conflict_decisions") or 0)
+        ledger_snippet_count = int(stage_counts.get("ledger_conflict_snippets") or 0)
+        scheduled_ledger_count = int(stage_counts.get("review_scheduled_ledger_snippets") or 0)
+        ledger_completion = _ledger_adjudication_completion(
+            review_enabled=bool(settings.ENABLE_QWEN_REVIEW),
+            review_result=review_result,
+            ledger_decision_count=ledger_decision_count,
+            ledger_snippet_count=ledger_snippet_count,
+            scheduled_ledger_count=scheduled_ledger_count,
+            source_review_queue_count=int(
+                metadata.get("subject_ledger_review_queue_count")
+                or stage_counts.get("subject_ledger_review_queue")
+                or 0
+            ),
+            resolved_review_queue_count=int(
+                resolved_subject_ledger_summary.get("review_queue_count") or 0
+            ),
+        )
+        expected_ledger_decisions = int(ledger_completion["expected_decision_count"])
+        ledger_adjudication_incomplete = bool(ledger_completion["incomplete"])
+        if ledger_adjudication_incomplete:
+            requires_manual_review = True
+            quality_flags.append("ledger_conflict_adjudication_incomplete")
         metadata.update(
             {
-                "workflow_variant": (
-                    "local_high_quality_mid_review"
-                    if settings.is_local_high_quality_mode()
-                    else "lowmem_mid_review"
-                ),
+                "workflow_variant": "lowmem_mid_review",
                 "review_configured": bool(settings.ENABLE_QWEN_REVIEW),
                 "review_dispatched": bool(settings.ENABLE_QWEN_REVIEW and len(snippets) > 0),
-                "review_started": bool(review_result is not None),
-                "review_completed": True,
+                "review_started": bool(
+                    review_result and review_result.model_used
+                ),
+                "review_completed": bool(review_result and review_result.model_used and not ledger_adjudication_incomplete),
                 "recognition_profile": settings.get_high_quality_profile_key(),
                 "primary_model": "rule/uie/ner",
                 "review_model": (
                     review_result.model_name
                     if review_result and review_result.model_name
-                    else (settings.get_default_review_llm_model() or settings.MID_REVIEW_MODEL)
+                    else settings.get_default_review_llm_model()
                 ),
-                "review_backend": review_result.review_backend if review_result else None,
-                "review_model_configured": settings.get_default_review_llm_model() or settings.MID_REVIEW_MODEL,
-                "fast_review_model_configured": settings.FAST_REVIEW_MODEL,
+                "review_backend": (
+                    review_result.review_backend
+                    if review_result
+                    else None
+                ),
+                "active_review_stage": (
+                    "standard_review"
+                    if review_result and review_result.model_used
+                    else None
+                ),
+                "active_review_model": (
+                    review_result.model_name
+                    if review_result and review_result.model_name
+                    else None
+                ),
+                "active_review_backend": (
+                    review_result.review_backend
+                    if review_result
+                    else None
+                ),
+                "review_model_configured": settings.get_default_review_llm_model() or settings.REVIEW_MODEL,
                 "review_model_used": bool(review_result and review_result.model_used),
+                "contextual_refine_llm_used": False,
+                "contextual_refine_llm_skipped_reason": "rule_first_contextual_refine",
                 "review_model_fallback_used": bool(review_result and review_result.fallback_used),
                 "review_model_loaded": bool(recognizer.review_service.loaded),
                 "review_error": review_result.error if review_result else None,
                 "review_snippet_count": len(review_snippets),
                 "review_snippet_scheduled_count": len(snippets),
-                "arbitration_model": review_result.arbitration_model if review_result else None,
-                "arbitration_model_configured": settings.HEAVY_ARBITRATION_MODEL,
-                "arbitration_used": bool(review_result and review_result.arbitration_used),
-                "arbitration_snippet_count": int(review_result.arbitration_snippet_count) if review_result else 0,
-                "arbitration_error": review_result.arbitration_error if review_result else None,
                 "review_skipped_reason": review_skipped_reason,
-                "final_quality_gate_model_used": bool(final_gate_result and final_gate_result.model_used),
+                "review_quality_mode": "rule_first",
+                "high_risk_subject_unreviewed_count": 0,
+                "same_surface_multi_type_unresolved_count": 0,
+                "subject_multi_replacement_count": 0,
+                "replacement_reused_by_multi_subject_count": 0,
                 "qwen_trigger_reasons": review_trigger_reasons,
                 **qwen_contribution,
+                "ledger_conflict_adjudication_enabled": bool(
+                    review_result and review_metadata.get("ledger_conflict_adjudication_enabled")
+                ),
+                "ledger_conflict_decision_count": ledger_decision_count,
+                "ledger_conflict_snippet_count": ledger_snippet_count,
+                "ledger_conflict_expected_decision_count": expected_ledger_decisions,
+                "ledger_conflict_remaining_review_queue_count": int(
+                    ledger_completion["remaining_review_queue_count"]
+                ),
+                "ledger_conflict_decisions": list(
+                    review_metadata.get("ledger_conflict_decisions") or []
+                ) if review_result else [],
+                "review_scheduled_ledger_snippet_count": int(
+                    review_metadata.get("review_scheduled_ledger_snippet_count") or 0
+                ) if review_result else 0,
+                "review_scheduled_standard_snippet_count": int(
+                    review_metadata.get("review_scheduled_standard_snippet_count") or 0
+                ) if review_result else 0,
+                "review_deterministic_rejection_count": int(
+                    review_metadata.get("review_deterministic_rejection_count") or 0
+                ) if review_result else 0,
+                "review_deterministic_entity_decision_count": int(
+                    review_metadata.get("review_deterministic_entity_decision_count") or 0
+                ) if review_result else 0,
+                "review_deterministic_entity_count": int(
+                    review_metadata.get("review_deterministic_entity_count") or 0
+                ) if review_result else 0,
+                "review_entity_decision_rejection_count": int(
+                    review_metadata.get("review_entity_decision_rejection_count") or 0
+                ) if review_result else 0,
+                "review_entity_decision_entity_count": int(
+                    review_metadata.get("review_entity_decision_entity_count") or 0
+                ) if review_result else 0,
+                "ledger_conflict_adjudication_incomplete": ledger_adjudication_incomplete,
+                "resolved_subject_ledger_enabled": bool(resolved_subject_ledger_summary),
+                "resolved_subject_ledger_summary": resolved_subject_ledger_summary,
+                "resolved_subject_ledger_review_queue_count": int(
+                    resolved_subject_ledger_summary.get("review_queue_count") or 0
+                ),
                 "stage_counts": stage_counts,
                 "requires_manual_review": bool(requires_manual_review),
                 "quality_gate_passed": (
@@ -351,6 +593,7 @@ async def _run(payload: Dict[str, Any]) -> Dict[str, Any]:
                 ),
                 "quality_gate_reason": contextual_quality_reason or None,
                 "contextual_quality_gate": contextual_quality_metadata,
+                "short_org_publication_filter_version": SHORT_ORG_PUBLICATION_FILTER_VERSION,
                 "quality_flags": sorted(set(quality_flags)),
                 "review_model_installed": bool(review_available),
             }

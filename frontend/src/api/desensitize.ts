@@ -199,8 +199,7 @@ export const uploadAndAnalyze = (
   llmModel?: string,
   anonymizationStrategy?: string,
   desensitizeMode?: string,
-  pageSessionId?: string,
-  wpsDocxTemplate?: File | null
+  pageSessionId?: string
 ) => {
   const formData = new FormData()
   formData.append('file', file)
@@ -219,10 +218,6 @@ export const uploadAndAnalyze = (
   if (pageSessionId) {
     formData.append('page_session_id', pageSessionId)
   }
-  if (wpsDocxTemplate) {
-    formData.append('wps_docx_template', wpsDocxTemplate)
-  }
-
   return request.post<any, TaskStatus>('/desensitize/upload', formData, {
     headers: { 'Content-Type': 'multipart/form-data' }
   })

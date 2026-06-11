@@ -22,7 +22,7 @@ from pathlib import Path, PurePosixPath
 from time import perf_counter
 from typing import Any, Dict, List, Optional, Union
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
 from app.core.anonymization_strategy import (
@@ -37,10 +37,7 @@ from app.core.config import (
     settings,
 )
 from app.core.document_workflow import classify_document_workflow, resolve_large_document_page_count
-from app.core.llm_strategy import get_llm_strategy_profile
 from app.core.runtime_probe import (
-    detected_ollama_path,
-    download_hint,
     installer_hint,
     platform_label,
 )
@@ -73,6 +70,7 @@ from app.services.lowmem_model_assets import (
     model_installed,
     primary_models_ready,
 )
+from app.services.review_input_compactor import compact_review_worker_payload_entities
 
 logger = logging.getLogger(__name__)
 
@@ -88,11 +86,28 @@ batch_task_runners: Dict[str, asyncio.Task] = {}
 active_request_tasks: Dict[str, asyncio.Task] = {}
 page_sessions: Dict[str, Dict[str, Any]] = {}
 page_session_watchdogs: Dict[str, asyncio.Task] = {}
+
+
+def _query_bool_override(request: Request, name: str, current: bool) -> bool:
+    if name not in request.query_params:
+        return current
+    normalized = str(request.query_params.get(name) or "").strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return current
+
+
+def _query_str_override(request: Request, name: str, current: Optional[str]) -> Optional[str]:
+    if name not in request.query_params:
+        return current
+    value = str(request.query_params.get(name) or "").strip()
+    return value or None
 analysis_worker_python_cache: Optional[str] = None
 analysis_worker_semaphore = asyncio.Semaphore(1)
 process_worker_semaphore = asyncio.Semaphore(1)
 pdf_normalize_worker_semaphore = asyncio.Semaphore(1)
-local_pdf_frontline_worker_semaphore = asyncio.Semaphore(1)
 ANALYZE_FAILURE_DETAIL = "文件解析或识别失败，请检查文件内容后重试。"
 ANONYMIZE_FAILURE_DETAIL = "脱敏处理失败，请稍后重试或检查当前配置。"
 BATCH_FAILURE_DETAIL = "批量脱敏失败，请稍后重试或缩小文件夹范围。"
@@ -175,6 +190,30 @@ def _analysis_workflow_metadata(analysis_workflow: Optional[Dict[str, Any]]) -> 
             "triggered_by_page_count": bool(document_workflow.get("triggered_by_page_count")),
             "triggered_by_text_length": bool(document_workflow.get("triggered_by_text_length")),
         },
+    }
+
+
+def _large_document_parent_process_deferred_analysis_result(
+    analysis_workflow: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    metadata = _analysis_workflow_metadata(analysis_workflow)
+    metadata.update(
+        {
+            "large_document_mode": True,
+            "execution_mode": "large_document_parent_process_deferred",
+            "large_document_execution_mode": "defer_to_process_worker_grouped_default_line",
+            "analysis_stage_review_skipped": "large_document_parent_process",
+            "review_configured": False,
+            "review_dispatched": False,
+            "review_started": False,
+            "review_completed": False,
+            "_large_document_pre_routed": True,
+        }
+    )
+    return {
+        "entities": [],
+        "statistics": {},
+        "analysis_metadata": metadata,
     }
 
 
@@ -689,7 +728,8 @@ def _run_worker_process_blocking(
             text=True,
             start_new_session=(os.name == "posix"),
         )
-        deadline = time.time() + max(30, int(timeout_seconds or settings.ANALYSIS_WORKER_TIMEOUT))
+        timeout_value = int(timeout_seconds) if timeout_seconds is not None else int(settings.ANALYSIS_WORKER_TIMEOUT)
+        deadline = None if timeout_value <= 0 else time.time() + max(30, timeout_value)
         while process.poll() is None:
             if cancel_event is not None and cancel_event.is_set():
                 _terminate_worker_process_tree(process)
@@ -714,7 +754,7 @@ def _run_worker_process_blocking(
                             progress_callback(progress_payload)
                 except Exception:
                     logger.debug("Failed to read worker progress file: %s", progress_path, exc_info=True)
-            if time.time() > deadline:
+            if deadline is not None and time.time() > deadline:
                 _terminate_worker_process_tree(process)
                 stdout, stderr = process.communicate(timeout=5)
                 raise TimeoutError(
@@ -837,6 +877,18 @@ def _run_stage_isolated_analysis_worker_blocking(
 ) -> Dict[str, Any]:
     start_time = perf_counter()
     workflow_metadata = _analysis_workflow_metadata(analysis_workflow)
+    if str((analysis_workflow or {}).get("mode") or "").strip() == "large_document_pre_routed":
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "stage": "large_document_parent_process",
+                    "current": 0,
+                    "total": 1,
+                    "message": "已识别为大文件模式，跳过旧分析线，等待父流程裁切分组处理...",
+                }
+            )
+        return _large_document_parent_process_deferred_analysis_result(analysis_workflow)
+
     if progress_callback is not None:
         progress_callback(
             {
@@ -924,6 +976,19 @@ def _run_stage_isolated_analysis_worker_blocking(
             "analysis_metadata": metadata,
         }
 
+    review_compaction = compact_review_worker_payload_entities(
+        primary_entities=primary_entities,
+        review_entities=primary_review_entities,
+    )
+    compacted_primary_entities = review_compaction["entities"]
+    compacted_review_entities = review_compaction["review_entities"]
+    compacted_primary_metadata = dict(primary_metadata)
+    compacted_primary_metadata["review_input_compaction"] = dict(review_compaction.get("summary") or {})
+    compacted_stage_counts = dict(compacted_primary_metadata.get("stage_counts") or {})
+    compacted_stage_counts["review_input_primary_compacted"] = len(compacted_primary_entities)
+    compacted_stage_counts["review_input_surface_compacted"] = len(compacted_review_entities)
+    compacted_primary_metadata["stage_counts"] = compacted_stage_counts
+
     try:
         if progress_callback is not None:
             progress_callback(
@@ -938,10 +1003,10 @@ def _run_stage_isolated_analysis_worker_blocking(
             module_name="app.workers.qwen_review_worker",
             payload={
                 "text": text,
-                "entities": primary_entities,
-                "review_entities": primary_review_entities,
+                "entities": compacted_primary_entities,
+                "review_entities": compacted_review_entities,
                 "entities_filter": entities,
-                "analysis_metadata": primary_metadata,
+                "analysis_metadata": compacted_primary_metadata,
                 "source_metadata": source_metadata or {},
                 "source_structure": source_structure,
                 "desensitize_mode": settings.get_effective_desensitize_mode(),
@@ -954,51 +1019,11 @@ def _run_stage_isolated_analysis_worker_blocking(
                 "ENABLE_PRIMARY_NER": "False",
                 "ENABLE_SECONDARY_NER": "False",
             },
-            timeout_seconds=settings.REVIEW_WORKER_TIMEOUT,
+            timeout_seconds=0,
         )
     except Exception as exc:
-        logger.warning("Qwen review worker failed; returning primary recognition result", exc_info=True)
-        metadata = dict(primary_metadata)
-        quality_flags = list(metadata.get("quality_flags") or [])
-        quality_flags.append("review_worker_error")
-        metadata.update(
-            {
-                **workflow_metadata,
-                "analysis_worker_process": True,
-                "analysis_stage_isolation": True,
-                "review_configured": True,
-                "review_dispatched": True,
-                "review_started": False,
-                "review_completed": False,
-                "analysis_stage_review_skipped": "review_worker_error",
-                "primary_worker_pid": primary_worker.get("pid"),
-                "primary_worker_seconds": primary_worker.get("seconds"),
-                "primary_worker_peak_rss_mib": primary_worker.get("peak_rss_mib"),
-                "primary_worker_peak_footprint_mib": primary_worker.get("peak_footprint_mib"),
-                "review_worker_pid": None,
-                "review_worker_seconds": None,
-                "review_worker_peak_rss_mib": None,
-                "review_worker_peak_footprint_mib": None,
-                "analysis_worker_pid": primary_worker.get("pid"),
-                "analysis_worker_seconds": round(perf_counter() - start_time, 4),
-                "analysis_worker_peak_rss_mib": primary_worker.get("peak_rss_mib"),
-                "analysis_worker_peak_footprint_mib": primary_worker.get("peak_footprint_mib"),
-                "analysis_worker_memory_peak_mib": round(primary_memory_peak_mib, 1)
-                if primary_memory_peak_mib is not None
-                else None,
-                "analysis_worker_memory_peak_source": primary_memory_peak_source,
-                "analysis_worker_peak_strategy": "primary_only_after_review_worker_error",
-                "review_model_used": False,
-                "review_error": str(exc)[:1000],
-                "requires_manual_review": True,
-                "quality_flags": sorted(set(quality_flags)),
-            }
-        )
-        return {
-            "entities": primary_entities,
-            "statistics": primary_result.get("statistics") or {},
-            "analysis_metadata": metadata,
-        }
+        logger.error("Qwen final review worker failed; blocking export", exc_info=True)
+        raise RuntimeError(f"final_review_worker_failed:{exc}") from exc
 
     review_worker = dict(review_result.get("_worker_process") or {})
     primary_peak = primary_worker.get("peak_rss_mib")
@@ -1012,6 +1037,15 @@ def _run_stage_isolated_analysis_worker_blocking(
         if isinstance(value, (int, float))
     ]
     metadata = dict(review_result.get("analysis_metadata") or {})
+    review_worker_completed = bool(metadata.get("review_completed", metadata.get("review_model_used", False)))
+    review_worker_started = bool(metadata.get("review_started", metadata.get("review_model_used", False)))
+    review_worker_incomplete = bool(metadata.get("ledger_conflict_adjudication_incomplete"))
+    if review_worker_incomplete:
+        metadata["requires_manual_review"] = True
+        metadata["quality_gate_passed"] = False
+        quality_flags = list(metadata.get("quality_flags") or [])
+        quality_flags.append("ledger_conflict_adjudication_incomplete")
+        metadata["quality_flags"] = sorted(set(str(flag) for flag in quality_flags if str(flag).strip()))
     metadata.update(
         {
             **workflow_metadata,
@@ -1019,8 +1053,8 @@ def _run_stage_isolated_analysis_worker_blocking(
             "analysis_stage_isolation": True,
             "review_configured": True,
             "review_dispatched": True,
-            "review_started": True,
-            "review_completed": True,
+            "review_started": review_worker_started,
+            "review_completed": review_worker_completed and not review_worker_incomplete,
             "analysis_stage_review_skipped": None,
             "primary_worker_pid": primary_worker.get("pid"),
             "primary_worker_seconds": primary_worker.get("seconds"),
@@ -1066,6 +1100,18 @@ def _run_analysis_worker_blocking(
             source_metadata=source_metadata,
             source_structure=source_structure,
         )
+    if str((analysis_workflow or {}).get("mode") or "").strip() == "large_document_pre_routed":
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "stage": "large_document_parent_process",
+                    "current": 0,
+                    "total": 1,
+                    "message": "已识别为大文件模式，跳过旧分析线，等待父流程裁切分组处理...",
+                }
+            )
+        return _large_document_parent_process_deferred_analysis_result(analysis_workflow)
+
     if settings.is_high_quality_desensitize_mode() and bool(settings.ANALYSIS_STAGE_ISOLATION):
         return _run_stage_isolated_analysis_worker_blocking(
             text=text,
@@ -1111,6 +1157,17 @@ async def _analyze_entities(
         source_metadata=source_metadata,
         source_structure=source_structure,
     )
+    if str(analysis_workflow.get("mode") or "").strip() == "large_document_pre_routed":
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "stage": "large_document_parent_process",
+                    "current": 0,
+                    "total": 1,
+                    "message": "已识别为大文件模式，跳过旧分析线，等待父流程裁切分组处理...",
+                }
+            )
+        return _large_document_parent_process_deferred_analysis_result(analysis_workflow)
     if _should_use_analysis_worker(use_llm):
         if progress_callback is not None:
             if analysis_worker_semaphore.locked():
@@ -1202,6 +1259,37 @@ def _set_task_state(
     task_id = str(task.get("task_id") or "").strip()
     if task_id:
         _persist_task_state(task_id, task)
+
+
+def _analysis_completion_state(metadata: Dict[str, Any]) -> tuple[str, str]:
+    metadata = metadata if isinstance(metadata, dict) else {}
+    quality_gate_passed = bool(metadata.get("quality_gate_passed", True))
+    requires_manual_review = bool(metadata.get("requires_manual_review", False))
+    flags = [str(flag) for flag in (metadata.get("quality_flags") or []) if str(flag).strip()]
+    docx_blocking_metrics = (
+        "docx_unhandled_text_part_count",
+        "docx_unknown_text_part_count",
+        "docx_hidden_text_node_count",
+        "docx_field_instruction_node_count",
+        "docx_review_required_text_node_count",
+        "docx_entity_unrewritable_count",
+        "docx_entity_range_crosses_virtual_fragment_count",
+        "docx_entity_without_unit_count",
+        "docx_entity_missing_unit_count",
+        "docx_post_rewrite_residual_count",
+        "final_directory_missing_replacement_count",
+        "final_directory_subject_multi_replacement_count",
+        "final_directory_replacement_reused_by_multi_subject_count",
+    )
+    for metric in docx_blocking_metrics:
+        try:
+            if int(metadata.get(metric) or 0) > 0:
+                return "ready", "识别完成，请确认实体后生成脱敏文件。"
+        except Exception:
+            continue
+    if not quality_gate_passed or requires_manual_review or flags:
+        return "ready", "识别完成，请确认实体后生成脱敏文件。"
+    return "ready", "识别完成，请确认实体后生成脱敏文件。"
 
 
 def _task_status_response(task_id: str, task: Dict) -> TaskStatus:
@@ -1820,352 +1908,121 @@ def _purge_terminal_tasks(now: Optional[datetime] = None) -> None:
             _purge_batch_task(batch_id)
 
 
-def _ollama_catalog_tier(model_name: str) -> str:
-    if settings.is_heavy_arbitration_ollama_model(model_name):
-        return "heavy_arbitration"
-    if settings.is_high_quality_lowmem_mode() and settings.is_fast_primary_ollama_model(model_name):
-        return "fast_primary"
-    if settings.is_mid_review_ollama_model(model_name):
-        return "mid_review"
-    if settings.is_fast_primary_ollama_model(model_name):
-        return "fast_primary"
-    return "default"
-
-
-def _ollama_recommended_for(model_name: str) -> list[str]:
-    tier = _ollama_catalog_tier(model_name)
-    if tier == "heavy_arbitration":
-        return ["疑难冲突仲裁"]
-    if tier == "mid_review":
-        return ["PDF 文本主审查", "高风险片段审查"]
-    if tier == "fast_primary":
-        return ["快速首轮识别", "片段审查备用"]
-    return ["文档识别", "文档脱敏"]
-
-
 def _get_model_catalog() -> LLMModelListResponse:
-    if settings.is_high_quality_desensitize_mode():
-        assets = all_assets()
-        primary_models = []
-        if settings.ENABLE_PRIMARY_UIE:
-            primary_models.append(settings.PRIMARY_IE_MODEL)
-        if settings.ENABLE_PRIMARY_NER:
-            primary_models.append(settings.PRIMARY_NER_MODEL)
-        if settings.ENABLE_SECONDARY_NER:
-            primary_models.append(settings.SECONDARY_NER_MODEL)
-        if settings.is_high_quality_lowmem_mode():
-            review_models = list(
-                dict.fromkeys(
-                    [
-                        settings.REVIEW_MODEL,
-                        settings.REVIEW_MODEL_FALLBACK,
-                        *settings.get_lowmem_ollama_review_candidates(),
-                        settings.HEAVY_ARBITRATION_MODEL,
-                    ]
-                )
-            )
-        else:
-            review_models = list(
-                dict.fromkeys(
-                    [
-                        settings.MID_REVIEW_MODEL,
-                        settings.MID_REVIEW_FALLBACK_MODEL,
-                        settings.FAST_REVIEW_MODEL,
-                        settings.REVIEW_MODEL,
-                        settings.REVIEW_MODEL_FALLBACK,
-                        settings.HEAVY_ARBITRATION_MODEL,
-                    ]
-                )
-            )
-        ollama_available = False
-        installed_ollama_models: set[str] = set()
-        try:
-            from app.services.ollama_service import OllamaLLMService
-
-            ollama = OllamaLLMService(
-                base_url=settings.OLLAMA_BASE_URL,
-                model=settings.OLLAMA_MODEL,
-                timeout=settings.OLLAMA_TIMEOUT,
-                num_ctx=settings.OLLAMA_NUM_CTX,
-            )
-            ollama_available = bool(ollama.available)
-            installed_ollama_models = set(ollama.list_models()) if ollama_available else set()
-        except Exception:
-            ollama_available = False
-            installed_ollama_models = set()
-        if settings.is_high_quality_lowmem_mode():
-            ollama_model_options = list(
-                dict.fromkeys(
-                    [
-                        *settings.get_lowmem_ollama_review_candidates(
-                            available_models=sorted(installed_ollama_models)
-                        ),
-                        settings.HEAVY_ARBITRATION_MODEL,
-                    ]
-                )
-            )
-        else:
-            ollama_model_options = settings.get_ollama_model_options(
-                available_models=sorted(installed_ollama_models)
-            )
-        local_options = [
-            LLMModelOption(
-                name=asset.model_id,
-                installed=asset.installed,
-                is_default=False,
-                strategy_key=settings.get_high_quality_profile_key(),
-                strategy_label=settings.get_high_quality_profile_label(),
-                strategy_description="中文规则、外挂规则、UIE/NER 与片段审查模型组合的本地工作流。",
-                tier=asset.role,
-                supports_precision_review=asset.role in {"review", "review_fallback"},
-                supports_vision=False,
-                recommended_for=(
-                    ["本地小模型片段精审备用"]
-                    if asset.role in {"review", "review_fallback"}
-                    else ["中文主识别", "实体召回"]
-                ),
-                role=asset.role,
-                memory_tier=asset.memory_tier,
-                local_path=str(asset.path) if asset.path else None,
-            )
-            for asset in assets
-        ]
-        default_review_model = settings.get_default_review_llm_model(
-            available_models=sorted(installed_ollama_models)
-        ) or (
-            settings.REVIEW_MODEL
-            if settings.is_high_quality_lowmem_mode()
-            else settings.MID_REVIEW_MODEL
+    assets = all_assets()
+    primary_models = []
+    if settings.ENABLE_PRIMARY_UIE:
+        primary_models.append(settings.PRIMARY_IE_MODEL)
+    if settings.ENABLE_PRIMARY_NER:
+        primary_models.append(settings.PRIMARY_NER_MODEL)
+    if settings.ENABLE_SECONDARY_NER:
+        primary_models.append(settings.SECONDARY_NER_MODEL)
+    review_models = list(
+        dict.fromkeys(
+            [
+                settings.REVIEW_MODEL,
+                settings.REVIEW_MODEL_FALLBACK,
+            ]
         )
-        ollama_options = [
-            LLMModelOption(
-                name=model_name,
-                installed=model_name in installed_ollama_models,
-                is_default=model_name == default_review_model,
-                strategy_key=get_llm_strategy_profile(model_name).key,
-                strategy_label=get_llm_strategy_profile(model_name).label,
-                strategy_description=get_llm_strategy_profile(model_name).description,
-                tier=_ollama_catalog_tier(model_name),
-                supports_precision_review=_ollama_catalog_tier(model_name) in {"mid_review", "heavy_arbitration"},
-                supports_vision=False,
-                recommended_for=_ollama_recommended_for(model_name),
-                role=_ollama_catalog_tier(model_name),
-                memory_tier=_ollama_catalog_tier(model_name),
-            )
-            for model_name in ollama_model_options
-        ]
-        return LLMModelListResponse(
-            backend=settings.get_high_quality_profile_key(),
-            default_model=default_review_model,
-            service_available=True,
-            profile=settings.get_high_quality_profile_key(),
-            primary_models=primary_models,
-            review_models=review_models,
-            models=[*local_options, *ollama_options],
-        )
-
-    default_model = settings.get_default_llm_model()
-    default_strategy = get_llm_strategy_profile(default_model)
-    if settings.LLM_BACKEND.lower() != "ollama":
-        return LLMModelListResponse(
-            backend=settings.LLM_BACKEND,
-            default_model=default_model,
-            service_available=True,
-            models=[
-                LLMModelOption(
-                    name=default_model,
-                    installed=True,
-                    is_default=True,
-                    strategy_key=default_strategy.key,
-                    strategy_label=default_strategy.label,
-                    strategy_description=default_strategy.description,
-                    tier="default",
-                    supports_precision_review=False,
-                    supports_vision=False,
-                    recommended_for=["文档识别", "文档脱敏"],
-                )
-            ],
-        )
-
-    from app.services.ollama_service import OllamaLLMService
-
-    ollama = OllamaLLMService(
-        base_url=settings.OLLAMA_BASE_URL,
-        model=settings.OLLAMA_MODEL,
-        timeout=settings.OLLAMA_TIMEOUT,
-        num_ctx=settings.OLLAMA_NUM_CTX,
     )
-    installed_models = set(ollama.list_models()) if ollama.available else set()
-    model_options = settings.get_ollama_model_options(available_models=sorted(installed_models))
+    local_options = [
+        LLMModelOption(
+            name=asset.model_id,
+            installed=asset.installed,
+            is_default=False,
+            strategy_key=settings.get_high_quality_profile_key(),
+            strategy_label=settings.get_high_quality_profile_label(),
+            strategy_description="中文规则、外挂规则、UIE/NER 与片段审查模型组合的本地工作流。",
+            tier=asset.role,
+            supports_precision_review=asset.role in {"review", "review_fallback"},
+            supports_vision=False,
+            recommended_for=(
+                ["本地小模型片段精审备用"]
+                if asset.role in {"review", "review_fallback"}
+                else ["中文主识别", "实体召回"]
+            ),
+            role=asset.role,
+            memory_tier=asset.memory_tier,
+            local_path=str(asset.path) if asset.path else None,
+        )
+        for asset in assets
+    ]
+    installed_local_models = [asset.model_id for asset in assets if asset.installed]
+    default_review_model = (
+        settings.get_default_review_llm_model(available_models=installed_local_models)
+        or settings.REVIEW_MODEL
+    )
     return LLMModelListResponse(
-        backend=settings.LLM_BACKEND,
-        default_model=default_model,
-        service_available=ollama.available,
-        models=[
-            LLMModelOption(
-                name=model_name,
-                    installed=model_name in installed_models,
-                    is_default=model_name == default_model,
-                    strategy_key=get_llm_strategy_profile(model_name).key,
-                    strategy_label=get_llm_strategy_profile(model_name).label,
-                    strategy_description=get_llm_strategy_profile(model_name).description,
-                    tier=_ollama_catalog_tier(model_name),
-                    supports_precision_review=_ollama_catalog_tier(model_name) in {"mid_review", "heavy_arbitration"},
-                    supports_vision=False,
-                    recommended_for=_ollama_recommended_for(model_name),
-                )
-            for model_name in model_options
-        ],
+        backend=settings.get_high_quality_profile_key(),
+        default_model=default_review_model,
+        service_available=True,
+        profile=settings.get_high_quality_profile_key(),
+        primary_models=primary_models,
+        review_models=review_models,
+        models=local_options,
     )
 
 
 def _get_runtime_status() -> RuntimeStatusResponse:
-    default_model = settings.get_default_llm_model()
     current_platform = platform_label()
-    current_backend = settings.LLM_BACKEND.lower()
-
-    if settings.is_high_quality_desensitize_mode():
-        catalog = _get_model_catalog()
-        primary_ready = primary_models_ready()
-        available_processing_models = [item.name for item in catalog.models if item.installed]
-        review_candidates = settings.get_route_review_model_candidates(
-            available_models=available_processing_models
-        )
-        preferred_review_model = next(
-            (model_name for model_name in review_candidates if model_name in available_processing_models),
-            None,
-        )
-        review_ready = bool(preferred_review_model)
-        required_model = settings.REVIEW_MODEL if settings.is_high_quality_lowmem_mode() else settings.MID_REVIEW_MODEL
-        default_review_model = settings.get_default_review_llm_model(
-            available_models=available_processing_models
-        ) or required_model
-        required_review_installed = required_model in available_processing_models
-        ready = primary_ready
-        if settings.is_high_quality_lowmem_mode() and primary_ready and review_ready:
-            recommended_action = (
-                f"高质量低内存工作流已就绪：主识别后会用 {preferred_review_model} "
-                "进行高风险片段审查；9B 高质量路线保持独立，不会被低内存路线默认调用。"
-            )
-        elif settings.is_high_quality_lowmem_mode() and primary_ready:
-            recommended_action = "中文主识别模型已就绪，但未检测到低内存片段审查模型；系统会继续识别并标记人工复核。"
-        elif primary_ready and required_review_installed:
-            recommended_action = (
-                f"三层脱敏工作流已就绪：主识别后会用 {settings.MID_REVIEW_MODEL} "
-                "thinking 模式进行 PDF/高风险片段主审查，27B 仅在质量闸失败时仲裁。"
-            )
-        elif primary_ready and review_ready:
-            recommended_action = (
-                f"中文主识别模型已就绪，将使用 {preferred_review_model} 作为片段审查回退；"
-                f"推荐后续安装 {required_model}。"
-            )
-        elif primary_ready:
-            recommended_action = "中文主识别模型已就绪，但未检测到 9B/14B/8B/4B 片段审查模型；系统会继续识别并标记人工复核。"
-        else:
-            recommended_action = f"请先下载中文 UIE/NER 主识别模型，再开始{settings.get_high_quality_profile_label()}。"
-        return RuntimeStatusResponse(
-            backend=settings.get_high_quality_profile_key(),
-            platform=current_platform,
-            ready=ready,
-            ollama_install_detected=bool(detected_ollama_path()),
-            ollama_path=detected_ollama_path(),
-            service_available=True,
-            required_model=required_model,
-            required_model_installed=required_review_installed,
-            available_processing_models=available_processing_models,
-            preferred_processing_model=preferred_review_model,
-            default_model=default_review_model,
-            installer_hint=installer_hint(),
-            download_hint=(
-                f"主识别模型目录：{settings.LOWMEM_MODEL_ROOT}；低内存片段审查模型："
-                f"{settings.REVIEW_MODEL} / {settings.REVIEW_MODEL_FALLBACK}"
-                if settings.is_high_quality_lowmem_mode()
-                else f"主识别模型目录：{settings.LOWMEM_MODEL_ROOT}；Ollama 推荐中审模型：{settings.MID_REVIEW_MODEL}"
-            ),
-            recommended_action=recommended_action,
-            desensitize_mode=settings.get_effective_desensitize_mode(),
-            primary_models_ready=primary_ready,
-            review_model_installed=review_ready,
-            review_model_loaded=False,
-            estimated_memory_tier=settings.get_high_quality_memory_tier(),
-            analysis_worker_process=bool(settings.ANALYSIS_WORKER_PROCESS),
-            analysis_stage_isolation=bool(settings.ANALYSIS_STAGE_ISOLATION),
-            analysis_worker_timeout=int(settings.ANALYSIS_WORKER_TIMEOUT),
-        )
-
-    if current_backend != "ollama":
-        return RuntimeStatusResponse(
-            backend=settings.LLM_BACKEND,
-            platform=current_platform,
-            ready=True,
-            ollama_install_detected=False,
-            ollama_path=None,
-            service_available=True,
-            required_model=default_model,
-            required_model_installed=True,
-            available_processing_models=[default_model] if default_model else [],
-            preferred_processing_model=default_model,
-            default_model=default_model,
-            installer_hint=installer_hint(),
-            download_hint=download_hint(default_model),
-            recommended_action="当前运行环境已就绪，可直接开始处理文档。",
-            desensitize_mode=settings.get_effective_desensitize_mode(),
-        )
-
     catalog = _get_model_catalog()
-    ollama_path = detected_ollama_path()
-    install_detected = bool(ollama_path)
-    selected_model = next((item for item in catalog.models if item.name == default_model), None)
-    required_model_installed = bool(selected_model and selected_model.installed)
     available_processing_models = [item.name for item in catalog.models if item.installed]
-    preferred_processing_model = default_model if required_model_installed else (
-        available_processing_models[0] if available_processing_models else None
+    review_candidates = settings.get_route_review_model_candidates(
+        available_models=available_processing_models
     )
-    ready = catalog.service_available and bool(available_processing_models)
-
-    if ready and required_model_installed:
-        recommended_action = "运行环境已就绪，可直接开始高质量 4B 脱敏处理。"
-    elif ready and preferred_processing_model:
+    preferred_review_model = next(
+        (model_name for model_name in review_candidates if model_name in available_processing_models),
+        None,
+    )
+    review_ready = bool(preferred_review_model)
+    required_model = settings.REVIEW_MODEL
+    default_review_model = settings.get_default_review_llm_model(
+        available_models=available_processing_models
+    ) or required_model
+    required_review_installed = required_model in available_processing_models
+    primary_ready = primary_models_ready()
+    ready = primary_ready
+    if primary_ready and review_ready:
         recommended_action = (
-            f"已检测到可用处理模型 {preferred_processing_model}，当前可直接进入正式处理。"
+            f"高质量低内存工作流已就绪：主识别后会用 {preferred_review_model} "
+            "进行高风险片段审查；最终质量以规则层硬闸和小模型兜底为主。"
         )
-    elif not install_detected:
-        recommended_action = "请先安装 Ollama，再回到客户端完成模型检查。"
-    elif not catalog.service_available:
-        recommended_action = "已检测到 Ollama，但服务暂不可用。请先打开 Ollama，然后点击重新检测。"
-    elif not available_processing_models:
-        recommended_action = (
-            f"请先下载可用模型。推荐安装 {default_model}，也支持已安装的 qwen3.5:27b 系列模型。"
-        )
+    elif primary_ready:
+        recommended_action = "中文主识别模型已就绪，但未检测到低内存片段审查模型；系统会继续识别并标记人工复核。"
     else:
-        recommended_action = "请先完成运行环境检查，确认 Ollama 和固定模型都已就绪。"
+        recommended_action = f"请先下载中文 UIE/NER 主识别模型，再开始{settings.get_high_quality_profile_label()}。"
 
     return RuntimeStatusResponse(
-        backend=settings.LLM_BACKEND,
+        backend=settings.get_high_quality_profile_key(),
         platform=current_platform,
         ready=ready,
-        ollama_install_detected=install_detected,
-        ollama_path=ollama_path,
-        service_available=catalog.service_available,
-        required_model=default_model,
-        required_model_installed=required_model_installed,
+        ollama_install_detected=False,
+        ollama_path=None,
+        service_available=True,
+        required_model=required_model,
+        required_model_installed=required_review_installed,
         available_processing_models=available_processing_models,
-        preferred_processing_model=preferred_processing_model,
-        default_model=default_model,
+        preferred_processing_model=preferred_review_model,
+        default_model=default_review_model,
         installer_hint=installer_hint(),
-        download_hint=download_hint(default_model),
+        download_hint=(
+            f"主识别模型目录：{settings.LOWMEM_MODEL_ROOT}；低内存片段审查模型："
+            f"{settings.REVIEW_MODEL} / {settings.REVIEW_MODEL_FALLBACK}"
+        ),
         recommended_action=recommended_action,
         desensitize_mode=settings.get_effective_desensitize_mode(),
+        primary_models_ready=primary_ready,
+        review_model_installed=review_ready,
+        review_model_loaded=False,
+        estimated_memory_tier=settings.get_high_quality_memory_tier(),
+        analysis_worker_process=bool(settings.ANALYSIS_WORKER_PROCESS),
+        analysis_stage_isolation=bool(settings.ANALYSIS_STAGE_ISOLATION),
+        analysis_worker_timeout=int(settings.ANALYSIS_WORKER_TIMEOUT),
     )
 
 
 def _get_strategy_payload(llm_model: Optional[str]) -> tuple[Optional[str], Optional[str]]:
-    if settings.is_high_quality_desensitize_mode():
-        return settings.get_high_quality_profile_key(), settings.get_high_quality_profile_label()
-    if not llm_model:
-        return None, None
-    strategy = get_llm_strategy_profile(llm_model)
-    return strategy.key, strategy.label
+    return settings.get_high_quality_profile_key(), settings.get_high_quality_profile_label()
 
 
 def _get_anonymization_strategy_payload(
@@ -2176,97 +2033,23 @@ def _get_anonymization_strategy_payload(
 
 
 def _get_llm_analysis_metadata(engine, llm_model: Optional[str]) -> Dict[str, object]:
-    if settings.is_high_quality_desensitize_mode():
-        recognizer = engine.recognizer_registry.get_recognizer("high_quality_lowmem")
-        if recognizer is None or not hasattr(recognizer, "get_last_run_metadata"):
-            return {}
-        try:
-            return dict(recognizer.get_last_run_metadata(llm_model))
-        except Exception:
-            return {}
-
-    if not llm_model:
-        return {}
-
-    recognizer = engine.recognizer_registry.get_recognizer("llm")
+    recognizer = engine.recognizer_registry.get_recognizer("high_quality_lowmem")
     if recognizer is None or not hasattr(recognizer, "get_last_run_metadata"):
         return {}
-
     try:
-        metadata = recognizer.get_last_run_metadata(llm_model)
+        return dict(recognizer.get_last_run_metadata(llm_model))
     except Exception:
         return {}
 
-    document_type = str(metadata.get("document_type", "")).strip()
-    if not document_type:
-        return {}
-
-    payload: Dict[str, object] = {
-        "llm_document_type": document_type,
-        "llm_document_type_label": metadata.get("document_type_label") or document_type,
-        "analysis_tier": "precision_review"
-        if get_llm_strategy_profile(llm_model).key == "review_27b"
-        else "precision_4b",
-    }
-    if metadata.get("document_type_reason"):
-        payload["llm_document_type_reason"] = metadata["document_type_reason"]
-    if metadata.get("document_type_confidence"):
-        payload["llm_document_type_confidence"] = metadata["document_type_confidence"]
-    if metadata.get("document_type_source"):
-        payload["llm_document_type_source"] = metadata["document_type_source"]
-    if metadata.get("engine_strategy"):
-        payload["engine_strategy"] = metadata["engine_strategy"]
-    if metadata.get("focus_plan"):
-        payload["llm_focus_plan"] = metadata["focus_plan"]
-    if metadata.get("recall_passes"):
-        payload["recall_passes"] = metadata["recall_passes"]
-        payload["llm_recall_passes"] = metadata["recall_passes"]
-    if metadata.get("specialized_passes"):
-        payload["llm_specialized_passes"] = metadata["specialized_passes"]
-    if metadata.get("high_risk_blocks"):
-        payload["high_risk_blocks"] = metadata["high_risk_blocks"]
-    if metadata.get("definition_hints"):
-        payload["definition_hints"] = metadata["definition_hints"]
-    return payload
-
 
 def _resolve_requested_llm_model(llm_model: Optional[str]) -> str:
-    if settings.is_high_quality_desensitize_mode():
-        default_review_model = settings.get_default_review_llm_model()
-        fallback = settings.REVIEW_MODEL if settings.is_high_quality_lowmem_mode() else settings.MID_REVIEW_MODEL
-        return (llm_model or default_review_model or fallback).strip() or fallback
-    requested_model = (llm_model or settings.get_default_llm_model()).strip()
-    if settings.LLM_BACKEND.lower() != "ollama":
-        return requested_model or settings.LLM_MODEL_NAME
-
-    return requested_model or settings.get_default_llm_model()
+    default_review_model = settings.get_default_review_llm_model()
+    fallback = settings.REVIEW_MODEL
+    return (llm_model or default_review_model or fallback).strip() or fallback
 
 
 def _ensure_model_ready(llm_model: Optional[str]) -> str:
-    model_name = _resolve_requested_llm_model(llm_model)
-    if settings.is_high_quality_desensitize_mode():
-        return model_name
-    if settings.LLM_BACKEND.lower() != "ollama":
-        return model_name
-
-    catalog = _get_model_catalog()
-    if not catalog.service_available:
-        return model_name
-
-    selected = next((item for item in catalog.models if item.name == model_name), None)
-    if selected is not None and not selected.installed:
-        raise HTTPException(
-            status_code=400,
-            detail=f"模型 {model_name} 尚未下载，请先执行 ollama pull {model_name}",
-        )
-    return model_name
-
-
-def _select_installed_review_model(catalog: LLMModelListResponse) -> Optional[str]:
-    for item in catalog.models:
-        if item.installed and item.supports_precision_review:
-            return item.name
-    return None
+    return _resolve_requested_llm_model(llm_model)
 
 
 def _resolve_document_parse_models(
@@ -2282,20 +2065,6 @@ def _resolve_document_parse_models(
     }
     if not use_llm or Path(file_path).suffix.lower() != ".pdf":
         return parse_models
-    if settings.is_high_quality_desensitize_mode():
-        return parse_models
-    if settings.LLM_BACKEND.lower() != "ollama":
-        return parse_models
-    if settings.is_review_capable_ollama_model(requested_model):
-        return parse_models
-
-    catalog = _get_model_catalog()
-    if not catalog.service_available:
-        return parse_models
-
-    review_model = _select_installed_review_model(catalog)
-    if review_model and review_model != requested_model:
-        parse_models["ocr_llm_model"] = review_model
     return parse_models
 
 
@@ -2358,14 +2127,6 @@ def _should_normalize_pdf_for_lowmem(file_path: str) -> bool:
     )
 
 
-def _should_normalize_pdf_for_local_high_quality(file_path: str) -> bool:
-    return bool(
-        settings.is_local_high_quality_mode()
-        and bool(settings.LOCAL_PDF_FRONTLINE_ENABLED)
-        and Path(file_path).suffix.lower() == ".pdf"
-    )
-
-
 def _pdf_normalization_output_dir() -> str:
     output_dir = Path(settings.RUNTIME_ROOT) / "pdf_normalized"
     ensure_private_directory(output_dir)
@@ -2411,102 +2172,6 @@ def _run_pdf_normalization_worker_blocking(file_path: str) -> Dict[str, Any]:
     return normalized
 
 
-def _run_local_pdf_frontline_worker_blocking(file_path: str, progress_callback=None) -> Dict[str, Any]:
-    source_path = str(Path(file_path).expanduser().resolve())
-    result = _run_worker_process_blocking(
-        module_name="app.workers.local_high_quality_pdf_normalize_worker",
-        payload={
-            "file_path": source_path,
-            "output_dir": _pdf_normalization_output_dir(),
-        },
-        input_prefix="local-pdf-frontline-in-",
-        output_prefix="local-pdf-frontline-out-",
-        timeout_seconds=int(settings.LOCAL_PDF_FRONTLINE_WORKER_TIMEOUT),
-        progress_callback=progress_callback,
-        env_overrides={
-            "OMP_NUM_THREADS": "1",
-            "OPENBLAS_NUM_THREADS": "1",
-            "MKL_NUM_THREADS": "1",
-            "VECLIB_MAXIMUM_THREADS": "1",
-            "TOKENIZERS_PARALLELISM": "false",
-        },
-    )
-    normalized = dict(result.get("normalized") or {})
-    metadata = dict(normalized.get("metadata") or {})
-    worker = dict(result.get("_worker_process") or {})
-    worker_memory_peak_mib, worker_memory_peak_source = _peak_memory_mib_from_worker(worker)
-    metadata.update(
-        {
-            "frontline_worker_process": True,
-            "frontline_worker_pid": worker.get("pid"),
-            "frontline_worker_seconds": worker.get("seconds"),
-            "frontline_worker_peak_rss_mib": worker.get("peak_rss_mib"),
-            "frontline_worker_peak_footprint_mib": worker.get("peak_footprint_mib"),
-            "frontline_worker_peak_mib": round(worker_memory_peak_mib, 1)
-            if worker_memory_peak_mib is not None
-            else None,
-            "frontline_worker_peak_source": worker_memory_peak_source,
-        }
-    )
-    normalized["metadata"] = metadata
-    return normalized
-
-
-def _pdf_word_audit_output_dir() -> str:
-    output_dir = Path(settings.RUNTIME_ROOT) / "pdf_word_audit"
-    ensure_private_directory(output_dir)
-    return str(output_dir)
-
-
-def _run_pdf_word_audit_frontline_worker_blocking(
-    file_path: str,
-    wps_docx_template_path: str,
-    progress_callback=None,
-) -> Dict[str, Any]:
-    source_path = str(Path(file_path).expanduser().resolve())
-    template_path = str(Path(wps_docx_template_path).expanduser().resolve())
-    audit_threads = max(1, int(getattr(settings, "PDF_WORD_AUDIT_V4_WORKER_THREADS", 1) or 1))
-    result = _run_worker_process_blocking(
-        module_name="app.workers.pdf_word_audit_worker",
-        payload={
-            "audit_id": uuid.uuid4().hex,
-            "pdf_path": source_path,
-            "wps_docx_path": template_path,
-            "output_dir": _pdf_word_audit_output_dir(),
-        },
-        input_prefix="pdf-word-audit-frontline-in-",
-        output_prefix="pdf-word-audit-frontline-out-",
-        timeout_seconds=max(int(settings.LOCAL_PDF_FRONTLINE_WORKER_TIMEOUT or 0), 7200),
-        progress_callback=progress_callback,
-        env_overrides={
-            "OMP_NUM_THREADS": str(audit_threads),
-            "OPENBLAS_NUM_THREADS": str(audit_threads),
-            "MKL_NUM_THREADS": str(audit_threads),
-            "VECLIB_MAXIMUM_THREADS": str(audit_threads),
-            "TOKENIZERS_PARALLELISM": "false",
-        },
-    )
-    audit = dict(result.get("audit") or {})
-    metadata = dict(audit.get("metadata") or {})
-    worker = dict(result.get("_worker_process") or {})
-    worker_memory_peak_mib, worker_memory_peak_source = _peak_memory_mib_from_worker(worker)
-    metadata.update(
-        {
-            "pdf_word_audit_worker_process": True,
-            "pdf_word_audit_worker_pid": worker.get("pid"),
-            "pdf_word_audit_worker_seconds": worker.get("seconds"),
-            "pdf_word_audit_worker_peak_rss_mib": worker.get("peak_rss_mib"),
-            "pdf_word_audit_worker_peak_footprint_mib": worker.get("peak_footprint_mib"),
-            "pdf_word_audit_worker_peak_mib": round(worker_memory_peak_mib, 1)
-            if worker_memory_peak_mib is not None
-            else None,
-            "pdf_word_audit_worker_peak_source": worker_memory_peak_source,
-        }
-    )
-    audit["metadata"] = metadata
-    return audit
-
-
 async def _normalize_pdf_for_parsing(file_path: str) -> Dict[str, Any]:
     async with pdf_normalize_worker_semaphore:
         return await asyncio.to_thread(_run_pdf_normalization_worker_blocking, file_path)
@@ -2521,19 +2186,6 @@ def _callable_accepts_keyword(func: object, keyword: str) -> bool:
         parameter.kind == inspect.Parameter.VAR_KEYWORD
         for parameter in signature.parameters.values()
     )
-
-
-async def _normalize_local_pdf_for_parsing(file_path: str, progress_callback=None) -> Dict[str, Any]:
-    def _run_worker() -> Dict[str, Any]:
-        if progress_callback is None or not _callable_accepts_keyword(
-            _run_local_pdf_frontline_worker_blocking,
-            "progress_callback",
-        ):
-            return _run_local_pdf_frontline_worker_blocking(file_path)
-        return _run_local_pdf_frontline_worker_blocking(file_path, progress_callback=progress_callback)
-
-    async with local_pdf_frontline_worker_semaphore:
-        return await asyncio.to_thread(_run_worker)
 
 
 async def _parse_normalized_pdf_document(
@@ -2578,105 +2230,6 @@ async def _parse_normalized_pdf_document(
     return doc_result
 
 
-async def _parse_local_pdf_frontline_document(
-    file_path: str,
-    *,
-    use_llm: bool,
-    llm_model: Optional[str],
-    progress_callback=None,
-) -> Dict:
-    normalized = await _normalize_local_pdf_for_parsing(file_path, progress_callback=progress_callback)
-    normalized_path = str(normalized.get("normalized_file_path") or "").strip()
-    if not normalized_path:
-        raise RuntimeError("local_pdf_frontline_missing_output_path")
-    if not Path(normalized_path).exists():
-        raise RuntimeError(f"local_pdf_frontline_output_not_found:{normalized_path}")
-
-    docx_result = await document_parser.parse(
-        normalized_path,
-        use_llm=False,
-        llm_model=None,
-        ocr_llm_model=None,
-    )
-    normalized_metadata = dict(normalized.get("metadata") or {})
-    metadata = {
-        **(docx_result.get("metadata") or {}),
-        **normalized_metadata,
-        "original_pdf_file_path": file_path,
-        "normalized_file_path": normalized_path,
-    }
-    structure = normalized.get("structure") or docx_result.get("structure")
-    doc_result = {
-        "text": str(docx_result.get("text") or ""),
-        "metadata": metadata,
-        "structure": structure,
-        "normalized_file_path": normalized_path,
-    }
-    if not doc_result["text"] and isinstance(structure, dict):
-        doc_result["text"] = "\n\n".join(
-            str(page.get("text") or "")
-            for page in structure.get("pages", [])
-            if isinstance(page, dict) and str(page.get("text") or "").strip()
-        )
-    return doc_result
-
-
-async def _parse_pdf_word_audit_frontline_document(
-    file_path: str,
-    *,
-    wps_docx_template_path: str,
-    use_llm: bool,
-    llm_model: Optional[str],
-    progress_callback=None,
-) -> Dict:
-    del use_llm, llm_model
-
-    def _run_worker() -> Dict[str, Any]:
-        return _run_pdf_word_audit_frontline_worker_blocking(
-            file_path,
-            wps_docx_template_path,
-            progress_callback=progress_callback,
-        )
-
-    async with local_pdf_frontline_worker_semaphore:
-        audit = await asyncio.to_thread(_run_worker)
-
-    audited_path = str(audit.get("audited_docx_path") or "").strip()
-    if not audited_path:
-        raise RuntimeError("pdf_word_audit_missing_output_path")
-    if not Path(audited_path).exists():
-        raise RuntimeError(f"pdf_word_audit_output_not_found:{audited_path}")
-
-    docx_result = await document_parser.parse(
-        audited_path,
-        use_llm=False,
-        llm_model=None,
-        ocr_llm_model=None,
-    )
-    audit_metadata = dict(audit.get("metadata") or {})
-    metadata = {
-        **(docx_result.get("metadata") or {}),
-        **audit_metadata,
-        "source_format": "pdf",
-        "normalized_format": "docx",
-        "original_pdf_file_path": file_path,
-        "normalized_file_path": audited_path,
-        "pdf_frontline_profile": audit_metadata.get("profile") or "pdf_word_audit_v4_conversion_fidelity",
-        "wps_template_docx_path": wps_docx_template_path,
-        "pdf_word_audit_id": audit.get("audit_id"),
-        "pdf_word_audit_auto_corrected": audit_metadata.get("auto_corrected"),
-        "pdf_word_audit_manual_review": audit_metadata.get("manual_review"),
-        "pdf_word_audit_comment_count": audit_metadata.get("comment_count"),
-        "pdf_word_audit_report_path": audit_metadata.get("audit_report_path"),
-    }
-    return {
-        "text": str(docx_result.get("text") or ""),
-        "metadata": metadata,
-        "structure": docx_result.get("structure"),
-        "normalized_file_path": audited_path,
-    }
-
-
 def _task_normalized_file_path(container: Dict[str, Any]) -> Optional[str]:
     direct = str(container.get("normalized_file_path") or "").strip()
     if direct:
@@ -2697,14 +2250,8 @@ def _analysis_failure_detail(exc: Exception, default: str) -> str:
     error_text = str(exc)
     if "ocr_model_missing" in error_text:
         return "PDF OCR 模型缺失，请先下载 RapidOCR PP-OCRv5 mobile det/rec 模型后重试。"
-    if "glm_ocr_model_missing" in error_text:
-        return "GLM-OCR 模型缺失或 Ollama 不可用，请确认本机已安装 glm-ocr:latest 后重试。"
     if "ocr_quality_gate_failed" in error_text:
         return "PDF OCR 质量门禁未通过，存在识别失败或低质量页面，请检查原 PDF 清晰度和本机 OCR/VL 组件配置后重试。"
-    if "pdf_word_audit_wps_template_required" in error_text:
-        return "本机高质量 PDF 线路现在必须上传 WPS 转换后的 DOCX 作为底稿；系统只做 OCR 核查、修正和批注，不再自建 DOCX 版式。"
-    if "local_pdf_frontline" in error_text or "local_high_quality_pdf_normalize_worker" in error_text:
-        return "本机高质量 PDF 前置识别或 DOCX 恢复失败，请检查 PDF 内容、GLM-OCR 和版面恢复组件配置后重试。"
     if "pdf_normalization" in error_text or "pdf-normalize" in error_text:
         return "PDF 前置识别或 DOCX 规范化失败，请检查 PDF 内容或 OCR 组件配置后重试。"
     return default
@@ -2725,35 +2272,13 @@ async def _parse_document(
     use_llm: bool,
     llm_model: Optional[str],
     progress_callback=None,
-    wps_docx_template_path: Optional[str] = None,
 ) -> Dict:
     parse_models = _resolve_document_parse_models(
         file_path,
         use_llm=use_llm,
         llm_model=llm_model,
     )
-    if (
-        wps_docx_template_path
-        and settings.is_local_high_quality_mode()
-        and Path(file_path).suffix.lower() == ".pdf"
-    ):
-        doc_result = await _parse_pdf_word_audit_frontline_document(
-            file_path,
-            wps_docx_template_path=wps_docx_template_path,
-            use_llm=use_llm,
-            llm_model=llm_model,
-            progress_callback=progress_callback,
-        )
-    elif settings.is_local_high_quality_mode() and Path(file_path).suffix.lower() == ".pdf":
-        raise RuntimeError("pdf_word_audit_wps_template_required")
-    elif _should_normalize_pdf_for_local_high_quality(file_path):
-        doc_result = await _parse_local_pdf_frontline_document(
-            file_path,
-            use_llm=use_llm,
-            llm_model=llm_model,
-            progress_callback=progress_callback,
-        )
-    elif _should_normalize_pdf_for_lowmem(file_path):
+    if _should_normalize_pdf_for_lowmem(file_path):
         doc_result = await _parse_normalized_pdf_document(
             file_path,
             use_llm=use_llm,
@@ -2779,7 +2304,6 @@ async def _parse_document_with_optional_progress(
     use_llm: bool,
     llm_model: Optional[str],
     progress_callback=None,
-    wps_docx_template_path: Optional[str] = None,
 ) -> Dict:
     kwargs: Dict[str, Any] = {
         "use_llm": use_llm,
@@ -2787,8 +2311,6 @@ async def _parse_document_with_optional_progress(
     }
     if progress_callback is not None and _callable_accepts_keyword(_parse_document, "progress_callback"):
         kwargs["progress_callback"] = progress_callback
-    if wps_docx_template_path and _callable_accepts_keyword(_parse_document, "wps_docx_template_path"):
-        kwargs["wps_docx_template_path"] = wps_docx_template_path
     return await _parse_document(file_path, **kwargs)
 
 
@@ -3079,10 +2601,28 @@ async def _run_process_worker_async(
             payload=worker_payload,
             input_prefix="process-worker-in-",
             output_prefix="process-worker-out-",
-            timeout_seconds=int(settings.PROCESS_WORKER_TIMEOUT),
+            timeout_seconds=_process_worker_timeout_seconds(worker_payload),
             progress_callback=progress_callback,
             cancel_event=cancel_event,
         )
+
+
+def _is_large_document_parent_process_payload(worker_payload: Dict[str, Any]) -> bool:
+    source_metadata = worker_payload.get("source_metadata")
+    if not isinstance(source_metadata, dict):
+        return False
+    return (
+        source_metadata.get("_large_document_pre_routed") is True
+        or str(source_metadata.get("analysis_workflow_mode") or "").strip() == "large_document_pre_routed"
+        or str(source_metadata.get("large_document_execution_mode") or "").strip()
+        == "defer_to_process_worker_grouped_default_line"
+    )
+
+
+def _process_worker_timeout_seconds(worker_payload: Dict[str, Any]) -> int:
+    if _is_large_document_parent_process_payload(worker_payload):
+        return 0
+    return int(settings.PROCESS_WORKER_TIMEOUT)
 
 
 def _apply_completed_process_result(
@@ -3116,7 +2656,7 @@ def _apply_completed_process_result(
     quality_warning = None
     if quality_metadata and not quality_metadata.get("quality_gate_passed", True):
         quality_warning = (
-            "质量闸检测到仍有残留命中或一致性问题"
+            "质量检查提示：仍有残留命中或一致性问题"
             + (
                 f"：{quality_metadata.get('quality_gate_reason')}"
                 if quality_metadata.get("quality_gate_reason")
@@ -3127,7 +2667,6 @@ def _apply_completed_process_result(
     if quality_warning:
         warning_message = f"{warning_message} | {quality_warning}" if warning_message else quality_warning
 
-    task["status"] = "completed"
     task["entities"] = entities
     task["anonymized_text"] = anonymized_text
     task["output_path"] = export_result.get("output_path")
@@ -3143,6 +2682,7 @@ def _apply_completed_process_result(
     task["processing_time"] = round(total_processing_time, 4)
     task["quality_metadata"] = quality_metadata
     task["progress"] = 100
+    task["status"] = "completed"
     task["message"] = "脱敏完成，可下载结果文件。"
     task["error_message"] = None
     task["updated_at"] = datetime.now()
@@ -3218,6 +2758,7 @@ def _annotate_response_entities(entities: list[Dict], quality_metadata: Dict) ->
             if not canonical_key:
                 continue
             group_labels[canonical_key] = str(item.get("primary_text", "")).strip() or canonical_key
+    _merge_subject_ledger_group_labels(group_labels, quality_metadata)
 
     residual_keys = set()
     residual_hits = quality_metadata.get("residual_hits")
@@ -3247,6 +2788,8 @@ def _annotate_response_entities(entities: list[Dict], quality_metadata: Dict) ->
 
 def _build_canonical_groups_payload(entities: list[Dict], quality_metadata: Dict) -> list[Dict]:
     groups: Dict[str, Dict[str, object]] = {}
+    ledger_group_labels: Dict[str, str] = {}
+    _merge_subject_ledger_group_labels(ledger_group_labels, quality_metadata)
     for entity in entities:
         canonical_key = str(entity.get("group_id") or entity.get("canonical_key") or "").strip()
         if not canonical_key:
@@ -3255,7 +2798,13 @@ def _build_canonical_groups_payload(entities: list[Dict], quality_metadata: Dict
             canonical_key,
             {
                 "group_id": canonical_key,
-                "group_label": str(entity.get("group_label") or entity.get("context_label") or entity.get("text") or "").strip(),
+                "group_label": str(
+                    ledger_group_labels.get(canonical_key)
+                    or entity.get("group_label")
+                    or entity.get("context_label")
+                    or entity.get("text")
+                    or ""
+                ).strip(),
                 "primary_text": str(entity.get("text") or "").strip(),
                 "canonical_role": str(entity.get("canonical_role") or "").strip() or None,
                 "aliases": set(),
@@ -3299,6 +2848,25 @@ def _build_canonical_groups_payload(entities: list[Dict], quality_metadata: Dict
     return result
 
 
+def _merge_subject_ledger_group_labels(group_labels: Dict[str, str], quality_metadata: Dict) -> None:
+    metadata = quality_metadata if isinstance(quality_metadata, dict) else {}
+    ledger = metadata.get("resolved_subject_ledger")
+    if not isinstance(ledger, dict):
+        ledger = metadata.get("rule_first_subject_ledger")
+    if not isinstance(ledger, dict):
+        return
+    for subject in ledger.get("subjects") or []:
+        if not isinstance(subject, dict):
+            continue
+        subject_id = str(subject.get("subject_id") or "").strip()
+        if not subject_id:
+            continue
+        group_key = f"LEDGER_SUBJECT_{re.sub(r'[^A-Za-z0-9_]+', '_', subject_id).strip('_')}"
+        label = str(subject.get("canonical_text") or "").strip()
+        if group_key and label:
+            group_labels.setdefault(group_key, label)
+
+
 def _build_suspected_misses_payload(quality_metadata: Dict) -> list[Dict]:
     results: list[Dict] = []
     residual_hits = quality_metadata.get("residual_hits")
@@ -3312,7 +2880,7 @@ def _build_suspected_misses_payload(quality_metadata: Dict) -> list[Dict]:
                     "severity": "medium",
                     "reason": str(item.get("line") or item.get("window_text") or "当前文本中仍存在未覆盖变体。").strip(),
                     "evidence_refs": [],
-                    "lawyer_action_hint": "建议人工确认该片段是否应补充进当前实体列表。",
+                    "action_hint": "建议人工确认该片段是否应补充进当前实体列表。",
                 }
             )
 
@@ -3324,7 +2892,7 @@ def _build_suspected_misses_payload(quality_metadata: Dict) -> list[Dict]:
                 "severity": "medium",
                 "reason": "系统检测到同一主体可能存在多个替换表达，建议人工核对。",
                 "evidence_refs": [],
-                "lawyer_action_hint": "建议检查同一主体、简称和角色称谓是否已统一。",
+                "action_hint": "建议检查同一主体、简称和角色称谓是否已统一。",
             }
         )
 
@@ -3350,21 +2918,6 @@ def _save_upload(task_id: str, filename: str, content: bytes) -> tuple[str, str]
     file_path.write_bytes(content)
     ensure_private_file(file_path)
     return str(file_path), suffix
-
-
-def _save_wps_docx_template(task_id: str, filename: str, content: bytes) -> str:
-    suffix = Path(filename).suffix.lower()
-    if suffix != ".docx":
-        raise HTTPException(status_code=400, detail="WPS 转换模板必须是 DOCX 文件。")
-    if len(content) > settings.MAX_UPLOAD_SIZE:
-        raise HTTPException(
-            status_code=400,
-            detail=f"WPS 转换模板过大，单文件最大 {settings.MAX_UPLOAD_SIZE // (1024 * 1024)} MB。",
-        )
-    file_path = Path(settings.UPLOAD_DIR) / f"{task_id}_wps_template.docx"
-    file_path.write_bytes(content)
-    ensure_private_file(file_path)
-    return str(file_path)
 
 
 def _analysis_progress_bands() -> dict[str, tuple[int, int]]:
@@ -3789,7 +3342,6 @@ async def _run_analysis_task(task_id: str) -> None:
                 use_llm=use_llm,
                 llm_model=selected_llm_model,
                 progress_callback=_parse_progress_callback(task_id),
-                wps_docx_template_path=task.get("wps_docx_template_path"),
             )
         task["text"] = doc_result["text"]
         task["structure"] = doc_result.get("structure")
@@ -3817,12 +3369,13 @@ async def _run_analysis_task(task_id: str) -> None:
         task["entities"] = entities
         task["statistics"] = analysis_payload.get("statistics") or {}
         task["analysis_time"] = round(perf_counter() - start_time, 4)
+        completion_status, completion_message = _analysis_completion_state(task.get("metadata") or {})
 
         _set_task_state(
             task,
-            status="ready",
+            status=completion_status,
             progress=100,
-            message="识别完成，请确认实体后生成脱敏文件。",
+            message=completion_message,
         )
     except asyncio.CancelledError:
         logger.info("Analysis task cancelled: %s", task_id)
@@ -3858,8 +3411,8 @@ def _download_name(filename: str, output_path: str) -> str:
 
 @router.post("/upload", response_model=Union[AnalyzeResponse, TaskStatus])
 async def upload_and_analyze(
+    request: Request,
     file: UploadFile = File(...),
-    wps_docx_template: Optional[UploadFile] = File(None),
     use_llm: bool = Form(True),
     use_custom: bool = Form(True),
     llm_model: Optional[str] = Form(None),
@@ -3870,28 +3423,18 @@ async def upload_and_analyze(
 ):
     logger.info("Received upload request")
     _purge_terminal_tasks()
+    use_llm = _query_bool_override(request, "use_llm", use_llm)
+    use_custom = _query_bool_override(request, "use_custom", use_custom)
+    async_mode = _query_bool_override(request, "async_mode", async_mode)
+    llm_model = _query_str_override(request, "llm_model", llm_model)
+    anonymization_strategy = _query_str_override(request, "anonymization_strategy", anonymization_strategy)
+    desensitize_mode = _query_str_override(request, "desensitize_mode", desensitize_mode)
+    page_session_id = _query_str_override(request, "page_session_id", page_session_id)
 
     task_id = str(uuid.uuid4())
     content = await file.read()
     filename = file.filename or "unknown.txt"
-    incoming_suffix = Path(filename).suffix.lower()
     selected_desensitize_mode = _resolve_desensitize_mode(desensitize_mode)
-    if wps_docx_template is not None and (
-        selected_desensitize_mode != "local_high_quality" or incoming_suffix != ".pdf"
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="WPS 转 Word 核查模板仅支持本机高质量线路下的 PDF 文件。",
-        )
-    if (
-        selected_desensitize_mode == "local_high_quality"
-        and incoming_suffix == ".pdf"
-        and wps_docx_template is None
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="本机高质量 PDF 线路必须上传 WPS 转换后的 DOCX；当前版本只做 WPS 转换文档核查，不再自建 DOCX 版式。",
-        )
     with desensitize_mode_context(selected_desensitize_mode):
         selected_llm_model = _ensure_model_ready(llm_model) if use_llm else None
         strategy_key, strategy_label = _get_strategy_payload(selected_llm_model)
@@ -3900,14 +3443,9 @@ async def upload_and_analyze(
         )
 
     saved_file_path: Optional[str] = None
-    saved_template_path: Optional[str] = None
     try:
         file_path, suffix = _save_upload(task_id, filename, content)
         saved_file_path = file_path
-        if wps_docx_template is not None:
-            template_filename = wps_docx_template.filename or "wps_template.docx"
-            template_content = await wps_docx_template.read()
-            saved_template_path = _save_wps_docx_template(task_id, template_filename, template_content)
 
         if not async_mode:
             start_time = perf_counter()
@@ -3916,7 +3454,6 @@ async def upload_and_analyze(
                     file_path,
                     use_llm=use_llm,
                     llm_model=selected_llm_model,
-                    wps_docx_template_path=saved_template_path,
                 )
             metadata = {
                 **doc_result["metadata"],
@@ -3940,21 +3477,21 @@ async def upload_and_analyze(
             entities = _annotate_response_entities(entities, metadata)
             statistics = analysis_payload.get("statistics") or {}
             analysis_time = round(perf_counter() - start_time, 4)
+            completion_status, completion_message = _analysis_completion_state(metadata)
 
             task_data = {
                 "task_id": task_id,
                 "filename": filename,
                 "file_path": file_path,
-                "wps_docx_template_path": saved_template_path,
                 "normalized_file_path": str(metadata.get("normalized_file_path") or "").strip() or None,
                 "text": text,
                 "entities": entities,
                 "statistics": statistics,
                 "metadata": metadata,
                 "structure": structure,
-                "status": "ready",
+                "status": completion_status,
                 "progress": 100,
-                "message": "识别完成，请确认实体后生成脱敏文件。",
+                "message": completion_message,
                 "created_at": datetime.now(),
                 "analysis_time": analysis_time,
                 "suffix": suffix,
@@ -4001,7 +3538,6 @@ async def upload_and_analyze(
             "task_id": task_id,
             "filename": filename,
             "file_path": file_path,
-            "wps_docx_template_path": saved_template_path,
             "created_at": datetime.now(),
             "suffix": suffix,
             "status": "queued",
@@ -4029,13 +3565,13 @@ async def upload_and_analyze(
         raise
     except Exception as exc:
         _delete_if_managed(saved_file_path, allowed_parent=settings.UPLOAD_DIR)
-        _delete_if_managed(saved_template_path, allowed_parent=settings.UPLOAD_DIR)
         logger.error("File analysis failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=_analysis_failure_detail(exc, ANALYZE_FAILURE_DETAIL))
 
 
 @router.post("/batch/upload", response_model=BatchTaskStatus)
 async def upload_and_process_folder(
+    request: Request,
     files: List[UploadFile] = File(...),
     relative_paths: Optional[List[str]] = Form(None),
     folder_name: Optional[str] = Form(None),
@@ -4049,6 +3585,12 @@ async def upload_and_process_folder(
 ):
     logger.info("Received batch upload request")
     _purge_terminal_tasks()
+    use_llm = _query_bool_override(request, "use_llm", use_llm)
+    use_custom = _query_bool_override(request, "use_custom", use_custom)
+    llm_model = _query_str_override(request, "llm_model", llm_model)
+    anonymization_strategy = _query_str_override(request, "anonymization_strategy", anonymization_strategy)
+    desensitize_mode = _query_str_override(request, "desensitize_mode", desensitize_mode)
+    page_session_id = _query_str_override(request, "page_session_id", page_session_id)
 
     if not files:
         raise HTTPException(status_code=400, detail="请至少选择一个文件。")
@@ -4148,7 +3690,7 @@ async def get_analysis_result(task_id: str):
     status = str(task.get("status") or "").strip().lower()
     if status == "failed":
         raise HTTPException(status_code=500, detail=task.get("error_message") or ANALYZE_FAILURE_DETAIL)
-    if status not in {"ready", "processing", "anonymizing", "completed"}:
+    if status not in {"ready", "review_required", "review_failed", "processing", "anonymizing", "completed", "completed_with_warnings"}:
         raise HTTPException(status_code=409, detail="Analysis is still running. Please retry shortly.")
 
     if not task.get("text"):
@@ -4218,7 +3760,7 @@ async def anonymize_text(request: DesensitizeRequest):
         raise HTTPException(status_code=404, detail="Task was not found. Please upload the file again.")
     task_status = str(task.get("status") or "").strip().lower()
     has_analysis_payload = bool(task.get("text")) and task.get("entities") is not None
-    if task_status not in {"ready", "processing", "anonymizing", "completed"}:
+    if task_status not in {"ready", "review_required", "review_failed", "processing", "anonymizing", "completed", "completed_with_warnings"}:
         if not (task_status == "failed" and has_analysis_payload):
             raise HTTPException(status_code=409, detail="识别尚未完成，请先等待识别结果准备完成。")
 
@@ -4329,7 +3871,7 @@ async def get_processed_result(task_id: str):
     status = str(task.get("status") or "").strip().lower()
     if status == "failed":
         raise HTTPException(status_code=500, detail=task.get("error_message") or ANONYMIZE_FAILURE_DETAIL)
-    if status != "completed":
+    if status not in {"completed", "completed_with_warnings", "review_failed"}:
         raise HTTPException(status_code=409, detail="Desensitization is still running. Please retry shortly.")
     return _serialize_desensitize_result(task_id, task)
 
@@ -4342,6 +3884,11 @@ async def download_mapping_result(task_id: str):
     task = _get_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task was not found.")
+    status = str(task.get("status") or "").strip().lower()
+    if status == "failed":
+        raise HTTPException(status_code=500, detail=task.get("error_message") or ANONYMIZE_FAILURE_DETAIL)
+    if status not in {"completed", "completed_with_warnings", "review_failed"}:
+        raise HTTPException(status_code=409, detail="Desensitization is still running. Please retry shortly.")
 
     filename = task["filename"]
     output_path = task.get("mapping_output_path")
@@ -4369,6 +3916,11 @@ async def download_result(task_id: str):
     task = _get_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task was not found.")
+    status = str(task.get("status") or "").strip().lower()
+    if status == "failed":
+        raise HTTPException(status_code=500, detail=task.get("error_message") or ANONYMIZE_FAILURE_DETAIL)
+    if status not in {"completed", "completed_with_warnings", "review_failed"}:
+        raise HTTPException(status_code=409, detail="Desensitization is still running. Please retry shortly.")
 
     filename = task["filename"]
     output_path = task.get("output_path")

@@ -9,29 +9,42 @@ import logging
 import re
 import site
 import sys
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import httpx
 
 from app.core.config import settings
 from app.core.recognizer_base import RecognizerResult
+from app.rules.default_subject_policy import canonical_default_entity_type
 from app.services.lowmem_entity_utils import (
     NON_ENTITY_ROLE_TERMS,
     ORG_PATTERN,
     ORG_SUFFIX_TERMS,
+    OFFICIAL_INSTITUTION_PATTERN,
     clean_candidate_text,
+    expand_org_span_with_left_region_prefix,
+    expand_subject_span_to_containing_shape,
+    find_short_org_prefix_before_non_subject_boundary,
     find_value_span,
     infer_semantic_type,
     is_generic_organization_term,
+    is_government_institution_text,
     is_identity_reference_term,
+    is_non_subject_action_or_function_term,
+    is_non_subject_generic_org_reference,
+    is_official_institution_text,
     is_org_like_text,
     is_position_title,
     is_probable_person,
+    is_weak_function_stripped_org,
     looks_like_organization_short_name,
     normalize_entity_text,
     make_entity,
     strip_identity_reference_prefix,
+    strip_leading_subject_function_words,
+    subject_noun_gate,
 )
 from app.services.lowmem_memory import release_runtime_memory
 from app.services.lowmem_model_assets import build_model_asset
@@ -39,6 +52,129 @@ from app.services.risk_snippet_scheduler import RiskSnippet
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_ratio(numerator: int, denominator: int) -> float:
+    if denominator <= 0:
+        return 0.0
+    return round(max(0.0, min(1.0, float(numerator) / float(denominator))), 4)
+
+
+REVIEW_CONTEXT_CHAR_RATIO = 2.2
+REVIEW_PROMPT_SAFETY_CHARS = 1200
+REVIEW_DECISION_SOURCE_NAMES = {
+    "qwen_fragment_review",
+    "qwen_entity_decision",
+    "review_deterministic_decision",
+}
+RULE_ORG_REVIEW_NON_SUBJECT_PREFIXES = (
+    "相关",
+    "前述",
+    "上述",
+    "涉案",
+    "本案",
+    "本合同",
+    "本协议",
+    "该",
+    "其",
+    "另有",
+    "还有",
+    "其中",
+)
+RULE_ORG_REVIEW_NON_SUBJECT_TOKENS = (
+    "材料",
+    "资料",
+    "文件",
+    "信息",
+    "事项",
+    "情况",
+    "环节",
+    "内容",
+    "手续",
+    "账户",
+    "业务",
+    "已经",
+    "处理",
+    "办理",
+    "提交",
+    "说明",
+    "确认",
+    "完成",
+    "涉及",
+    "利用",
+    "绑定",
+)
+RULE_ORG_REVIEW_WEAK_SUFFIXES = ("学校", "大学", "学院", "医院", "协会", "学会")
+RULE_ORG_REVIEW_STRONG_SUFFIXES = (
+    "股份有限公司",
+    "有限责任公司",
+    "集团有限公司",
+    "有限公司",
+    "分公司",
+    "子公司",
+    "集团",
+    "公司",
+    "商行",
+    "合作社",
+    "联合社",
+    "联社",
+    "工作室",
+    "经营部",
+    "门市部",
+    "营业部",
+    "办事处",
+    "基金会",
+    "联合会",
+    "俱乐部",
+    "实验室",
+    "门诊部",
+    "诊所",
+    "律师事务所",
+    "会计师事务所",
+    "研究院",
+    "研究所",
+    "服务中心",
+    "技术中心",
+)
+GENERIC_GOVERNMENT_REVIEW_REFERENCES = {
+    "法院",
+    "人民法院",
+    "一审法院",
+    "二审法院",
+    "原审法院",
+    "审法院",
+    "本院",
+    "贵院",
+    "该院",
+    "上级法院",
+    "下级法院",
+    "执行法院",
+}
+
+
+def _review_prompt_char_budget(*, quality_gate: bool = False, allow_thinking: bool = False) -> int:
+    num_ctx = int(getattr(settings, "REVIEW_NUM_CTX", 4096) or 4096)
+    max_tokens = int(
+        getattr(
+            settings,
+            "REVIEW_THINKING_MAX_TOKENS" if allow_thinking else "REVIEW_MAX_TOKENS",
+            384,
+        )
+        or 384
+    )
+    available_tokens = max(512, num_ctx - max_tokens - 256)
+    estimated = int(available_tokens * REVIEW_CONTEXT_CHAR_RATIO) - REVIEW_PROMPT_SAFETY_CHARS
+    return max(1200, min(3000, estimated))
+
+
+def _compact_prompt_text(value: str, limit: int) -> str:
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    if limit <= 240:
+        return text[:limit]
+    head = max(80, int(limit * 0.68))
+    tail = max(60, limit - head - 36)
+    return f"{text[:head]}\n...[已按4096上下文预算截断]...\n{text[-tail:]}"
 
 @dataclass(frozen=True)
 class ReviewRuntime:
@@ -61,10 +197,23 @@ class ReviewResult:
     error: Optional[str] = None
     raw_candidate_count: int = 0
     parsed_snippet_count: int = 0
-    arbitration_model: Optional[str] = None
-    arbitration_used: bool = False
-    arbitration_snippet_count: int = 0
-    arbitration_error: Optional[str] = None
+    metadata: Dict[str, object] = field(default_factory=dict)
+
+
+def _first_surface_text(card: dict) -> str:
+    for surface in card.get("surfaces") or []:
+        if isinstance(surface, dict):
+            text = str(surface.get("text") or "").strip()
+        else:
+            text = str(surface or "").strip()
+        if text:
+            return text
+    for occurrence in card.get("occurrences") or []:
+        if isinstance(occurrence, dict):
+            text = str(occurrence.get("text") or "").strip()
+            if text:
+                return text
+    return ""
 
 
 class QwenFragmentReviewService:
@@ -77,28 +226,17 @@ class QwenFragmentReviewService:
     ALLOWED_TYPES = {
         "PERSON",
         "ORGANIZATION",
-        "ADDRESS",
-        "BANK_NAME",
-        "ACCOUNT_NAME",
-        "PROJECT",
-        "CONTRACT_NO",
-        "CASE_NO",
-        "COURT",
-        "ALIAS",
-        "CN_ID_CARD",
-        "CN_CREDIT_CODE",
-        "CN_BANK_CARD",
-        "CN_PHONE",
+        "LOCATION",
+        "GOVERNMENT",
     }
     TYPE_ALIASES = {
-        "ID_CARD": "CN_ID_CARD",
-        "IDCARD": "CN_ID_CARD",
-        "CREDIT_CODE": "CN_CREDIT_CODE",
-        "BANK_CARD": "CN_BANK_CARD",
-        "PHONE": "CN_PHONE",
+        "ACCOUNT_NAME": "ORGANIZATION",
+        "BANK_NAME": "GOVERNMENT",
         "COMPANY": "ORGANIZATION",
         "ORG": "ORGANIZATION",
-        "LOCATION": "ADDRESS",
+        "ADDRESS": "LOCATION",
+        "COURT": "GOVERNMENT",
+        "GOVERNMENT_AGENCY": "GOVERNMENT",
         "PERSON_NAME": "PERSON",
         "LEGAL_REPRESENTATIVE": "PERSON",
         "CONTACT_PERSON": "PERSON",
@@ -119,6 +257,33 @@ class QwenFragmentReviewService:
         "地址",
         "住所",
         "住址",
+        "通过",
+        "通过了",
+        "经过",
+        "根据",
+        "依据",
+        "提交",
+        "确认",
+        "要求",
+        "请求",
+        "判令",
+        "承担",
+        "负责",
+        "继续",
+        "履行",
+        "履约",
+        "结算",
+        "付款",
+        "收款",
+        "交付",
+        "配合",
+        "联系",
+        "协商",
+        "双方",
+        "各方",
+        "一方",
+        "另一方",
+        "该公司",
         "法院",
         "人民法院",
         "一审法院",
@@ -133,8 +298,9 @@ class QwenFragmentReviewService:
 目标：看片段原文，完成两件事：
 A. entities：输出片段中应脱敏的真实实体；即使“已识别实体”已经识别正确，也要再次输出，表示确认。
 B. rejects：输出“已识别实体”里明显不是敏感实体的候选。
-允许类型：PERSON, ORGANIZATION, ADDRESS, BANK_NAME, ACCOUNT_NAME, PROJECT, CONTRACT_NO, CASE_NO, COURT, ALIAS, CN_ID_CARD, CN_CREDIT_CODE, CN_BANK_CARD, CN_PHONE。
-重点补漏：复杂中文人名、少数民族/带中点姓名、上诉人/被上诉人/原审原告/原审被告/申请人/被申请人对应的真实主体、委托诉讼代理人、股东/实际控制人、住址/现住址/户籍地/身份证住址/经常居住地、法院/仲裁机构、账户名/开户行、公司简称关系。对于没有明示“以下简称”的公司简称、前半段简称、去掉“公司”二字后的简称，可以结合全文高概率推理，归并到同一真实主体。对以人名命名的公司简称、门店、商行、工作室、合作社、中心、研究院、事务所、协会、医院、学校、经营部、门市部等组织主体，不要因为字面像自然人姓名就误判为 PERSON。
+C. entity_decisions：逐项裁决“已识别实体”。如果候选以“通过/经过/根据/依据/要求/通知/由/向/对/与/和”等功能词、动作词、连接词开头，必须排除前面的功能词；如果后半段是完整主体，用 trim_to 输出去掉功能词后的真实主体；如果后半段不是完整主体或只是泛称，使用 reject；如果动作词只出现在主体名称中间，且整体是完整公司/机构/政府/地名，保留该主体；如果一个候选吞了多个并列主体，必须用 split_into 拆开；如果候选只是普通词/动词/代词，使用 reject。
+允许类型只能是：PERSON, ORGANIZATION, LOCATION, GOVERNMENT。
+重点补漏：复杂中文人名、少数民族/带中点姓名、上诉人/被上诉人/原审原告/原审被告/申请人/被申请人对应的真实主体、委托诉讼代理人、股东/实际控制人、住址/现住址/户籍地/身份证住址/经常居住地、法院/仲裁机构、公司简称关系。法院、检察院、公安、政府、仲裁委员会等统一输出 GOVERNMENT；地址统一输出 LOCATION。开户行、户名、账号、案号、合同编号、项目名称、金额、电话、证号、银行卡号、信用代码都不是主体分类，不要输出为实体。
 额外强调：即使全文里从头到尾只出现简称、没有出现完整公司名，只要该 2-6 字简称在片段里承担签约、履约、结算、付款、收款、供货、交付、施工、对账、盖章、落款、对接等组织主体动作，或与另一组织主体并列承担合同义务，也应优先识别为 ORGANIZATION，不要因为缺少“公司/集团/中心”等后缀而漏掉。
 当 PERSON 与 ORGANIZATION 难以区分时，如果该词在片段里更像合同/诉讼/交易主体而不是自然人，例如出现在“由X继续履约”“X负责结算”“X向乙方付款”“X与Y签订协议”“X继续供货”“X承担责任”这类语境中，优先输出 ORGANIZATION。
 不要把这些普通词或泛称当实体：国家、中华人民共和国、人民共和国、法定代表人、法定代理人、法人代表、负责人、联系人、委托代理人、委托诉讼代理人、诉讼代理人、代理人、控告人、被控告人、举报人、申诉人、起诉人、自诉人、技术人员、总经理、经理、董事长、董事、监事、岗位、职位、职务、我中心、本院、贵院、法院、人民法院、一审法院、二审法院、项目所在地人民法院、地址、合同期限、三个、五个。注意：“签订日期”这个标签不是实体，但具体日期值可以保留，不要放入 rejects。
@@ -143,8 +309,9 @@ B. rejects：输出“已识别实体”里明显不是敏感实体的候选。
 2. entities 放片段里的全部敏感实体，包括已经正确识别的实体、漏掉的实体、需要纠正类型的实体；不要因为已经识别过就输出空。
 2.1. 对只有简称的组织主体，不要因为没有全称锚点就省略；只要片段语义足够支持，就直接输出该简称本身。
 3. rejects 只放明显错误的已识别实体，例如：普通词“国家/法定代表人/法定代理人/控告人/地址/法院”、普通岗位词、章节标题、泛称“一审法院/二审法院/本院/法院/地址”、吞掉整句的案号/合同编号。
-4. 地址要尽量输出完整地址；人名不要拆字；公司/法院要输出完整正式名称。
-5. 如果片段包含合同编号、工程名称、工程地址、甲乙方、开户行、户名、账号、落款主体，entities 通常不应为空。
+3.1. 对开头就是功能词/动作词的候选必须先杀掉前缀功能词，例如“通过北京某某有限公司”“依据某某委员会文件”“由某某分公司负责”这类候选，如果后半段是完整主体，使用 trim_to 输出“北京某某有限公司”“某某委员会”“某某分公司”；如果后半段不是完整主体或只是“公司/机构/材料”等泛称，使用 reject。
+4. 地址要尽量输出完整地址；人名不要拆字；公司/政府机构要输出完整正式名称。
+5. 如果片段包含甲乙方、诉讼主体、政府机构、地址、落款主体，entities 通常不应为空；只有账号/案号/合同编号/开户行/户名时可以为空。
 6. 最多输出 24 个 entities、16 个 rejects；确实没有敏感实体或错误时才输出空数组。
 片段类型：{snippet_type}
 已识别实体（可能有错，不要盲信）：
@@ -152,32 +319,7 @@ B. rejects：输出“已识别实体”里明显不是敏感实体的候选。
 片段开始：
 {snippet_text}
 片段结束。
-JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role":"甲方"}}],"rejects":[{{"type":"ORGANIZATION","text":"国家","reason":"普通词"}}]}}
-"""
-
-    QUALITY_GATE_PROMPT_TEMPLATE = """你是中文合同/法律文书脱敏最终高精度审查模型。只输出 JSON，不要解释。
-任务：对当前片段做最终纠错审查，尽可能发现前序识别的错误与遗漏。
-你必须同时完成两件事：
-A. entities：输出片段中应脱敏的真实敏感实体。对“已识别实体”里本来就正确的项，也要再次输出，表示确认。
-B. rejects：输出“已识别实体”里明显错误、明显错型、明显吞句、明显普通词/身份词/职务词/标签词的项。
-允许类型：PERSON, ORGANIZATION, ADDRESS, BANK_NAME, ACCOUNT_NAME, PROJECT, CONTRACT_NO, CASE_NO, COURT, ALIAS, CN_ID_CARD, CN_CREDIT_CODE, CN_BANK_CARD, CN_PHONE。
-最终审查硬规则：
-1. 必须逐一复核“已识别实体”中的每一项。对明显错误项，不能沉默，必须放入 rejects。
-2. 如果某个已识别 text 本身是真实敏感实体，但前序 type 明显错了，要在 entities 里用正确 type 重新输出，并在 rejects 里打掉旧错项。
-3. 重点找前序常见错误：把控告人、法定代理人、联系人、负责人、委托代理人、诉讼代理人、职务、岗位等身份或职务词误当实体；把公司错当人名；把人名错当机构；把整句吞成案号或合同号；漏掉只以简称出现的公司或机构主体。
-4. 对没有全称锚点、只单独出现的 2-6 字公司或机构简称，只要它在片段里承担签约、履约、结算、付款、收款、供货、交付、施工、对账、盖章、落款、对接、承担责任等组织主体动作，或与另一主体并列承担合同、诉讼、交易义务，就应优先识别为 ORGANIZATION，不得因缺少“公司”等后缀而省略。
-5. 对以人名命名的公司、工作室、商行、合作社、经营部、门市部、营业部、办事处、中心、研究院、事务所、学校、医院、协会、银行等组织主体，不要因为字面像姓名就误判为 PERSON。
-6. 不要把这些普通词或泛称当实体：国家、中华人民共和国、人民共和国、法定代表人、法定代理人、法人代表、负责人、联系人、委托代理人、委托诉讼代理人、诉讼代理人、代理人、控告人、被控告人、举报人、申诉人、起诉人、自诉人、技术人员、总经理、经理、董事长、董事、监事、岗位、职位、职务、我中心、本院、贵院、法院、人民法院、一审法院、二审法院、项目所在地人民法院、地址、合同期限、三个、五个。
-7. text 必须是片段原文里的连续字符串，一个字都不能编。
-8. 金额和日期默认不脱敏；具体日期值也不要误放进 rejects。
-9. 输出时优先纠错和补漏，不要保守放过明显问题。
-片段类型：{snippet_type}
-已识别实体（可能有错，必须逐一复核）：
-{existing_entities}
-片段开始：
-{snippet_text}
-片段结束。
-JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role":"甲方"}}],"rejects":[{{"type":"ORGANIZATION","text":"控告人","reason":"身份指代词"}},{{"type":"PERSON","text":"广州某新能源有限公司","reason":"类型错误，应为ORGANIZATION"}}]}}
+JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role":"甲方"}}],"rejects":[{{"type":"ORGANIZATION","text":"国家","reason":"普通词"}}],"entity_decisions":[{{"text":"通过某某公司","type":"ORGANIZATION","action":"trim_to","trim_to":"某某公司","reason":"去掉开头功能词"}}]}}
 """
 
     SHORT_ORG_ACTION_PATTERNS = (
@@ -435,13 +577,21 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
         self._mlx_model = None
         self._mlx_tokenizer = None
         self._mlx_model_path: Optional[str] = None
-        self._ollama_models_touched: set[str] = set()
 
     @property
     def installed(self) -> bool:
-        if self.review_asset.installed or self.fallback_asset.installed:
+        if self.review_asset.installed:
             return True
-        return self._select_ollama_review_model(self._installed_ollama_models()) is not None
+        if self.fallback_asset.installed and (
+            not settings.is_high_quality_lowmem_mode()
+            or settings.LOWMEM_ENABLE_LOCAL_REVIEW_FALLBACK
+        ):
+            return True
+        return False
+
+    @property
+    def quality_gate_installed(self) -> bool:
+        return False
 
     async def review(
         self,
@@ -450,38 +600,132 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
         *,
         existing_entities: Optional[Iterable[RecognizerResult]] = None,
         max_snippets: Optional[int] = None,
+        progress_callback: Optional[Callable[[Dict[str, object]], None]] = None,
     ) -> ReviewResult:
         if not settings.ENABLE_QWEN_REVIEW:
             return ReviewResult(requires_manual_review=False, error="review_disabled")
-        runtime = self._select_review_runtime()
-        if runtime is None:
-            return ReviewResult(requires_manual_review=True, error="review_model_not_installed")
 
         fallback_used = False
         all_results: list[RecognizerResult] = []
         all_rejections: list[Dict] = []
+        ledger_decisions: list[Dict[str, Any]] = []
+        entity_decision_entity_count = 0
         any_model_used = False
+        model_attempted = False
         last_error: Optional[str] = None
         raw_candidate_count = 0
         parsed_snippet_count = 0
         existing_list = list(existing_entities or [])
-        review_model_name = runtime.model_id
-        review_backend = runtime.backend
+        global_deterministic_decisions = self._deterministic_review_entity_decisions(
+            [self._entity_dict_for_review(item) for item in existing_list]
+        )
+        all_rejections.extend(global_deterministic_decisions["rejections"])
         review_limit = max_snippets or max(1, int(settings.MID_REVIEW_MAX_SNIPPETS or settings.REVIEW_MAX_SNIPPETS))
-        scheduled_snippets = list(snippets)[:review_limit]
+        scheduled_snippets = self._schedule_review_snippets(list(snippets), review_limit=review_limit)
+        scheduled_ledger_count = sum(1 for snippet in scheduled_snippets if self._is_ledger_adjudication_snippet(snippet))
+        scheduled_standard_count = len(scheduled_snippets) - scheduled_ledger_count
+        standard_runtime = self._select_review_runtime()
+        if not scheduled_snippets:
+            if global_deterministic_decisions["entities"]:
+                all_results.extend(
+                    self._materialize_candidates(
+                        full_text,
+                        {"entities": global_deterministic_decisions["entities"]},
+                        RiskSnippet(
+                            "final_subject_adjudication",
+                            "final_subject:deterministic_global",
+                            0,
+                            len(full_text),
+                            full_text,
+                        ),
+                        source_name="review_deterministic_decision",
+                    )
+                )
+            return ReviewResult(
+                entities=self._dedupe_results(all_results),
+                rejected_entities=self._dedupe_rejections(all_rejections),
+                requires_manual_review=False,
+                error="no_standard_review_snippets",
+                metadata={
+                    "review_deterministic_rejection_count": sum(
+                        1 for item in self._dedupe_rejections(all_rejections) if item.get("deterministic_review")
+                    ),
+                    "review_deterministic_entity_decision_count": sum(
+                        1 for item in self._dedupe_rejections(all_rejections) if item.get("deterministic_entity_decision")
+                    ),
+                    "review_deterministic_entity_count": sum(
+                        1 for item in self._dedupe_results(all_results)
+                        if (item.metadata or {}).get("source") == "review_deterministic_decision"
+                    ),
+                },
+            )
+        if standard_runtime is None:
+            if global_deterministic_decisions["entities"]:
+                all_results.extend(
+                    self._materialize_candidates(
+                        full_text,
+                        {"entities": global_deterministic_decisions["entities"]},
+                        RiskSnippet(
+                            "final_subject_adjudication",
+                            "final_subject:deterministic_global",
+                            0,
+                            len(full_text),
+                            full_text,
+                        ),
+                        source_name="review_deterministic_decision",
+                    )
+                )
+            return ReviewResult(
+                entities=self._dedupe_results(all_results),
+                rejected_entities=self._dedupe_rejections(all_rejections),
+                requires_manual_review=True,
+                error="review_model_not_installed",
+                metadata={
+                    "review_deterministic_rejection_count": sum(
+                        1 for item in self._dedupe_rejections(all_rejections) if item.get("deterministic_review")
+                    ),
+                    "review_deterministic_entity_decision_count": sum(
+                        1 for item in self._dedupe_rejections(all_rejections) if item.get("deterministic_entity_decision")
+                    ),
+                    "review_deterministic_entity_count": sum(
+                        1 for item in self._dedupe_results(all_results)
+                        if (item.metadata or {}).get("source") == "review_deterministic_decision"
+                    ),
+                },
+            )
+        review_model_name = standard_runtime.model_id
+        review_backend = standard_runtime.backend
 
         for snippet in scheduled_snippets:
-            snippet_mode = "quality_gate" if snippet.snippet_type == "quality_gate_block" else "standard"
-            snippet_existing = self._entities_for_snippet(existing_list, snippet, mode=snippet_mode)
+            if progress_callback is not None:
+                try:
+                    progress_callback(
+                        {
+                            "stage": "review",
+                            "current": parsed_snippet_count + 1,
+                            "total": len(scheduled_snippets),
+                            "message": "正在执行模型审查...",
+                        }
+                    )
+                except Exception:
+                    logger.debug("Review progress callback failed", exc_info=True)
+            snippet_existing = self._entities_for_snippet(existing_list, snippet, mode="standard")
+            deterministic_decisions = self._deterministic_review_entity_decisions(snippet_existing)
+            deterministic_rejections = deterministic_decisions["rejections"]
             raw_response: Optional[str] = None
-            active_runtime = self._select_runtime_for_snippet(snippet) or runtime
+            active_runtime = standard_runtime
+            if active_runtime is None:
+                last_error = "review_model_not_installed"
+                all_rejections.extend(deterministic_rejections)
+                continue
             try:
                 allow_thinking = self._review_thinking_enabled(active_runtime)
-                prompt = self._build_prompt(
+                prompt = self._build_review_prompt_for_snippet(
                     snippet,
                     existing_entities=snippet_existing,
                     allow_thinking=allow_thinking,
                 )
+                model_attempted = True
                 raw_response = await self._review_with_runtime(
                     prompt,
                     active_runtime,
@@ -499,11 +743,12 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
                     try:
                         active_runtime = fallback_runtime
                         allow_thinking = self._review_thinking_enabled(active_runtime)
-                        prompt = self._build_prompt(
+                        prompt = self._build_review_prompt_for_snippet(
                             snippet,
                             existing_entities=snippet_existing,
                             allow_thinking=allow_thinking,
                         )
+                        model_attempted = True
                         raw_response = await self._review_with_runtime(
                             prompt,
                             active_runtime,
@@ -515,26 +760,47 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
                         any_model_used = True
                     except Exception as fallback_exc:
                         last_error = f"{type(fallback_exc).__name__}: {fallback_exc}"
-                if raw_response is None:
-                    if "not_installed" in str(last_error):
-                        break
-                    continue
+            if raw_response is None:
+                if deterministic_decisions["entities"] and not self._is_ledger_adjudication_snippet(snippet):
+                    all_results.extend(
+                        self._materialize_candidates(
+                            full_text,
+                            {"entities": deterministic_decisions["entities"]},
+                            snippet,
+                            source_name="review_deterministic_decision",
+                        )
+                    )
+                all_rejections.extend(deterministic_rejections)
+                if self._is_ledger_adjudication_snippet(snippet):
+                    ledger_decisions.append(
+                        self._fallback_ledger_decision(
+                            snippet,
+                            snippet_existing,
+                            reason=last_error or "ledger_review_model_response_missing",
+                        )
+                    )
+                if "not_installed" in str(last_error):
+                    break
+                continue
 
             parsed = self._parse_json_response(raw_response or "")
             if parsed is None:
                 allow_thinking = self._review_thinking_enabled(active_runtime)
-                retry_prompt = self._build_prompt(
+                retry_prompt = self._build_review_prompt_for_snippet(
                     snippet,
-                    existing_entities=self._entities_for_snippet(
+                    existing_entities=snippet_existing
+                    if getattr(snippet, "target_entity", None)
+                    else self._entities_for_snippet(
                         existing_list,
                         snippet,
-                        limit=24 if snippet.snippet_type == "quality_gate_block" else 12,
-                        mode=snippet_mode,
+                        limit=12,
+                        mode="standard",
                     ),
                     short=True,
                     allow_thinking=allow_thinking,
                 )
                 try:
+                    model_attempted = True
                     retry_response = await self._review_with_runtime(
                         retry_prompt,
                         active_runtime,
@@ -545,76 +811,88 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
                     last_error = f"json_retry_failed:{type(exc).__name__}"
             if parsed is None:
                 last_error = last_error or "review_json_parse_failed"
+                if deterministic_decisions["entities"] and not self._is_ledger_adjudication_snippet(snippet):
+                    all_results.extend(
+                        self._materialize_candidates(
+                            full_text,
+                            {"entities": deterministic_decisions["entities"]},
+                            snippet,
+                            source_name="review_deterministic_decision",
+                        )
+                    )
+                all_rejections.extend(deterministic_rejections)
+                if self._is_ledger_adjudication_snippet(snippet):
+                    ledger_decisions.append(
+                        self._fallback_ledger_decision(
+                            snippet,
+                            snippet_existing,
+                            reason=last_error,
+                        )
+                    )
                 continue
             raw_candidate_count += len(parsed.get("entities") or [])
             parsed_snippet_count += 1
-            all_results.extend(self._materialize_candidates(full_text, parsed, snippet))
-            all_rejections.extend(self._materialize_rejections(parsed, snippet_existing))
-
-        arbitration_model: Optional[str] = None
-        arbitration_used = False
-        arbitration_snippet_count = 0
-        arbitration_error: Optional[str] = None
-        arbitration_requires_manual = False
-        arbitration_snippets = self._select_arbitration_snippets(
-            scheduled_snippets,
-            parsed_snippet_count=parsed_snippet_count,
-            review_error=last_error,
-        )
-        heavy_arbitration_enabled = settings.ENABLE_HEAVY_ARBITRATION and (
-            not settings.is_high_quality_lowmem_mode() or settings.LOWMEM_ENABLE_HEAVY_ARBITRATION
-        )
-        if heavy_arbitration_enabled and arbitration_snippets:
-            arbitration_model = self._select_ollama_arbitration_model()
-            if arbitration_model:
-                arbitration_runtime = ReviewRuntime(
-                    backend="ollama",
-                    model_id=arbitration_model,
-                    tier="heavy_arbitration",
-                )
-                for snippet in arbitration_snippets[: max(1, settings.HEAVY_ARBITRATION_MAX_SNIPPETS)]:
-                    snippet_existing = self._entities_for_snippet(existing_list, snippet, limit=18)
-                    prompt = self._build_arbitration_prompt(snippet, existing_entities=snippet_existing)
-                    try:
-                        raw_response = await self._review_with_runtime(
-                            prompt,
-                            arbitration_runtime,
-                            allow_thinking=self._arbitration_thinking_enabled(),
+            if self._is_ledger_adjudication_snippet(snippet):
+                decisions = self._materialize_ledger_decisions(parsed, snippet, snippet_existing)
+                if not decisions:
+                    decisions = [
+                        self._fallback_ledger_decision(
+                            snippet,
+                            snippet_existing,
+                            reason="ledger_review_returned_no_decision",
                         )
-                        arbitration_used = True
-                        any_model_used = True
-                        parsed = self._parse_json_response(raw_response or "")
-                        if parsed is None:
-                            arbitration_error = "arbitration_json_parse_failed"
-                            continue
-                        arbitration_snippet_count += 1
-                        arbitration_requires_manual = arbitration_requires_manual or bool(
-                            parsed.get("requires_manual_review")
-                        )
-                        raw_candidate_count += len(parsed.get("entities") or [])
-                        all_results.extend(
-                            self._materialize_candidates(
-                                full_text,
-                                parsed,
-                                snippet,
-                                source_name="qwen_heavy_arbitration",
-                            )
-                        )
-                        all_rejections.extend(self._materialize_rejections(parsed, snippet_existing))
-                    except Exception as exc:
-                        arbitration_error = f"{type(exc).__name__}: {exc}"
-                        logger.warning("Heavy arbitration failed: %s", exc)
-                        break
+                    ]
+                ledger_decisions.extend(decisions)
+                all_rejections.extend(self._ledger_decision_rejections(decisions, snippet_existing))
+                all_rejections.extend(deterministic_rejections)
             else:
-                arbitration_error = "arbitration_model_not_installed"
+                all_results.extend(self._materialize_candidates(full_text, parsed, snippet))
+                all_rejections.extend(self._materialize_rejections(parsed, snippet_existing))
+                entity_decisions = self._materialize_entity_decisions(parsed, snippet_existing)
+                all_rejections.extend(entity_decisions["rejections"])
+                if entity_decisions["entities"]:
+                    entity_decision_entity_count += len(entity_decisions["entities"])
+                    all_results.extend(
+                        self._materialize_candidates(
+                            full_text,
+                            {"entities": entity_decisions["entities"]},
+                            snippet,
+                            source_name="qwen_entity_decision",
+                        )
+                    )
+                if deterministic_decisions["entities"]:
+                    all_results.extend(
+                        self._materialize_candidates(
+                            full_text,
+                            {"entities": deterministic_decisions["entities"]},
+                            snippet,
+                            source_name="review_deterministic_decision",
+                        )
+                    )
+                all_rejections.extend(deterministic_rejections)
+            if progress_callback is not None:
+                try:
+                    progress_callback(
+                        {
+                            "stage": "review",
+                            "current": parsed_snippet_count,
+                            "total": len(scheduled_snippets),
+                            "message": "模型审查进行中...",
+                        }
+                    )
+                except Exception:
+                    logger.debug("Review progress callback failed", exc_info=True)
 
-        requires_manual_review = bool(last_error) or not any_model_used or arbitration_requires_manual
-        if arbitration_error:
-            requires_manual_review = True
+        ledger_requires_manual = any(bool(item.get("requires_manual_review")) for item in ledger_decisions)
+        requires_manual_review = (
+            bool(last_error)
+            or not any_model_used
+            or ledger_requires_manual
+        )
         return ReviewResult(
-            entities=all_results,
-            rejected_entities=all_rejections,
-            model_used=any_model_used,
+            entities=self._dedupe_results(all_results),
+            rejected_entities=self._dedupe_rejections(all_rejections),
+            model_used=model_attempted,
             fallback_used=fallback_used,
             model_name=review_model_name,
             review_backend=review_backend,
@@ -622,10 +900,94 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
             error=last_error,
             raw_candidate_count=raw_candidate_count,
             parsed_snippet_count=parsed_snippet_count,
-            arbitration_model=arbitration_model,
-            arbitration_used=arbitration_used,
-            arbitration_snippet_count=arbitration_snippet_count,
-            arbitration_error=arbitration_error,
+            metadata={
+                "ledger_conflict_adjudication_enabled": bool(ledger_decisions),
+                "ledger_conflict_decisions": ledger_decisions,
+                "ledger_conflict_decision_count": len(ledger_decisions),
+                "ledger_conflict_manual_review_required": ledger_requires_manual,
+                "ledger_conflict_snippet_count": sum(
+                    1 for snippet in scheduled_snippets if self._is_ledger_adjudication_snippet(snippet)
+                ),
+                "review_scheduled_snippet_count": len(scheduled_snippets),
+                "review_scheduled_ledger_snippet_count": scheduled_ledger_count,
+                "review_scheduled_standard_snippet_count": scheduled_standard_count,
+                "review_deterministic_rejection_count": sum(
+                    1 for item in self._dedupe_rejections(all_rejections) if item.get("deterministic_review")
+                ),
+                "review_deterministic_entity_decision_count": sum(
+                    1 for item in self._dedupe_rejections(all_rejections) if item.get("deterministic_entity_decision")
+                ),
+                "review_deterministic_entity_count": sum(
+                    1 for item in self._dedupe_results(all_results)
+                    if (item.metadata or {}).get("source") == "review_deterministic_decision"
+                ),
+                "review_entity_decision_rejection_count": sum(
+                    1
+                    for item in self._dedupe_rejections(all_rejections)
+                    if item.get("entity_decision") and not item.get("deterministic_entity_decision")
+                ),
+                "review_entity_decision_entity_count": entity_decision_entity_count,
+            },
+        )
+
+    @staticmethod
+    def _entity_dict_for_review(entity: RecognizerResult) -> dict:
+        metadata = dict(entity.metadata or {})
+        return {
+            "type": entity.entity_type,
+            "text": entity.text,
+            "start": int(entity.start),
+            "end": int(entity.end),
+            "source": entity.source,
+            "metadata": metadata,
+            "role": metadata.get("role") or metadata.get("label"),
+        }
+
+    @staticmethod
+    def _schedule_review_snippets(snippets: list[RiskSnippet], *, review_limit: int) -> list[RiskSnippet]:
+        """Never drop ledger conflicts or DOCX structure behind the generic cap."""
+        if not snippets:
+            return []
+        ledger_snippets = [
+            snippet
+            for snippet in snippets
+            if QwenFragmentReviewService._is_ledger_adjudication_snippet(snippet)
+        ]
+        final_subject_snippets = [
+            snippet
+            for snippet in snippets
+            if not QwenFragmentReviewService._is_ledger_adjudication_snippet(snippet)
+            and QwenFragmentReviewService._is_final_subject_adjudication_snippet(snippet)
+        ]
+        structure_snippets = [
+            snippet
+            for snippet in snippets
+            if not QwenFragmentReviewService._is_ledger_adjudication_snippet(snippet)
+            and not QwenFragmentReviewService._is_final_subject_adjudication_snippet(snippet)
+            and str(snippet.risk_reason or "").startswith("docx_structure:")
+        ]
+        non_ledger = [
+            snippet
+            for snippet in snippets
+            if not QwenFragmentReviewService._is_ledger_adjudication_snippet(snippet)
+            and not QwenFragmentReviewService._is_final_subject_adjudication_snippet(snippet)
+            and not str(snippet.risk_reason or "").startswith("docx_structure:")
+        ]
+        ordinary_limit = max(1, int(review_limit or 1))
+        structure_limit = max(2, min(len(structure_snippets), max(ordinary_limit // 2, 6)))
+        remaining_ordinary_limit = max(1, ordinary_limit - min(structure_limit, len(structure_snippets)))
+        return [
+            *ledger_snippets,
+            *final_subject_snippets,
+            *structure_snippets[:structure_limit],
+            *non_ledger[:remaining_ordinary_limit],
+        ]
+
+    @staticmethod
+    def _is_final_subject_adjudication_snippet(snippet: RiskSnippet) -> bool:
+        return (
+            snippet.snippet_type == "rule_first_review_block"
+            or str(snippet.risk_reason or "").startswith(("rule_first:", "final_subject:"))
         )
 
     async def generate_text(
@@ -633,6 +995,7 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
         prompt: str,
         *,
         max_tokens: Optional[int] = None,
+        quality_gate: bool = False,
     ) -> Dict[str, object]:
         runtime = self._select_review_runtime()
         if runtime is None:
@@ -667,32 +1030,6 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
         }
 
     def _select_review_runtime(self) -> Optional[ReviewRuntime]:
-        ollama_models = self._installed_ollama_models()
-        if settings.is_high_quality_lowmem_mode():
-            if self.review_asset.installed:
-                return ReviewRuntime(
-                    backend=settings.REVIEW_BACKEND.lower().strip(),
-                    model_id=self.review_asset.model_id,
-                    asset=self.review_asset,
-                    tier="local_review",
-                )
-            if settings.LOWMEM_ENABLE_LOCAL_REVIEW_FALLBACK and self.fallback_asset.installed:
-                return ReviewRuntime(
-                    backend=settings.REVIEW_MODEL_FALLBACK_BACKEND.lower().strip(),
-                    model_id=self.fallback_asset.model_id,
-                    asset=self.fallback_asset,
-                    fallback=True,
-                    tier="local_review_fallback",
-                )
-            ollama_model = self._select_ollama_review_model(ollama_models)
-            if ollama_model:
-                return ReviewRuntime(backend="ollama", model_id=ollama_model, tier="fast_primary")
-            return None
-
-        ollama_model = self._select_ollama_review_model(ollama_models)
-        if ollama_model:
-            tier = "mid_review" if settings.is_mid_review_ollama_model(ollama_model) else "fast_primary"
-            return ReviewRuntime(backend="ollama", model_id=ollama_model, tier=tier)
         if self.review_asset.installed:
             return ReviewRuntime(
                 backend=settings.REVIEW_BACKEND.lower().strip(),
@@ -700,7 +1037,10 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
                 asset=self.review_asset,
                 tier="local_review",
             )
-        if self.fallback_asset.installed:
+        if self.fallback_asset.installed and (
+            not settings.is_high_quality_lowmem_mode()
+            or settings.LOWMEM_ENABLE_LOCAL_REVIEW_FALLBACK
+        ):
             return ReviewRuntime(
                 backend=settings.REVIEW_MODEL_FALLBACK_BACKEND.lower().strip(),
                 model_id=self.fallback_asset.model_id,
@@ -726,100 +1066,56 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
         return None
 
     def _select_runtime_for_snippet(self, snippet: RiskSnippet) -> Optional[ReviewRuntime]:
-        if snippet.snippet_type != "quality_gate_block":
-            return self._select_review_runtime()
-        return self._select_quality_gate_runtime()
+        return self._select_review_runtime()
 
-    def _select_quality_gate_runtime(self) -> Optional[ReviewRuntime]:
-        base_runtime = self._select_review_runtime()
-        if settings.is_high_quality_lowmem_mode():
-            if base_runtime is None:
-                return None
-            return ReviewRuntime(
-                backend=base_runtime.backend,
-                model_id=base_runtime.model_id,
-                asset=base_runtime.asset,
-                fallback=base_runtime.fallback,
-                tier="quality_gate_high_precision",
+    @staticmethod
+    def _dedupe_results(results: list[RecognizerResult]) -> list[RecognizerResult]:
+        deduped: list[RecognizerResult] = []
+        index_by_key: dict[tuple[str, int, int, str], int] = {}
+        for item in sorted(results, key=lambda result: (result.start, result.end, result.entity_type, result.text)):
+            key = (item.entity_type, int(item.start), int(item.end), item.text)
+            if key in index_by_key:
+                existing_index = index_by_key[key]
+                existing = deduped[existing_index]
+                existing_metadata = dict(existing.metadata or {})
+                item_metadata = dict(item.metadata or {})
+                if item_metadata.get("entity_decision") and not existing_metadata.get("entity_decision"):
+                    deduped[existing_index] = item
+                continue
+            index_by_key[key] = len(deduped)
+            deduped.append(item)
+        return deduped
+
+    @staticmethod
+    def _dedupe_rejections(rejections: list[Dict]) -> list[Dict]:
+        deduped: list[Dict] = []
+        index_by_key: dict[tuple[str, str, int, int], int] = {}
+        for item in rejections:
+            key = (
+                str(item.get("type") or "").upper(),
+                str(item.get("text") or ""),
+                int(item.get("start") or 0),
+                int(item.get("end") or 0),
             )
-        installed_models = self._installed_ollama_models()
-
-        for candidate in (
-            settings.HEAVY_ARBITRATION_MODEL,
-            settings.MID_REVIEW_MODEL,
-            settings.MID_REVIEW_FALLBACK_MODEL,
-        ):
-            normalized = str(candidate or "").strip()
-            if normalized and normalized in installed_models:
-                return ReviewRuntime(
-                    backend="ollama",
-                    model_id=normalized,
-                    tier="quality_gate_high_precision",
+            if key in index_by_key:
+                existing_index = index_by_key[key]
+                existing = deduped[existing_index]
+                existing_rank = (
+                    int(bool(existing.get("entity_decision"))) * 2
+                    + int(bool(existing.get("deterministic_entity_decision")))
+                    + int(bool(existing.get("deterministic_review")))
                 )
-
-        for model_name in settings.get_ollama_model_options(available_models=list(installed_models)):
-            if model_name in installed_models and settings.is_review_capable_ollama_model(model_name):
-                return ReviewRuntime(
-                    backend="ollama",
-                    model_id=model_name,
-                    tier="quality_gate_high_precision",
+                item_rank = (
+                    int(bool(item.get("entity_decision"))) * 2
+                    + int(bool(item.get("deterministic_entity_decision")))
+                    + int(bool(item.get("deterministic_review")))
                 )
-        return base_runtime
-
-    def _installed_ollama_models(self) -> set[str]:
-        try:
-            with httpx.Client(timeout=2.5) as client:
-                response = client.get(f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/tags")
-                response.raise_for_status()
-                data = response.json()
-        except Exception:
-            return set()
-        models = data.get("models") if isinstance(data, dict) else []
-        installed: set[str] = set()
-        for item in models or []:
-            if not isinstance(item, dict):
+                if item_rank > existing_rank:
+                    deduped[existing_index] = item
                 continue
-            name = str(item.get("name") or item.get("model") or "").strip()
-            if name:
-                installed.add(name)
-        return installed
-
-    def _select_ollama_review_model(self, installed_models: set[str]) -> Optional[str]:
-        if not installed_models:
-            return None
-        if settings.is_high_quality_lowmem_mode() and not settings.LOWMEM_ALLOW_MID_REVIEW_MODEL:
-            for candidate in settings.get_lowmem_ollama_review_candidates(
-                available_models=list(installed_models)
-            ):
-                if candidate in installed_models:
-                    return candidate
-            return None
-        exact_priority = [
-            settings.MID_REVIEW_MODEL,
-            settings.MID_REVIEW_FALLBACK_MODEL,
-            settings.FAST_REVIEW_MODEL,
-            settings.get_effective_ollama_model(),
-        ]
-        for candidate in exact_priority:
-            if candidate in installed_models:
-                return candidate
-        for model_name in settings.get_ollama_model_options(available_models=list(installed_models)):
-            if model_name not in installed_models:
-                continue
-            if settings.is_mid_review_ollama_model(model_name) or settings.is_fast_primary_ollama_model(model_name):
-                return model_name
-        return None
-
-    def _select_ollama_arbitration_model(self) -> Optional[str]:
-        if settings.is_high_quality_lowmem_mode() and not settings.LOWMEM_ENABLE_HEAVY_ARBITRATION:
-            return None
-        installed = self._installed_ollama_models()
-        if settings.HEAVY_ARBITRATION_MODEL in installed:
-            return settings.HEAVY_ARBITRATION_MODEL
-        for model_name in settings.get_ollama_model_options(available_models=list(installed)):
-            if model_name in installed and settings.is_heavy_arbitration_ollama_model(model_name):
-                return model_name
-        return None
+            index_by_key[key] = len(deduped)
+            deduped.append(item)
+        return deduped
 
     def _build_prompt(
         self,
@@ -829,46 +1125,62 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
         short: bool = False,
         allow_thinking: bool = False,
     ) -> str:
-        snippet_text = snippet.text[: min(settings.REVIEW_MAX_CHARS_PER_SNIPPET, 900)]
-        existing_json = json.dumps(existing_entities or [], ensure_ascii=False)
+        quality_gate = False
+        prompt_budget = _review_prompt_char_budget(
+            quality_gate=quality_gate,
+            allow_thinking=allow_thinking,
+        )
+        snippet_limit = int(settings.REVIEW_MAX_CHARS_PER_SNIPPET or 1200)
+        snippet_text = _compact_prompt_text(str(snippet.text or ""), min(snippet_limit, max(320, prompt_budget // 3)))
+        existing_payload = self._compact_existing_entities_for_prompt(
+            existing_entities or [],
+            max_items=16,
+            char_budget=max(520, prompt_budget // 3),
+        )
+        existing_json = json.dumps(existing_payload, ensure_ascii=False, separators=(",", ":"))
         short_org_hints = self._format_short_org_action_hints(snippet_text)
         thinking_prefix = "" if allow_thinking else "/no_think\n"
-        if snippet.snippet_type == "quality_gate_block":
-            if short:
-                return (
-                    f"{thinking_prefix}只输出 JSON。你在做最终高精度脱敏审查，必须逐一复核已识别实体，"
-                    "对明显错误项必须输出到 rejects，不能沉默；对真实敏感实体必须输出到 entities。"
-                    "重点发现：身份指代词/职务词误识别、公司与人名错分、吞句案号、只出现简称的公司漏识别。"
-                    "对只出现简称但承担履约、结算、付款、收款、供货、交付、承担责任等组织动作的 2-6 字主体，"
-                    "优先输出 ORGANIZATION。金额和日期默认不脱敏。\n"
-                    f"{short_org_hints}"
-                    f"已识别（必须逐一复核）：{existing_json}\n"
-                    f"片段：\n{snippet_text}\n"
-                    "格式：{\"entities\":[{\"type\":\"ORGANIZATION\",\"text\":\"某某公司\"}],"
-                    "\"rejects\":[{\"type\":\"ORGANIZATION\",\"text\":\"控告人\",\"reason\":\"身份指代词\"}]}\n"
-                )
-            return (
-                thinking_prefix
-                + self.QUALITY_GATE_PROMPT_TEMPLATE.format(
-                    snippet_type=snippet.snippet_type,
-                    snippet_text=snippet_text,
-                    existing_entities=existing_json,
-                )
-                + short_org_hints
-            )
         if short:
-            return (
+            prompt = (
                 f"{thinking_prefix}只输出 JSON。重新检查片段：entities 输出真实敏感实体，rejects 输出已识别里的明显错误。"
                 "即使已识别实体正确，也要在 entities 再输出确认。text 必须来自原文。"
+                "对已识别实体必须用 entity_decisions 裁决：keep/reject/trim_to/split_into。"
+                "候选以“通过/经过/根据/依据/由/向/对/与/和”等前置功能词开头时，必须排除前缀功能词；"
+                "后半段是完整主体则 trim_to 后半段，后半段不是完整主体或只是泛称则 reject。"
+                "动作词在主体名称中间时才 keep。"
                 "不要抽取国家/中华人民共和国/人民共和国/法定代表人/委托代理人/技术人员/我中心/"
                 "一审法院/二审法院/本院/法院/地址/合同期限/三个/五个；具体日期值不要放入 rejects。\n"
                 f"{short_org_hints}"
                 f"已识别（可能有错）：{existing_json}\n"
                 f"片段：\n{snippet_text}\n"
                 "格式：{\"entities\":[{\"type\":\"ORGANIZATION\",\"text\":\"某某公司\"}],"
-                "\"rejects\":[{\"type\":\"ORGANIZATION\",\"text\":\"国家\",\"reason\":\"普通词\"}]}\n"
+                "\"rejects\":[{\"type\":\"ORGANIZATION\",\"text\":\"国家\",\"reason\":\"普通词\"}],"
+                "\"entity_decisions\":[{\"text\":\"通过某某公司\",\"type\":\"ORGANIZATION\","
+                "\"action\":\"trim_to\",\"trim_to\":\"某某公司\",\"reason\":\"去掉开头功能词\"}]}\n"
             )
-        return (
+            return self._fit_prompt_to_review_budget(
+                prompt,
+                quality_gate=quality_gate,
+                allow_thinking=allow_thinking,
+            )
+        compact_prompt = (
+            thinking_prefix
+            + "你是中文合同/法律文书脱敏复核模型。只输出 JSON。\n"
+            + "任务：根据片段原文输出真实敏感 entities，并把已识别实体中的明显错误放入 rejects。"
+            + "同时用 entity_decisions 逐项裁决已识别实体，action 只能是 keep/reject/trim_to/split_into。"
+            + "候选以“通过/经过/根据/依据/由/向/对/与/和”等前置功能词开头时，必须排除前缀功能词；后半段是完整主体则 trim_to 后半段，后半段不是完整主体或只是泛称则 reject；动作词在主体名称中间时才 keep。"
+            + "text 必须来自片段连续原文；身份词/职务词/标签词/普通词不要当实体；金额和日期默认不脱敏。"
+            + "2-6字简称在履约/结算/付款/签章语境中按 ORGANIZATION 重点审查。\n"
+            + f"片段类型：{snippet.snippet_type}\n"
+            + f"已识别实体：{existing_json}\n"
+            + f"片段开始：\n{snippet_text}\n片段结束。\n"
+            + "JSON 格式：{\"entities\":[{\"type\":\"ORGANIZATION\",\"text\":\"某某公司\"}],"
+            + "\"rejects\":[{\"type\":\"ORGANIZATION\",\"text\":\"国家\",\"reason\":\"普通词\"}],"
+            + "\"entity_decisions\":[{\"text\":\"通过某某公司\",\"type\":\"ORGANIZATION\","
+            + "\"action\":\"trim_to\",\"trim_to\":\"某某公司\",\"reason\":\"去掉开头功能词\"}]}\n"
+            + short_org_hints
+        )
+        long_prompt = (
             thinking_prefix
             + self.PROMPT_TEMPLATE.format(
                 snippet_type=snippet.snippet_type,
@@ -877,6 +1189,58 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
             )
             + short_org_hints
         )
+        prompt = compact_prompt if len(long_prompt) > prompt_budget else long_prompt
+        return self._fit_prompt_to_review_budget(
+            prompt,
+            quality_gate=quality_gate,
+            allow_thinking=allow_thinking,
+        )
+
+    @staticmethod
+    def _compact_existing_entities_for_prompt(
+        entities: Iterable[dict],
+        *,
+        max_items: int,
+        char_budget: int,
+    ) -> list[dict]:
+        compacted: list[dict] = []
+        used_chars = 2
+        ordered_entities = sorted(
+            [item for item in entities or [] if isinstance(item, dict)],
+            key=lambda item: (
+                -QwenFragmentReviewService._existing_entity_suspicion_score(item),
+                int(item.get("start") or 0),
+                int(item.get("end") or 0),
+            ),
+        )
+        for item in ordered_entities:
+            if not isinstance(item, dict):
+                continue
+            payload = {
+                "type": str(item.get("type") or item.get("entity_type") or "").upper(),
+                "text": str(item.get("text") or "")[:80],
+                "start": int(item.get("start") or 0),
+                "end": int(item.get("end") or 0),
+            }
+            role = str(item.get("role") or "").strip()
+            if role:
+                payload["role"] = role[:20]
+            encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            if compacted and (len(compacted) >= max_items or used_chars + len(encoded) > char_budget):
+                break
+            compacted.append(payload)
+            used_chars += len(encoded) + 1
+        return compacted
+
+    @staticmethod
+    def _fit_prompt_to_review_budget(
+        prompt: str,
+        *,
+        quality_gate: bool,
+        allow_thinking: bool,
+    ) -> str:
+        budget = _review_prompt_char_budget(quality_gate=quality_gate, allow_thinking=allow_thinking)
+        return _compact_prompt_text(prompt, budget)
 
     @classmethod
     def _collect_short_org_action_candidates(cls, snippet_text: str) -> list[str]:
@@ -914,6 +1278,8 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
     @classmethod
     def _short_org_candidate_is_usable(cls, normalized: str) -> bool:
         if not normalized:
+            return False
+        if is_non_subject_action_or_function_term(normalized):
             return False
         if not 2 <= len(normalized) <= 8:
             return False
@@ -1003,7 +1369,6 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
                 if (
                     not normalized
                     or normalized in local_seen
-                    or cls._is_noisy_short_org_candidate(normalized)
                     or not cls._looks_like_short_org_list_item(candidate)
                 ):
                     continue
@@ -1059,7 +1424,7 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
 
     @classmethod
     def _trim_short_org_list_item(cls, value: str) -> str:
-        candidate = cls._trim_short_org_candidate_core(value)
+        candidate = clean_candidate_text(value)
         candidate = cls.SHORT_ORG_LIST_SUFFIX_NOISE_PATTERN.sub("", candidate).strip(" \t\r\n:：,，;；。()（）")
         return candidate
 
@@ -1095,6 +1460,8 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
         suffix_text: str = "",
     ) -> bool:
         if not normalized:
+            return True
+        if is_non_subject_action_or_function_term(normalized):
             return True
         if normalized in cls.SHORT_ORG_EXACT_NOISE_TERMS:
             return True
@@ -1150,6 +1517,9 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
         normalized = normalize_entity_text(cls._strip_narrative_prefixes(value))
         if not normalized:
             return ""
+        bounded = find_short_org_prefix_before_non_subject_boundary(normalized)
+        if bounded is not None and bounded[0] == 0 and bounded[1] > bounded[0]:
+            return normalized[bounded[0] : bounded[1]]
 
         previous = None
         while normalized and normalized != previous:
@@ -1190,80 +1560,309 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
 
         return normalized.strip()
 
-    def _build_arbitration_prompt(
+    def _build_review_prompt_for_snippet(
         self,
         snippet: RiskSnippet,
         *,
         existing_entities: Optional[list[dict]] = None,
+        short: bool = False,
+        allow_thinking: bool = False,
     ) -> str:
-        thinking = "/think" if self._arbitration_thinking_enabled() else "/no_think"
-        snippet_text = snippet.text[: min(settings.REVIEW_MAX_CHARS_PER_SNIPPET, 900)]
-        existing_json = json.dumps(existing_entities or [], ensure_ascii=False)
-        return (
-            f"{thinking}\n"
-            "你是中文合同/法律文书脱敏疑难仲裁模型。只输出 JSON，不要解释。\n"
-            "任务：仅根据片段原文和已识别实体，处理质量闸失败证据。"
-            "只允许三类结论：补充应脱敏实体到 entities，确认误识别到 rejects，"
-            "或在无法判断时设置 requires_manual_review=true。\n"
-            "不得全文扩写，不得编造原文不存在的 text。金额和日期默认不脱敏。\n"
-            "片段类型："
-            f"{snippet.snippet_type}\n"
-            "风险原因："
-            f"{snippet.risk_reason}\n"
-            f"已识别实体：{existing_json}\n"
-            f"片段：\n{snippet_text}\n"
-            "JSON 格式：{\"entities\":[{\"type\":\"ORGANIZATION\",\"text\":\"某某公司\",\"role\":\"甲方\"}],"
-            "\"rejects\":[{\"type\":\"ORGANIZATION\",\"text\":\"地址\",\"reason\":\"普通词\"}],"
-            "\"requires_manual_review\":false}\n"
+        if self._is_ledger_adjudication_snippet(snippet):
+            return self._build_ledger_adjudication_prompt(
+                snippet,
+                existing_entities=existing_entities,
+                allow_thinking=allow_thinking,
+            )
+        return self._build_prompt(
+            snippet,
+            existing_entities=existing_entities,
+            short=short,
+            allow_thinking=allow_thinking,
         )
 
     @staticmethod
-    def _review_thinking_enabled(runtime: ReviewRuntime | None) -> bool:
-        if runtime is None or runtime.backend.lower().strip() != "ollama":
-            return False
-        if runtime.tier == "quality_gate_high_precision":
-            return True
-        mode = str(settings.REVIEW_THINKING_MODE or "").strip().lower()
-        if mode in {"", "off", "false", "0", "none", "disabled"}:
-            return False
-        if mode in {"on", "true", "1", "all", "review", "mid_review", "middle"}:
-            return runtime.tier == "mid_review"
-        return False
+    def _is_ledger_adjudication_snippet(snippet: RiskSnippet) -> bool:
+        return (
+            str(snippet.snippet_type or "") == "ledger_conflict_adjudication"
+            or str(snippet.risk_reason or "").startswith("subject_ledger:")
+        )
+
+    def _build_ledger_adjudication_prompt(
+        self,
+        snippet: RiskSnippet,
+        *,
+        existing_entities: Optional[list[dict]] = None,
+        allow_thinking: bool = False,
+    ) -> str:
+        thinking = "/think" if allow_thinking else "/no_think"
+        prompt_budget = _review_prompt_char_budget(quality_gate=False, allow_thinking=allow_thinking)
+        snippet_text = _compact_prompt_text(
+            str(snippet.text or ""),
+            min(int(settings.REVIEW_MAX_CHARS_PER_SNIPPET or 900), max(320, prompt_budget // 3)),
+        )
+        target_entity = getattr(snippet, "target_entity", None)
+        target_payload = target_entity if isinstance(target_entity, dict) else {}
+        target_metadata = (
+            target_payload.get("metadata")
+            if isinstance(target_payload.get("metadata"), dict)
+            else {}
+        )
+        edge_id = str(target_metadata.get("subject_ledger_edge_id") or "").strip()
+        source_subject_id = str(target_metadata.get("subject_ledger_subject_id") or "").strip()
+        target_subject_id = str(target_metadata.get("subject_ledger_edge_target_subject_id") or "").strip()
+        target_canonical_text = str(target_metadata.get("subject_ledger_edge_target_canonical_text") or "").strip()
+        edge_relation = str(target_metadata.get("subject_ledger_edge_relation") or "").strip()
+        target_json = json.dumps(target_payload, ensure_ascii=False, separators=(",", ":"))
+        existing_payload = self._compact_existing_entities_for_prompt(
+            existing_entities or [],
+            max_items=8,
+            char_budget=max(280, prompt_budget // 4),
+        )
+        existing_json = json.dumps(existing_payload, ensure_ascii=False, separators=(",", ":"))
+        if edge_id and target_subject_id:
+            task_line = (
+                "任务：只裁决这一条 ledger identity edge，不做全文补漏，不发明主体，不改无关实体。"
+                "判断 source_subject 是否与 target_subject 是同一主体。\n"
+                f"edge：edge_id={edge_id}，relation={edge_relation}，"
+                f"source_subject_id={source_subject_id}，target_subject_id={target_subject_id}，"
+                f"target_canonical_text={target_canonical_text}\n"
+            )
+            schema = (
+                "JSON 格式：{\"decisions\":[{\"decision_scope\":\"edge\","
+                "\"edge_id\":\"E00001\",\"occurrence_id\":\"O00001:0:2:ORGANIZATION\","
+                "\"source_subject_id\":\"S00002\",\"target_subject_id\":\"S00001\","
+                "\"subject_id\":\"S00002\",\"action\":\"merge_to_canonical\","
+                "\"canonical_subject_id\":\"S00001\",\"confidence\":0.86,"
+                "\"reason\":\"上下文证明 source 是 target 简称\"}],"
+                "\"requires_manual_review\":false}\n"
+            )
+        else:
+            task_line = "任务：只裁决 target_entity 这一条 ledger 候选，不做全文补漏，不发明主体，不改无关实体。\n"
+            schema = (
+                "JSON 格式：{\"decisions\":[{\"occurrence_id\":\"O00001:0:2:ORGANIZATION\","
+                "\"subject_id\":\"S00001\",\"action\":\"confirm\",\"canonical_subject_id\":\"S00001\","
+                "\"confidence\":0.86,\"reason\":\"片段中承担付款主体动作\"}],\"requires_manual_review\":false}\n"
+            )
+        prompt = (
+            f"{thinking}\n"
+            "你是中文合同脱敏主体台账冲突裁决模型。只输出 JSON，不要解释。\n"
+            f"{task_line}"
+            "可选 action 只能是 confirm、merge_to_canonical、keep_separate、reject、manual_review。\n"
+            "confirm：该候选本身是应脱敏主体，但不改变现有主体归属；"
+            "merge_to_canonical：source_subject 与 target_subject 是同一主体，合并到 canonical_subject_id/target_subject_id；"
+            "keep_separate：source_subject 是应脱敏主体但与 target_subject 不是同一主体；"
+            "reject：该候选不是敏感实体；manual_review：证据不足。\n"
+            "当存在 edge_id 时，必须返回 decision_scope=edge、edge_id、source_subject_id、target_subject_id；"
+            "只有能证明同一主体时才使用 merge_to_canonical，否则使用 keep_separate 或 manual_review。\n"
+            "短组织简称只有在承担签约、履约、付款、收款、结算、交付、施工、对账、盖章、落款等主体动作，"
+            "或与 canonical_text 明显共享商业核心时，才能 confirm 或 merge_to_canonical。\n"
+            "不要输出 entities；如需拒绝，使用 decisions action=reject，不要使用 rejects。\n"
+            f"风险原因：{snippet.risk_reason}\n"
+            f"target_entity：{target_json}\n"
+            f"附近已识别实体：{existing_json}\n"
+            f"片段：\n{snippet_text}\n"
+            f"{schema}"
+        )
+        return self._fit_prompt_to_review_budget(
+            prompt,
+            quality_gate=False,
+            allow_thinking=allow_thinking,
+        )
 
     @staticmethod
-    def _arbitration_thinking_enabled() -> bool:
-        return str(settings.REVIEW_THINKING_MODE or "").strip().lower() in {
-            "on",
-            "true",
-            "1",
-            "all",
-            "arbitration",
-            "heavy",
+    def _materialize_ledger_decisions(
+        payload: Dict[str, Any],
+        snippet: RiskSnippet,
+        existing_entities: list[dict],
+    ) -> list[Dict[str, Any]]:
+        target_entity = getattr(snippet, "target_entity", None)
+        target = target_entity if isinstance(target_entity, dict) else {}
+        fallback_existing = existing_entities[0] if existing_entities else {}
+        target_metadata = target.get("metadata") if isinstance(target.get("metadata"), dict) else {}
+        if not target_metadata and isinstance(fallback_existing.get("metadata"), dict):
+            target_metadata = fallback_existing.get("metadata") or {}
+        allowed_actions = {"confirm", "merge_to_canonical", "keep_separate", "reject", "manual_review"}
+        rows = payload.get("decisions")
+        if not isinstance(rows, list):
+            rows = []
+        if not rows and payload.get("action"):
+            rows = [payload]
+        decisions: list[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            action = str(row.get("action") or "").strip().lower()
+            if action not in allowed_actions:
+                action = "manual_review"
+            edge_id = str(
+                row.get("edge_id")
+                or target_metadata.get("subject_ledger_edge_id")
+                or ""
+            ).strip()
+            source_subject_id = str(
+                row.get("source_subject_id")
+                or target_metadata.get("subject_ledger_subject_id")
+                or ""
+            ).strip()
+            target_subject_id = str(
+                row.get("target_subject_id")
+                or target_metadata.get("subject_ledger_edge_target_subject_id")
+                or ""
+            ).strip()
+            edge_relation = str(
+                row.get("edge_relation")
+                or row.get("relation")
+                or target_metadata.get("subject_ledger_edge_relation")
+                or ""
+            ).strip()
+            occurrence_id = str(
+                row.get("occurrence_id")
+                or target_metadata.get("subject_ledger_occurrence_id")
+                or ""
+            ).strip()
+            subject_id = str(
+                row.get("subject_id")
+                or source_subject_id
+                or target_metadata.get("subject_ledger_subject_id")
+                or ""
+            ).strip()
+            canonical_subject_id = str(
+                row.get("canonical_subject_id")
+                or (target_subject_id if action == "merge_to_canonical" else "")
+                or source_subject_id
+                or target_metadata.get("subject_ledger_subject_id")
+                or ""
+            ).strip()
+            if edge_id and action == "confirm" and source_subject_id:
+                canonical_subject_id = source_subject_id
+            decisions.append(
+                {
+                    "decision_scope": "edge" if edge_id else str(row.get("decision_scope") or "occurrence"),
+                    "edge_id": edge_id,
+                    "source_subject_id": source_subject_id,
+                    "target_subject_id": target_subject_id,
+                    "edge_relation": edge_relation,
+                    "occurrence_id": occurrence_id,
+                    "subject_id": subject_id,
+                    "action": action,
+                    "canonical_subject_id": canonical_subject_id,
+                    "confidence": QwenFragmentReviewService._coerce_confidence(row.get("confidence")),
+                    "reason": str(row.get("reason") or "").strip(),
+                    "requires_manual_review": bool(row.get("requires_manual_review")) or action == "manual_review",
+                    "text": str(target.get("text") or fallback_existing.get("text") or ""),
+                    "type": str(target.get("type") or fallback_existing.get("type") or "").upper(),
+                    "start": int(target.get("start") or fallback_existing.get("start") or 0),
+                    "end": int(target.get("end") or fallback_existing.get("end") or 0),
+                    "source": target.get("source") or fallback_existing.get("source"),
+                }
+            )
+        if not decisions and payload.get("requires_manual_review"):
+            decisions.append(
+                {
+                    "decision_scope": "edge" if target_metadata.get("subject_ledger_edge_id") else "occurrence",
+                    "edge_id": str(target_metadata.get("subject_ledger_edge_id") or ""),
+                    "source_subject_id": str(target_metadata.get("subject_ledger_subject_id") or ""),
+                    "target_subject_id": str(target_metadata.get("subject_ledger_edge_target_subject_id") or ""),
+                    "edge_relation": str(target_metadata.get("subject_ledger_edge_relation") or ""),
+                    "occurrence_id": str(target_metadata.get("subject_ledger_occurrence_id") or ""),
+                    "subject_id": str(target_metadata.get("subject_ledger_subject_id") or ""),
+                    "action": "manual_review",
+                    "canonical_subject_id": str(
+                        target_metadata.get("subject_ledger_edge_target_subject_id")
+                        or target_metadata.get("subject_ledger_subject_id")
+                        or ""
+                    ),
+                    "confidence": 0.0,
+                    "reason": "model_requires_manual_review",
+                    "requires_manual_review": True,
+                    "text": str(target.get("text") or fallback_existing.get("text") or ""),
+                    "type": str(target.get("type") or fallback_existing.get("type") or "").upper(),
+                    "start": int(target.get("start") or fallback_existing.get("start") or 0),
+                    "end": int(target.get("end") or fallback_existing.get("end") or 0),
+                    "source": target.get("source") or fallback_existing.get("source"),
+                }
+            )
+        return decisions
+
+    @staticmethod
+    def _fallback_ledger_decision(
+        snippet: RiskSnippet,
+        existing_entities: list[dict],
+        *,
+        reason: str,
+    ) -> Dict[str, Any]:
+        target_entity = getattr(snippet, "target_entity", None)
+        target = target_entity if isinstance(target_entity, dict) else {}
+        fallback_existing = existing_entities[0] if existing_entities else {}
+        target_metadata = target.get("metadata") if isinstance(target.get("metadata"), dict) else {}
+        if not target_metadata and isinstance(fallback_existing.get("metadata"), dict):
+            target_metadata = fallback_existing.get("metadata") or {}
+        edge_id = str(target_metadata.get("subject_ledger_edge_id") or "").strip()
+        source_subject_id = str(target_metadata.get("subject_ledger_subject_id") or "").strip()
+        target_subject_id = str(target_metadata.get("subject_ledger_edge_target_subject_id") or "").strip()
+        occurrence_id = str(target_metadata.get("subject_ledger_occurrence_id") or "").strip()
+        subject_id = source_subject_id or str(target_metadata.get("subject_ledger_subject_id") or "").strip()
+        return {
+            "decision_scope": "edge" if edge_id else "occurrence",
+            "edge_id": edge_id,
+            "source_subject_id": source_subject_id,
+            "target_subject_id": target_subject_id,
+            "edge_relation": str(target_metadata.get("subject_ledger_edge_relation") or ""),
+            "occurrence_id": occurrence_id,
+            "subject_id": subject_id,
+            "action": "manual_review",
+            "canonical_subject_id": target_subject_id or subject_id,
+            "confidence": 0.0,
+            "reason": str(reason or "ledger_review_requires_manual_review"),
+            "requires_manual_review": True,
+            "text": str(target.get("text") or fallback_existing.get("text") or ""),
+            "type": str(target.get("type") or fallback_existing.get("type") or "").upper(),
+            "start": int(target.get("start") or fallback_existing.get("start") or 0),
+            "end": int(target.get("end") or fallback_existing.get("end") or 0),
+            "source": target.get("source") or fallback_existing.get("source"),
         }
 
     @staticmethod
-    def _select_arbitration_snippets(
-        snippets: Iterable[RiskSnippet],
-        *,
-        parsed_snippet_count: int,
-        review_error: Optional[str],
-    ) -> list[RiskSnippet]:
-        snippet_list = list(snippets)
-        if not snippet_list:
-            return []
-        trigger_types = {"conflict_block", "ocr_anomaly_block"}
-        trigger_reasons = {"uie_ner_overlap_conflict", "long_document_low_entity_density"}
-        selected = [
-            snippet
-            for snippet in snippet_list
-            if snippet.snippet_type in trigger_types
-            or snippet.risk_reason in trigger_reasons
-            or "conflict" in snippet.risk_reason
-            or "low_entity_density" in snippet.risk_reason
-        ]
-        if review_error or parsed_snippet_count == 0:
-            selected = selected or snippet_list[: max(1, settings.HEAVY_ARBITRATION_MAX_SNIPPETS)]
-        return selected[: max(1, settings.HEAVY_ARBITRATION_MAX_SNIPPETS)]
+    def _ledger_decision_rejections(
+        decisions: list[Dict[str, Any]],
+        existing_entities: list[dict],
+    ) -> list[Dict[str, Any]]:
+        rejected: list[Dict[str, Any]] = []
+        for decision in decisions:
+            if decision.get("action") != "reject":
+                continue
+            target = None
+            occurrence_id = str(decision.get("occurrence_id") or "")
+            for existing in existing_entities:
+                metadata = existing.get("metadata") if isinstance(existing.get("metadata"), dict) else {}
+                if occurrence_id and metadata.get("subject_ledger_occurrence_id") == occurrence_id:
+                    target = existing
+                    break
+            target = target or decision
+            rejected.append(
+                {
+                    "text": str(target.get("text") or ""),
+                    "type": str(target.get("type") or "").upper(),
+                    "start": int(target.get("start") or 0),
+                    "end": int(target.get("end") or 0),
+                    "source": target.get("source"),
+                    "reason": str(decision.get("reason") or "ledger_adjudication_reject"),
+                    "ledger_decision": dict(decision),
+                }
+            )
+        return rejected
+
+    @staticmethod
+    def _coerce_confidence(value: Any) -> float:
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _review_thinking_enabled(runtime: ReviewRuntime | None) -> bool:
+        return False
 
     @staticmethod
     def _entities_for_snippet(
@@ -1273,6 +1872,28 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
         limit: int = 24,
         mode: str = "standard",
     ) -> list[dict]:
+        target_entity = getattr(snippet, "target_entity", None)
+        if isinstance(target_entity, dict) and target_entity:
+            return [
+                {
+                    "type": str(target_entity.get("type") or target_entity.get("entity_type") or "").upper(),
+                    "text": str(target_entity.get("text") or ""),
+                    "start": int(target_entity.get("start") or 0),
+                    "end": int(target_entity.get("end") or 0),
+                    "source": target_entity.get("source"),
+                    "metadata": dict(target_entity.get("metadata") or {}),
+                    "role": (
+                        (target_entity.get("metadata") or {}).get("role")
+                        if isinstance(target_entity.get("metadata"), dict)
+                        else None
+                    )
+                    or (
+                        (target_entity.get("metadata") or {}).get("label")
+                        if isinstance(target_entity.get("metadata"), dict)
+                        else None
+                    ),
+                }
+            ]
         items: list[dict] = []
         for entity in entities:
             overlap = entity.start < snippet.end and entity.end > snippet.start
@@ -1285,6 +1906,7 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
                         "start": entity.start,
                         "end": entity.end,
                         "source": entity.source,
+                        "metadata": dict(entity.metadata or {}),
                         "role": (entity.metadata or {}).get("role") or (entity.metadata or {}).get("label"),
                     }
                 )
@@ -1312,22 +1934,22 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
             score += 100
         if normalized in QwenFragmentReviewService.NON_ENTITY_TERMS:
             score += 100
-        if entity_type in {"CASE_NO", "CONTRACT_NO"} and (
-            len(normalized) > (48 if entity_type == "CASE_NO" else 80)
-            or any(token in normalized for token in ("上诉人", "被上诉人", "不服", "提起上诉", "事实与理由", "以下简称"))
-        ):
-            score += 90
-        if entity_type in {"PERSON", "PERSON_NAME"} and is_org_like_text(normalized):
+        if entity_type == "PERSON" and is_org_like_text(normalized):
             score += 85
-        if entity_type in {"ORGANIZATION", "COMPANY_NAME"} and is_probable_person(normalized):
+        if entity_type in {"ORGANIZATION", "GOVERNMENT"} and is_probable_person(normalized):
             score += 80
-        if entity_type == "COURT" and normalized in {"法院", "人民法院", "一审法院", "二审法院", "本院", "贵院"}:
+        if entity_type == "GOVERNMENT" and normalized in {"法院", "人民法院", "一审法院", "二审法院", "本院", "贵院"}:
             score += 90
-        if entity_type in {"ORGANIZATION", "COMPANY_NAME"} and len(normalized) > 18 and any(
-            token in normalized for token in ("不服", "请求", "认为", "提交", "证明", "承担责任")
+        if entity_type in {"ORGANIZATION", "GOVERNMENT"} and len(normalized) > 18 and any(
+            token in normalized for token in ("不服", "请求", "认为", "提交", "证明", "承担责任", "通过", "经过", "根据", "依据")
         ):
             score += 70
-        if entity_type in {"ORGANIZATION", "COMPANY_NAME"} and looks_like_organization_short_name(normalized):
+        if entity_type in {"ORGANIZATION", "GOVERNMENT"} and any(
+            normalized.startswith(prefix)
+            for prefix in ("通过", "经过", "根据", "依据", "按照", "由", "向", "对", "与", "和")
+        ):
+            score += 90
+        if entity_type in {"ORGANIZATION", "GOVERNMENT"} and looks_like_organization_short_name(normalized):
             score += 25
         return score
 
@@ -1339,15 +1961,6 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
         allow_thinking: bool = False,
         max_tokens: Optional[int] = None,
     ) -> str:
-        if runtime.backend.lower().strip() == "ollama":
-            return await self._invoke_with_optional_max_tokens(
-                self._review_with_ollama,
-                prompt,
-                model_id=runtime.model_id,
-                allow_thinking=allow_thinking,
-                max_tokens=max_tokens,
-                tier=runtime.tier,
-            )
         if runtime.asset is None:
             raise RuntimeError("review_model_not_installed")
         return await self._review_with_backend(
@@ -1403,47 +2016,6 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
             if "max_tokens" not in str(exc):
                 raise
             return await func(*args, **kwargs)
-
-    async def _review_with_ollama(
-        self,
-        prompt: str,
-        *,
-        model_id: str,
-        allow_thinking: bool = False,
-        max_tokens: Optional[int] = None,
-        tier: str = "local",
-    ) -> str:
-        token_limit = int(max_tokens or (settings.REVIEW_THINKING_MAX_TOKENS if allow_thinking else settings.REVIEW_MAX_TOKENS))
-        payload = {
-            "model": model_id,
-            "prompt": prompt,
-            "stream": False,
-            "keep_alive": "1m",
-            "think": bool(allow_thinking),
-            "options": {
-                "num_ctx": settings.REVIEW_NUM_CTX,
-                "num_predict": token_limit,
-                "temperature": settings.REVIEW_TEMPERATURE,
-            },
-        }
-        if tier == "quality_gate_high_precision":
-            timeout_seconds = max(90, int(settings.REVIEW_OLLAMA_TIMEOUT))
-            payload["options"]["num_predict"] = max(token_limit, 640)
-        elif settings.is_high_quality_lowmem_mode():
-            timeout_seconds = max(10, int(settings.LOWMEM_REVIEW_OLLAMA_TIMEOUT))
-        else:
-            timeout_seconds = max(30, int(settings.REVIEW_OLLAMA_TIMEOUT))
-        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-            response = await client.post(f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/generate", json=payload)
-            if response.status_code >= 400 and "think" in response.text.lower():
-                # Older Ollama builds may not understand the top-level `think`
-                # switch; non-thinking calls still keep prompt-level `/no_think`.
-                payload.pop("think", None)
-                response = await client.post(f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/generate", json=payload)
-            response.raise_for_status()
-            data = response.json()
-        self._ollama_models_touched.add(model_id)
-        return str(data.get("response") or "")
 
     async def _review_with_lmstudio(
         self,
@@ -1562,9 +2134,19 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
                 continue
             if (
                 isinstance(payload, dict)
-                and (isinstance(payload.get("entities"), list) or isinstance(payload.get("rejects"), list))
+                and (
+                    isinstance(payload.get("entities"), list)
+                    or isinstance(payload.get("rejects"), list)
+                    or isinstance(payload.get("entity_decisions"), list)
+                    or isinstance(payload.get("decisions"), list)
+                    or isinstance(payload.get("missing_entities"), list)
+                    or isinstance(payload.get("add_missing_entities"), list)
+                    or isinstance(payload.get("action"), str)
+                    or isinstance(payload.get("requires_manual_review"), bool)
+                )
             ):
                 payload.setdefault("entities", [])
+                payload.setdefault("rejects", [])
                 return payload
 
         # Some local models wrap JSON in fenced blocks or append prose between
@@ -1576,9 +2158,19 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
                 continue
             if (
                 isinstance(payload, dict)
-                and (isinstance(payload.get("entities"), list) or isinstance(payload.get("rejects"), list))
+                and (
+                    isinstance(payload.get("entities"), list)
+                    or isinstance(payload.get("rejects"), list)
+                    or isinstance(payload.get("entity_decisions"), list)
+                    or isinstance(payload.get("decisions"), list)
+                    or isinstance(payload.get("missing_entities"), list)
+                    or isinstance(payload.get("add_missing_entities"), list)
+                    or isinstance(payload.get("action"), str)
+                    or isinstance(payload.get("requires_manual_review"), bool)
+                )
             ):
                 payload.setdefault("entities", [])
+                payload.setdefault("rejects", [])
                 return payload
 
         salvaged_entities: list[Dict] = []
@@ -1612,13 +2204,24 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
                 entity_type = self._infer_string_candidate_type(raw_text)
                 role = None
                 canonical = None
+                source_decision = ""
+                entity_decision_original_text = ""
+                entity_decision_reason = ""
             elif isinstance(item, dict):
                 entity_type = str(item.get("type") or "").strip().upper()
                 raw_text = str(item.get("text") or "").strip()
                 role = item.get("role")
                 canonical = item.get("canonical")
+                subject_id = str(item.get("subject_id") or "").strip()
+                canonical_subject_id = str(item.get("canonical_subject_id") or "").strip()
+                source_decision = str(item.get("source_decision") or "").strip()
+                entity_decision_original_text = str(item.get("entity_decision_original_text") or "").strip()
+                entity_decision_reason = str(item.get("entity_decision_reason") or "").strip()
             else:
                 continue
+            if isinstance(item, str):
+                subject_id = ""
+                canonical_subject_id = ""
             if not entity_type or not raw_text:
                 continue
             entity_type = self._normalize_entity_type(entity_type, raw_text, role=role, snippet=snippet)
@@ -1634,15 +2237,37 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
                 continue
             if not self._looks_like_review_candidate(entity_type, materialized_text):
                 continue
+            gate_passed, _ = subject_noun_gate(entity_type, materialized_text, allow_short_org=True)
+            review_short_org = (
+                entity_type == "ORGANIZATION"
+                and looks_like_organization_short_name(materialized_text)
+                and self._snippet_supports_short_org_resolution(snippet, materialized_text)
+            )
+            if not gate_passed and not review_short_org:
+                continue
             metadata = {
                 "source": source_name,
                 "snippet_type": snippet.snippet_type,
                 "risk_reason": snippet.risk_reason,
                 "role": role,
                 "canonical": canonical,
-                "review": source_name in {"qwen_fragment_review", "qwen_heavy_arbitration"},
-                "source_layer": "llm_review" if source_name in {"qwen_fragment_review", "qwen_heavy_arbitration"} else "",
+                "review_subject_id": subject_id or None,
+                "review_canonical_subject_id": canonical_subject_id or subject_id or None,
+                "review": source_name in REVIEW_DECISION_SOURCE_NAMES,
+                "source_layer": (
+                    "llm_review"
+                    if source_name in REVIEW_DECISION_SOURCE_NAMES
+                    else ""
+                ),
             }
+            if source_decision:
+                metadata["entity_decision"] = True
+                metadata["source_decision"] = source_decision
+                metadata["entity_decision_action"] = source_decision
+            if entity_decision_original_text:
+                metadata["entity_decision_original_text"] = entity_decision_original_text
+            if entity_decision_reason:
+                metadata["entity_decision_reason"] = entity_decision_reason
             if materialized_text != raw_text:
                 metadata["materialized_from"] = raw_text
             result = make_entity(
@@ -1683,7 +2308,7 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
         present_norms = {
             normalize_entity_text(item.text)
             for item in existing_results
-            if item.entity_type in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME"}
+            if item.entity_type in {"ORGANIZATION", "GOVERNMENT"}
         }
         any_present_norms = {
             normalize_entity_text(item.text)
@@ -1732,8 +2357,12 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
                     "source": source_name,
                     "snippet_type": snippet.snippet_type,
                     "risk_reason": snippet.risk_reason,
-                    "review": source_name in {"qwen_fragment_review", "qwen_heavy_arbitration"},
-                    "source_layer": "llm_review" if source_name in {"qwen_fragment_review", "qwen_heavy_arbitration"} else "",
+                    "review": source_name in REVIEW_DECISION_SOURCE_NAMES,
+                    "source_layer": (
+                        "llm_review"
+                        if source_name in REVIEW_DECISION_SOURCE_NAMES
+                        else ""
+                    ),
                     "materialized_from": item,
                     "list_completion": True,
                     "list_label": label,
@@ -1771,6 +2400,14 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
             )
             if span is None:
                 continue
+            expanded_span = expand_subject_span_to_containing_shape(
+                full_text,
+                span[0],
+                span[1],
+                entity_type,
+            )
+            if expanded_span is not None:
+                span = expanded_span
             return full_text[span[0] : span[1]], span
         return "", None
 
@@ -1789,14 +2426,18 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
 
         def _append(value: str) -> None:
             candidate = clean_candidate_text(value)
-            if entity_type == "ORGANIZATION":
+            if entity_type == "ORGANIZATION" and not ORG_PATTERN.search(normalize_entity_text(candidate)):
                 trimmed_candidate = self._trim_short_org_candidate_core(candidate)
                 if trimmed_candidate:
                     candidate = trimmed_candidate
             normalized = normalize_entity_text(candidate)
             if not candidate or not normalized or normalized in seen:
                 return
-            if entity_type == "ORGANIZATION" and self._is_noisy_short_org_candidate(normalized):
+            if entity_type == "ORGANIZATION" and is_non_subject_generic_org_reference(normalized):
+                return
+            if entity_type == "ORGANIZATION" and is_non_subject_action_or_function_term(normalized):
+                return
+            if entity_type == "ORGANIZATION" and not ORG_PATTERN.search(normalized) and self._is_noisy_short_org_candidate(normalized):
                 return
             seen.add(normalized)
             candidates.append(candidate)
@@ -1807,6 +2448,17 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
                 if is_generic_organization_term(prefixed_remainder):
                     return []
                 _append(prefixed_remainder)
+            function_stripped, consumed = strip_leading_subject_function_words(cleaned)
+            if consumed > 0:
+                function_stripped_normalized = normalize_entity_text(function_stripped)
+                if function_stripped_normalized and not is_non_subject_generic_org_reference(function_stripped_normalized):
+                    gate_type = "GOVERNMENT" if is_official_institution_text(function_stripped_normalized) else "ORGANIZATION"
+                    if (
+                        not is_weak_function_stripped_org(function_stripped)
+                        and subject_noun_gate(gate_type, function_stripped, allow_short_org=False)[0]
+                    ):
+                        _append(function_stripped)
+                return candidates
 
             if is_org_like_text(cleaned) and not self._looks_like_wrapped_org_candidate(cleaned):
                 _append(cleaned)
@@ -1944,6 +2596,536 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
         return rejected
 
     @staticmethod
+    def _materialize_entity_decisions(payload: Dict, existing_entities: list[dict]) -> Dict[str, list]:
+        """Turn model review decisions for existing entities into executable edits."""
+        rows = payload.get("entity_decisions") or payload.get("entity_decision") or []
+        if not isinstance(rows, list):
+            return {"rejections": [], "entities": []}
+
+        rejections: list[Dict] = []
+        entities: list[Dict] = []
+        for row in rows[:24]:
+            if not isinstance(row, dict):
+                continue
+            action = str(row.get("action") or "").strip().lower()
+            if action not in {"reject", "trim_to", "split_into", "keep"}:
+                continue
+            matched = QwenFragmentReviewService._match_existing_entity_decision(row, existing_entities)
+            if matched is None:
+                continue
+            if action == "keep":
+                continue
+            matched_text = str(matched.get("text") or "")
+            reason = str(row.get("reason") or f"entity_decision_{action}").strip()
+            rejections.append(
+                {
+                    "text": matched_text,
+                    "type": str(matched.get("type") or "").upper(),
+                    "start": int(matched.get("start") or 0),
+                    "end": int(matched.get("end") or 0),
+                    "source": matched.get("source"),
+                    "reason": reason,
+                    "entity_decision": True,
+                    "entity_decision_action": action,
+                }
+            )
+            if action == "reject":
+                continue
+            corrected_items: list[object]
+            if action == "trim_to":
+                corrected_items = [row.get("trim_to") or row.get("text_after") or row.get("correct_text")]
+            else:
+                corrected_items = row.get("split_into") or row.get("entities") or row.get("items") or []
+                if not isinstance(corrected_items, list):
+                    corrected_items = []
+            for corrected in corrected_items:
+                if isinstance(corrected, str):
+                    corrected_text = corrected.strip()
+                    corrected_type = str(row.get("correct_type") or row.get("type") or matched.get("type") or "").upper()
+                    role = row.get("role")
+                elif isinstance(corrected, dict):
+                    corrected_text = str(corrected.get("text") or corrected.get("trim_to") or "").strip()
+                    corrected_type = str(corrected.get("type") or row.get("correct_type") or row.get("type") or matched.get("type") or "").upper()
+                    role = corrected.get("role") or row.get("role")
+                else:
+                    continue
+                if not corrected_text:
+                    continue
+                corrected_type = canonical_default_entity_type(
+                    QwenFragmentReviewService.TYPE_ALIASES.get(corrected_type, corrected_type),
+                    corrected_text,
+                )
+                if corrected_type not in QwenFragmentReviewService.ALLOWED_TYPES:
+                    corrected_type = QwenFragmentReviewService._infer_static_string_candidate_type(corrected_text)
+                if corrected_type not in QwenFragmentReviewService.ALLOWED_TYPES:
+                    continue
+                if not subject_noun_gate(corrected_type, corrected_text, allow_short_org=False)[0]:
+                    continue
+                if corrected_type == "ORGANIZATION" and is_weak_function_stripped_org(corrected_text):
+                    original_text = str(row.get("text") or row.get("original_text") or matched_text or "")
+                    _, consumed = strip_leading_subject_function_words(original_text)
+                    if consumed > 0:
+                        continue
+                entities.append(
+                    {
+                        "type": corrected_type,
+                        "text": corrected_text,
+                        "role": role,
+                        "source_decision": action,
+                        "entity_decision_action": action,
+                        "entity_decision_original_text": matched_text,
+                        "entity_decision_reason": reason,
+                    }
+                )
+        return {"rejections": rejections, "entities": entities}
+
+    @staticmethod
+    def _match_existing_entity_decision(row: dict, existing_entities: list[dict]) -> Optional[dict]:
+        row_text = str(row.get("text") or row.get("original_text") or "").strip()
+        row_type = str(row.get("type") or "").strip().upper()
+        row_start = row.get("start")
+        row_end = row.get("end")
+        try:
+            row_start_int = int(row_start)
+            row_end_int = int(row_end)
+        except (TypeError, ValueError):
+            row_start_int = -1
+            row_end_int = -1
+        normalized_text = normalize_entity_text(row_text)
+        for existing in existing_entities or []:
+            if not isinstance(existing, dict):
+                continue
+            existing_type = str(existing.get("type") or existing.get("entity_type") or "").upper()
+            if row_type and existing_type != row_type:
+                continue
+            if row_start_int >= 0 and row_end_int >= 0:
+                if int(existing.get("start") or 0) == row_start_int and int(existing.get("end") or 0) == row_end_int:
+                    return existing
+            existing_text = str(existing.get("text") or "")
+            if row_text and existing_text == row_text:
+                return existing
+            if normalized_text and normalize_entity_text(existing_text) == normalized_text:
+                return existing
+        return None
+
+    @staticmethod
+    def _deterministic_review_rejections(existing_entities: list[dict]) -> List[Dict]:
+        rejected: list[Dict] = []
+        for existing in existing_entities or []:
+            if not isinstance(existing, dict):
+                continue
+            reason = QwenFragmentReviewService._deterministic_rejection_reason(existing)
+            if not reason:
+                continue
+            rejected.append(
+                {
+                    "text": str(existing.get("text") or ""),
+                    "type": str(existing.get("type") or existing.get("entity_type") or "").upper(),
+                    "start": int(existing.get("start") or 0),
+                    "end": int(existing.get("end") or 0),
+                    "source": existing.get("source"),
+                    "reason": reason,
+                    "deterministic_review": True,
+                }
+            )
+        return rejected
+
+    @staticmethod
+    def _deterministic_review_entity_decisions(existing_entities: list[dict]) -> Dict[str, list]:
+        """Materialize obvious review edits even when the local model misses them."""
+        rejections: list[Dict] = []
+        entities: list[Dict] = []
+        seen_rejections: set[tuple[str, str, int, int, str]] = set()
+        seen_entities: set[tuple[str, str, str, str]] = set()
+
+        def _append_rejection(existing: dict, reason: str, action: str) -> None:
+            text = str(existing.get("text") or "")
+            entity_type = QwenFragmentReviewService._review_subject_type(existing)
+            key = (
+                entity_type,
+                text,
+                int(existing.get("start") or 0),
+                int(existing.get("end") or 0),
+                action,
+            )
+            if key in seen_rejections:
+                return
+            seen_rejections.add(key)
+            rejections.append(
+                {
+                    "text": text,
+                    "type": entity_type,
+                    "start": int(existing.get("start") or 0),
+                    "end": int(existing.get("end") or 0),
+                    "source": existing.get("source"),
+                    "reason": reason,
+                    "deterministic_review": True,
+                    "deterministic_entity_decision": True,
+                    "entity_decision": True,
+                    "entity_decision_action": action,
+                }
+            )
+
+        def _append_entity(
+            entity_type: str,
+            text: str,
+            *,
+            original_text: str,
+            action: str,
+            reason: str,
+        ) -> None:
+            normalized_text = normalize_entity_text(text)
+            normalized_original = normalize_entity_text(original_text)
+            key = (entity_type, normalized_text, action, normalized_original)
+            if not normalized_text or key in seen_entities:
+                return
+            seen_entities.add(key)
+            entities.append(
+                {
+                    "type": entity_type,
+                    "text": text,
+                    "source_decision": action,
+                    "entity_decision_action": action,
+                    "entity_decision_original_text": original_text,
+                    "entity_decision_reason": reason,
+                }
+            )
+
+        for existing in existing_entities or []:
+            if not isinstance(existing, dict):
+                continue
+            text = str(existing.get("text") or "").strip()
+            entity_type = QwenFragmentReviewService._review_subject_type(existing)
+            if not text or entity_type not in QwenFragmentReviewService.ALLOWED_TYPES:
+                continue
+            normalized = normalize_entity_text(text)
+
+            reason = QwenFragmentReviewService._deterministic_final_subject_rejection_reason(existing)
+            if reason:
+                _append_rejection(existing, reason, "reject")
+                continue
+
+            if entity_type in {"ORGANIZATION", "GOVERNMENT"}:
+                reason = QwenFragmentReviewService._deterministic_rule_organization_rejection_reason(existing)
+                if reason:
+                    _append_rejection(existing, reason, "reject")
+                    continue
+
+                stripped, consumed = strip_leading_subject_function_words(text)
+                stripped_normalized = normalize_entity_text(stripped)
+                if consumed > 0:
+                    gate_type = (
+                        "GOVERNMENT"
+                        if is_official_institution_text(stripped_normalized)
+                        else "ORGANIZATION"
+                    )
+                    reason = "deterministic_trim_leading_function_word"
+                    if (
+                        stripped_normalized
+                        and not is_non_subject_generic_org_reference(stripped_normalized)
+                        and not is_generic_organization_term(stripped_normalized)
+                        and not (
+                            gate_type == "ORGANIZATION"
+                            and is_weak_function_stripped_org(stripped)
+                        )
+                        and subject_noun_gate(gate_type, stripped, allow_short_org=False)[0]
+                    ):
+                        _append_rejection(existing, reason, "trim_to")
+                        _append_entity(
+                            gate_type,
+                            stripped,
+                            original_text=text,
+                            action="trim_to",
+                            reason=reason,
+                        )
+                    else:
+                        _append_rejection(existing, "deterministic_reject_leading_function_word", "reject")
+                    continue
+
+                split_items = QwenFragmentReviewService._deterministic_split_parallel_subjects(
+                    text,
+                    entity_type,
+                )
+                if split_items:
+                    reason = "deterministic_split_parallel_subjects"
+                    _append_rejection(existing, reason, "split_into")
+                    for split_type, split_text in split_items:
+                        _append_entity(
+                            split_type,
+                            split_text,
+                            original_text=text,
+                            action="split_into",
+                            reason=reason,
+                        )
+                    continue
+
+                trimmed_subject = QwenFragmentReviewService._deterministic_trim_dirty_subject_text(text, entity_type)
+                if trimmed_subject and normalize_entity_text(trimmed_subject) != normalized:
+                    trimmed_type = (
+                        "GOVERNMENT"
+                        if is_official_institution_text(trimmed_subject)
+                        else canonical_default_entity_type(entity_type, trimmed_subject)
+                    )
+                    if trimmed_type in QwenFragmentReviewService.ALLOWED_TYPES and subject_noun_gate(
+                        trimmed_type,
+                        trimmed_subject,
+                        allow_short_org=trimmed_type == "ORGANIZATION",
+                    )[0]:
+                        reason = "deterministic_trim_non_subject_boundary"
+                        _append_rejection(existing, reason, "trim_to")
+                        _append_entity(
+                            trimmed_type,
+                            trimmed_subject,
+                            original_text=text,
+                            action="trim_to",
+                            reason=reason,
+                        )
+                        continue
+
+            reason = QwenFragmentReviewService._deterministic_rejection_reason(existing)
+            if reason:
+                _append_rejection(existing, reason, "reject")
+                continue
+
+        return {"rejections": rejections, "entities": entities}
+
+    @staticmethod
+    def _deterministic_final_subject_rejection_reason(existing: dict) -> str:
+        text = str(existing.get("text") or "").strip()
+        normalized = normalize_entity_text(text)
+        entity_type = QwenFragmentReviewService._review_subject_type(existing)
+        if not normalized or entity_type not in QwenFragmentReviewService.ALLOWED_TYPES:
+            return ""
+        if entity_type == "GOVERNMENT" and normalized in GENERIC_GOVERNMENT_REVIEW_REFERENCES:
+            return "deterministic_final_subject_generic_government_reference"
+        if is_identity_reference_term(normalized):
+            return "deterministic_final_subject_identity_reference"
+        if is_position_title(normalized):
+            return "deterministic_final_subject_position_title"
+        if normalized in QwenFragmentReviewService.NON_ENTITY_TERMS:
+            return "deterministic_final_subject_non_entity_term"
+        if entity_type in {"PERSON", "ORGANIZATION", "GOVERNMENT"} and is_non_subject_action_or_function_term(normalized):
+            return "deterministic_final_subject_action_or_function"
+        if entity_type == "PERSON":
+            if is_org_like_text(normalized) or is_official_institution_text(normalized) or subject_noun_gate("LOCATION", normalized)[0]:
+                return "deterministic_final_subject_person_type_mismatch"
+            if len(normalized) > 8 and any(
+                token in normalized
+                for token in ("请求", "认为", "提交", "证明", "负责", "联系", "地址", "法院", "公司", "材料", "情况")
+            ):
+                return "deterministic_final_subject_person_narrative_fragment"
+        if entity_type == "LOCATION":
+            if is_org_like_text(normalized) or is_official_institution_text(normalized):
+                return "deterministic_final_subject_location_type_mismatch"
+            if is_probable_person(normalized):
+                return "deterministic_final_subject_location_person_mismatch"
+            if len(normalized) > 30 and any(token in normalized for token in ("请求", "认为", "提交", "证明", "负责", "联系")):
+                return "deterministic_final_subject_location_narrative_fragment"
+        if entity_type == "GOVERNMENT":
+            if not is_official_institution_text(normalized) and not subject_noun_gate("GOVERNMENT", normalized)[0]:
+                return "deterministic_final_subject_weak_government_shape"
+        if entity_type == "ORGANIZATION":
+            if is_generic_organization_term(normalized):
+                return "deterministic_final_subject_generic_organization_term"
+            if is_probable_person(normalized) and not is_org_like_text(normalized):
+                return "deterministic_final_subject_organization_person_mismatch"
+        return ""
+
+    @staticmethod
+    def _review_subject_type(existing: dict) -> str:
+        text = str(existing.get("text") or "").strip()
+        raw_type = str(existing.get("type") or existing.get("entity_type") or "").strip().upper()
+        entity_type = canonical_default_entity_type(raw_type, text)
+        if entity_type in QwenFragmentReviewService.ALLOWED_TYPES:
+            return entity_type
+        normalized = normalize_entity_text(text)
+        if raw_type in {"GOVERNMENT", "GOVERNMENT_AGENCY", "COURT", "BANK_NAME"}:
+            return "GOVERNMENT"
+        if raw_type in {"PERSON", "PERSON_NAME", "LEGAL_REPRESENTATIVE", "CONTACT_PERSON", "SIGNATORY"}:
+            return "PERSON"
+        if raw_type in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME"}:
+            return "GOVERNMENT" if is_official_institution_text(normalized) else "ORGANIZATION"
+        if raw_type in {"LOCATION", "ADDRESS"}:
+            return "LOCATION"
+        return ""
+
+    @staticmethod
+    def _deterministic_rule_organization_rejection_reason(existing: dict) -> str:
+        text = str(existing.get("text") or "").strip()
+        entity_type = canonical_default_entity_type(
+            str(existing.get("type") or existing.get("entity_type") or "").upper(),
+            text,
+        )
+        if entity_type not in {"ORGANIZATION", "GOVERNMENT"}:
+            return ""
+        source = str(existing.get("source") or "").strip()
+        metadata = dict(existing.get("metadata") or {})
+        rule_first = metadata.get("rule_first")
+        candidate_id = str(rule_first.get("candidate_id") or "") if isinstance(rule_first, dict) else ""
+        if source not in {"rule_organization", "rule_organization_context"} and not candidate_id.startswith("rule_organization"):
+            return ""
+
+        normalized = normalize_entity_text(text)
+        if not normalized:
+            return "deterministic_rule_org_empty"
+        if is_official_institution_text(normalized):
+            return ""
+        if is_non_subject_generic_org_reference(normalized):
+            return "deterministic_rule_org_generic_reference"
+        if is_non_subject_action_or_function_term(normalized):
+            return "deterministic_rule_org_action_or_function"
+        if is_identity_reference_term(normalized) or is_position_title(normalized):
+            return "deterministic_rule_org_role_or_title"
+        if is_generic_organization_term(normalized):
+            return "deterministic_rule_org_generic_term"
+
+        strong_suffix = any(normalized.endswith(suffix) for suffix in RULE_ORG_REVIEW_STRONG_SUFFIXES)
+        if source == "rule_organization_context" and not strong_suffix:
+            if QwenFragmentReviewService._looks_like_non_subject_rule_org_phrase(normalized):
+                return "deterministic_rule_org_context_non_subject_phrase"
+            return ""
+
+        weak_suffix = next((suffix for suffix in RULE_ORG_REVIEW_WEAK_SUFFIXES if normalized.endswith(suffix)), "")
+        if weak_suffix:
+            stem = normalized[: -len(weak_suffix)]
+            if not stem or QwenFragmentReviewService._looks_like_non_subject_rule_org_phrase(stem):
+                return "deterministic_rule_org_weak_suffix_narrative"
+            if len(stem) < 4 and not re.search(r"(?:省|自治区|特别行政区|市|地区|自治州|盟|区|县|旗)", stem):
+                return "deterministic_rule_org_weak_suffix_low_evidence"
+
+        if not strong_suffix and QwenFragmentReviewService._looks_like_non_subject_rule_org_phrase(normalized):
+            return "deterministic_rule_org_non_subject_phrase"
+        return ""
+
+    @staticmethod
+    def _looks_like_non_subject_rule_org_phrase(normalized: str) -> bool:
+        if not normalized:
+            return False
+        if any(normalized.startswith(prefix) for prefix in RULE_ORG_REVIEW_NON_SUBJECT_PREFIXES):
+            return True
+        if any(token in normalized for token in RULE_ORG_REVIEW_NON_SUBJECT_TOKENS) and not any(
+            normalized.endswith(suffix) for suffix in RULE_ORG_REVIEW_STRONG_SUFFIXES
+        ):
+            return True
+        return False
+
+    @staticmethod
+    def _deterministic_trim_dirty_subject_text(text: str, entity_type: str) -> str:
+        """Trim obvious non-subject tail from an organization/government candidate."""
+
+        value = str(text or "").strip()
+        normalized = normalize_entity_text(value)
+        if not normalized or entity_type not in {"ORGANIZATION", "GOVERNMENT"}:
+            return ""
+        if ORG_PATTERN.fullmatch(normalized) or is_official_institution_text(normalized):
+            return ""
+        complete_matches: list[tuple[int, int, str]] = []
+        for pattern in (OFFICIAL_INSTITUTION_PATTERN, ORG_PATTERN):
+            for match in pattern.finditer(value):
+                candidate = value[match.start() : match.end()]
+                candidate_type = "GOVERNMENT" if is_official_institution_text(candidate) else "ORGANIZATION"
+                if subject_noun_gate(candidate_type, candidate, allow_short_org=False)[0]:
+                    complete_matches.append((match.start(), match.end(), candidate))
+        if complete_matches:
+            start, end, candidate = max(
+                complete_matches,
+                key=lambda item: (
+                    item[0] == 0,
+                    item[1] - item[0],
+                    -item[0],
+                ),
+            )
+            if (start, end) != (0, len(value)):
+                return candidate
+
+        short_boundary = find_short_org_prefix_before_non_subject_boundary(value)
+        if short_boundary is None:
+            return ""
+        start, end, _boundary_kind = short_boundary
+        if start != 0 or end >= len(value):
+            return ""
+        candidate = value[start:end]
+        if not looks_like_organization_short_name(candidate):
+            return ""
+        if not subject_noun_gate("ORGANIZATION", candidate, allow_short_org=True)[0]:
+            return ""
+        return candidate
+
+    @staticmethod
+    def _deterministic_split_parallel_subjects(text: str, entity_type: str) -> list[tuple[str, str]]:
+        normalized = normalize_entity_text(text)
+        if not normalized or len(normalized) > 120:
+            return []
+        if not re.search(r"[、，,及与和]", normalized):
+            return []
+
+        direct_parts = [part for part in re.split(r"[、，,及与和]+", normalized) if part]
+        if len(direct_parts) >= 2:
+            direct_items: list[tuple[str, str]] = []
+            for part in direct_parts[:8]:
+                part_type = canonical_default_entity_type(entity_type, part)
+                if part_type not in QwenFragmentReviewService.ALLOWED_TYPES:
+                    part_type = "GOVERNMENT" if canonical_default_entity_type("ORGANIZATION", part) == "GOVERNMENT" else "ORGANIZATION"
+                if not subject_noun_gate(part_type, part, allow_short_org=False)[0]:
+                    direct_items = []
+                    break
+                direct_items.append((part_type, part))
+            if len({normalize_entity_text(item[1]) for item in direct_items}) >= 2:
+                return direct_items
+
+        matches = [(match.group(0), match.start(), match.end()) for match in ORG_PATTERN.finditer(normalized)]
+        if len(matches) < 2:
+            return []
+        split_items: list[tuple[str, str]] = []
+        previous_end = -1
+        for matched_text, start, end in matches[:8]:
+            stripped_text, consumed = strip_leading_subject_function_words(matched_text)
+            if consumed > 0:
+                matched_text = stripped_text
+            if previous_end >= 0:
+                between = normalized[previous_end:start]
+                if not between or not re.fullmatch(r"[、，,及与和]+", between):
+                    return []
+            previous_end = end
+            split_type = canonical_default_entity_type(entity_type, matched_text)
+            if split_type not in QwenFragmentReviewService.ALLOWED_TYPES:
+                split_type = "GOVERNMENT" if canonical_default_entity_type("ORGANIZATION", matched_text) == "GOVERNMENT" else "ORGANIZATION"
+            if not subject_noun_gate(split_type, matched_text, allow_short_org=False)[0]:
+                return []
+            split_items.append((split_type, matched_text))
+        if len({normalize_entity_text(item[1]) for item in split_items}) < 2:
+            return []
+        return split_items
+
+    @staticmethod
+    def _deterministic_rejection_reason(existing: dict) -> str:
+        text = str(existing.get("text") or "")
+        normalized = normalize_entity_text(text)
+        entity_type = canonical_default_entity_type(
+            str(existing.get("type") or existing.get("entity_type") or "").upper(),
+            text,
+        )
+        if not normalized or entity_type not in {"PERSON", "ORGANIZATION", "LOCATION", "GOVERNMENT"}:
+            return ""
+        if entity_type in {"PERSON", "ORGANIZATION"} and is_non_subject_action_or_function_term(normalized):
+            return "deterministic_non_subject_action_or_function"
+        if is_identity_reference_term(normalized):
+            return "deterministic_identity_reference_term"
+        if is_position_title(normalized):
+            return "deterministic_position_title"
+        if normalized in QwenFragmentReviewService.NON_ENTITY_TERMS:
+            return "deterministic_non_entity_term"
+        if entity_type in {"ORGANIZATION", "GOVERNMENT"} and is_generic_organization_term(normalized):
+            return "deterministic_generic_organization_term"
+        if entity_type == "GOVERNMENT" and normalized in {"法院", "人民法院", "一审法院", "二审法院", "原审法院", "本院", "贵院"}:
+            return "deterministic_generic_government_reference"
+        if entity_type in {"ORGANIZATION", "GOVERNMENT"} and len(normalized) > 18 and any(
+            token in normalized for token in ("不服", "请求", "认为", "提交", "证明", "承担责任", "是否", "通过")
+        ):
+            return "deterministic_narrative_fragment"
+        return ""
+
+    @staticmethod
     def _allow_type_mismatch_rejection(reject_text: str, reject_type: str, reason: str) -> bool:
         normalized = normalize_entity_text(reject_text)
         if not normalized:
@@ -1981,7 +3163,13 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
                 entity_type = cls._infer_static_string_candidate_type(entity_text)
             elif isinstance(item, dict):
                 entity_text = str(item.get("text") or "").strip()
-                entity_type = cls.TYPE_ALIASES.get(str(item.get("type") or "").strip().upper(), str(item.get("type") or "").strip().upper())
+                entity_type = canonical_default_entity_type(
+                    cls.TYPE_ALIASES.get(
+                        str(item.get("type") or "").strip().upper(),
+                        str(item.get("type") or "").strip().upper(),
+                    ),
+                    entity_text,
+                )
             else:
                 continue
             if entity_type != expected_type:
@@ -1995,17 +3183,15 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
         normalized = re.sub(r"[\s，,。；;：:、]+", "", text or "")
         if not normalized:
             return ""
-        if "法院" in normalized or "仲裁委员会" in normalized or "检察院" in normalized:
-            return "COURT"
-        if "银行" in normalized and any(token in normalized for token in ("支行", "分行", "开户行")):
-            return "BANK_NAME"
+        if is_official_institution_text(normalized):
+            return "GOVERNMENT"
         if ORG_PATTERN.search(normalized) or any(token in normalized for token in ("有限公司", "集团", "公司", "事务所", "委员会", "中心")):
-            return "ORGANIZATION"
+            return canonical_default_entity_type("ORGANIZATION", normalized)
         if any(token in normalized for token in ("省", "市", "区", "县", "镇", "乡", "村", "路", "街", "道", "号", "栋", "室", "自治区", "自治州", "自治县")) and len(normalized) >= 6:
-            return "ADDRESS"
+            return "LOCATION"
         if is_probable_person(normalized):
             return "PERSON"
-        return infer_semantic_type(normalized, "")
+        return canonical_default_entity_type(infer_semantic_type(normalized, ""), normalized)
 
     def _infer_string_candidate_type(self, text: str) -> str:
         return self._infer_static_string_candidate_type(text)
@@ -2017,22 +3203,40 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
         role: object = None,
         snippet: Optional[RiskSnippet] = None,
     ) -> str:
-        normalized_type = self.TYPE_ALIASES.get(entity_type, entity_type)
+        normalized_type = canonical_default_entity_type(self.TYPE_ALIASES.get(entity_type, entity_type), text)
         inferred_type = self._infer_string_candidate_type(text)
         role_text = str(role or "").strip()
+        normalized_text = normalize_entity_text(text)
+        if normalized_text in self.NON_ENTITY_TERMS:
+            return ""
+        if normalized_type in {"PERSON", "ORGANIZATION"} and is_non_subject_generic_org_reference(text):
+            return ""
+        if normalized_type in {"PERSON", "ORGANIZATION"} and is_non_subject_action_or_function_term(text):
+            if normalized_type == "ORGANIZATION":
+                function_stripped, consumed = strip_leading_subject_function_words(text)
+                function_stripped_normalized = normalize_entity_text(function_stripped)
+                if (
+                    consumed > 0
+                    and function_stripped_normalized
+                    and not is_non_subject_generic_org_reference(function_stripped_normalized)
+                    and not is_weak_function_stripped_org(function_stripped)
+                    and subject_noun_gate("ORGANIZATION", function_stripped, allow_short_org=False)[0]
+                ):
+                    return "ORGANIZATION"
+            return ""
         if is_identity_reference_term(text) or is_position_title(text):
             return ""
         prefixed_remainder = strip_identity_reference_prefix(text)
         if prefixed_remainder and is_generic_organization_term(prefixed_remainder):
             return ""
         if any(token in role_text for token in ("住址", "住所", "地址", "开户地址", "通讯地址", "送达地址")):
-            return "ADDRESS"
-        if inferred_type in {"ADDRESS", "COURT", "BANK_NAME"} and normalized_type == "ORGANIZATION":
+            return "LOCATION"
+        if inferred_type in {"LOCATION", "GOVERNMENT"} and normalized_type == "ORGANIZATION":
             return inferred_type
         if normalized_type == "PERSON" and is_org_like_text(text):
-            return "ORGANIZATION"
-        if "法院" in text:
-            return "COURT"
+            return canonical_default_entity_type("ORGANIZATION", text)
+        if any(token in normalized_text for token in ("法院", "检察院", "公安局", "派出所", "仲裁委员会", "政府", "委员会", "银行", "支行", "分行")):
+            return "GOVERNMENT" if is_official_institution_text(normalized_text) else ""
         if normalized_type in {"PERSON", "ORGANIZATION"} and self._snippet_supports_short_org_resolution(snippet, text):
             return "ORGANIZATION"
         if any(
@@ -2065,7 +3269,9 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
             return "ORGANIZATION" if normalized_type == "PERSON" else normalized_type
         if normalized_type == "ORGANIZATION" and looks_like_organization_short_name(text):
             return "ORGANIZATION"
-        return normalized_type if normalized_type in self.ALLOWED_TYPES else ""
+        if normalized_type in self.ALLOWED_TYPES:
+            return normalized_type if subject_noun_gate(normalized_type, text, allow_short_org=True)[0] else ""
+        return ""
 
     @classmethod
     def _snippet_supports_short_org_resolution(
@@ -2078,15 +3284,12 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
         normalized = normalize_entity_text(text)
         snippet_text = str(snippet.text or "")
         allowed_snippet_type = snippet.snippet_type in {
-            "quality_gate_block",
             "narrative_hotspot",
             "header_party_block",
             "legal_party_block",
         }
         allowed_risk_reason = snippet.risk_reason in {
             "organization_action_cue",
-            "final_entity_quality_gate",
-            "final_entity_quality_gate_gap",
             "document_header",
             "keyword:付款",
             "keyword:收款",
@@ -2125,19 +3328,22 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
             return False
         if normalized in QwenFragmentReviewService.NON_ENTITY_TERMS:
             return False
-        if entity_type in {"CASE_NO", "CONTRACT_NO"}:
-            return bool(re.search(r"[（(][^）)]{2,}[）)]|号|第.+号|[A-Za-z].*\d|\d.*[A-Za-z]", normalized))
-        if entity_type == "ADDRESS":
-            return len(normalized) >= 6 or any(token in normalized for token in ("省", "市", "区", "县", "镇", "乡", "村", "路", "街", "道", "号", "栋", "室", "自治区", "自治州", "自治县", "旗", "盟"))
-        if entity_type == "COURT":
+        if entity_type in {"PERSON", "ORGANIZATION"} and is_non_subject_action_or_function_term(normalized):
+            return False
+        if entity_type == "LOCATION":
+            return subject_noun_gate("LOCATION", normalized)[0]
+        if entity_type == "GOVERNMENT":
             if normalized in {"一审法院", "二审法院", "原审法院", "本院", "法院"}:
                 return False
-            return any(token in normalized for token in ("人民法院", "中级人民法院", "高级人民法院", "仲裁委员会", "人民检察院"))
+            return subject_noun_gate("GOVERNMENT", normalized)[0]
         if entity_type == "PERSON":
-            if any(token in normalized for token in ("省", "市", "区", "县", "镇", "乡", "村", "路", "街", "号", "室")):
-                return False
-            return re.fullmatch(r"[\u4e00-\u9fa5]{2,8}(?:·[\u4e00-\u9fa5]{2,8})?", normalized) is not None
+            return subject_noun_gate("PERSON", normalized)[0]
         if entity_type == "ORGANIZATION":
+            if is_non_subject_generic_org_reference(normalized):
+                return False
+            _, consumed = strip_leading_subject_function_words(normalized)
+            if consumed > 0:
+                return False
             prefixed_remainder = strip_identity_reference_prefix(normalized)
             if prefixed_remainder and is_generic_organization_term(prefixed_remainder):
                 return False
@@ -2152,55 +3358,11 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
                 return False
             if any(token in normalized for token in ("随后", "另行", "继续", "负责", "配合", "协助")) and not is_org_like_text(normalized):
                 return False
-            return (
-                any(
-                    token in normalized
-                    for token in (
-                        "公司",
-                        "集团",
-                        "银行",
-                        "委员会",
-                        "事务所",
-                        "中心",
-                        "法院",
-                        "检察院",
-                        "商行",
-                        "合作社",
-                        "工作室",
-                        "经营部",
-                        "门市部",
-                        "营业部",
-                        "办事处",
-                        "基金会",
-                        "联合会",
-                        "研究院",
-                        "研究所",
-                        "协会",
-                        "医院",
-                        "学校",
-                    )
-                )
-                or looks_like_organization_short_name(normalized)
-                or len(normalized) >= 4
-            )
+            passed, _ = subject_noun_gate("ORGANIZATION", normalized, allow_short_org=True)
+            return passed or looks_like_organization_short_name(normalized)
         return True
 
     def unload(self) -> None:
-        for model_id in list(self._ollama_models_touched):
-            try:
-                with httpx.Client(timeout=3.0) as client:
-                    client.post(
-                        f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/generate",
-                        json={
-                            "model": model_id,
-                            "prompt": "",
-                            "stream": False,
-                            "keep_alive": 0,
-                        },
-                    )
-            except Exception:
-                logger.debug("Failed to unload Ollama review model %s", model_id, exc_info=True)
-        self._ollama_models_touched.clear()
         self._mlx_model = None
         self._mlx_tokenizer = None
         self._mlx_model_path = None

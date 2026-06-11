@@ -12,25 +12,7 @@
             </div>
 	          </template>
 	
-	          <div class="workflow-picker-card">
-	            <div class="workflow-picker-header">
-	              <div>
-	                <div class="workflow-picker-title">处理线路</div>
-	                <div class="workflow-picker-subtitle">{{ selectedDesensitizeModeDescription }}</div>
-	              </div>
-	            </div>
-	            <el-radio-group v-model="selectedDesensitizeMode" class="workflow-radio-group">
-	              <el-radio-button
-	                v-for="option in desensitizeModeOptions"
-	                :key="option.value"
-	                :label="option.value"
-	              >
-	                {{ option.label }}
-	              </el-radio-button>
-	            </el-radio-group>
-	          </div>
-
-	          <el-upload
+		          <el-upload
 	            class="upload-area"
             drag
             :auto-upload="false"
@@ -46,24 +28,6 @@
               <div class="el-upload__tip">单个文件最大 50MB。</div>
             </template>
           </el-upload>
-
-          <div v-if="canUseWpsTemplate" class="wps-template-card">
-            <div class="folder-picker-title">WPS 转 Word 核查模板</div>
-            <div class="folder-picker-subtitle">
-              本机高质量 PDF 必须上传 WPS 已转换的 DOCX。系统先核查并批注该 Word，再进入脱敏识别。
-            </div>
-            <el-upload
-              class="template-upload"
-              :auto-upload="false"
-              :limit="1"
-              accept=".docx"
-              :on-change="handleWpsTemplateChange"
-              :on-remove="handleWpsTemplateRemove"
-            >
-              <el-button class="full-width" plain>选择 WPS 转换 DOCX</el-button>
-            </el-upload>
-            <div class="form-tip">当前模板：{{ wpsDocxTemplateFile?.name || '未选择' }}</div>
-          </div>
 
           <input
             ref="folderInputRef"
@@ -92,17 +56,17 @@
             :title="templateName ? `当前模板：${templateName}` : '已启用自定义脱敏配置'"
           />
 	
-	          <el-form label-width="120px">
-	            <el-form-item :label="isSelectedHighQualityWorkflow ? '启用高质量识别' : '启用大模型'">
-              <el-switch v-model="options.use_llm" />
-            </el-form-item>
+		          <el-form label-width="120px">
+		            <el-form-item label="启用高质量识别">
+	              <el-switch v-model="options.use_llm" />
+	            </el-form-item>
 
-            <el-form-item :label="isSelectedHighQualityWorkflow ? '精审模型（按需）' : '识别模型'">
-              <el-select
-                v-model="selectedLlmModel"
-                class="full-width"
-                :placeholder="isSelectedHighQualityWorkflow ? '请选择按需精审模型' : '请选择模型'"
-                :disabled="!options.use_llm || !llmModelOptions.length"
+	            <el-form-item label="精审模型（按需）">
+	              <el-select
+	                v-model="selectedLlmModel"
+	                class="full-width"
+	                placeholder="请选择按需精审模型"
+	                :disabled="!options.use_llm || !llmModelOptions.length"
               >
                 <el-option
                   v-for="model in llmModelOptions"
@@ -112,14 +76,12 @@
                   :disabled="modelCatalog?.backend === 'ollama' && !model.installed"
                 />
               </el-select>
-              <div class="form-tip">
-                {{
-                  selectedModelDescription ||
-                  (isSelectedHighQualityWorkflow
-                    ? '小 Qwen 只在需要时做片段补漏，是否实际参与会在识别结果里显示。'
-                    : '识别与上下文脱敏会统一使用这里选择的模型。')
-                }}
-              </div>
+	              <div class="form-tip">
+	                {{
+	                  selectedModelDescription ||
+	                  '小 Qwen 只在需要时做片段补漏，是否实际参与会在识别结果里显示。'
+	                }}
+	              </div>
             </el-form-item>
 
             <el-form-item label="启用自定义规则">
@@ -148,10 +110,6 @@
               <span>{{ currentFile?.name || '未选择文件' }}</span>
             </el-form-item>
 
-            <el-form-item v-if="canUseWpsTemplate" label="WPS 模板">
-              <span>{{ wpsDocxTemplateFile?.name || '未选择' }}</span>
-            </el-form-item>
-
             <el-form-item label="当前文件夹">
               <span>{{ selectedFolderSummary }}</span>
             </el-form-item>
@@ -174,13 +132,13 @@
           />
 
           <div class="action-stack">
-            <el-button
-              type="primary"
-              size="large"
-              :loading="analyzing || analysisPending"
-              :disabled="!currentFile || !runtimeReady || (requiresWpsTemplate && !wpsDocxTemplateFile)"
-              @click="uploadFile"
-            >
+	            <el-button
+	              type="primary"
+	              size="large"
+	              :loading="analyzing || analysisPending"
+	              :disabled="!currentFile || !runtimeReady"
+	              @click="uploadFile"
+	            >
               开始识别
             </el-button>
 
@@ -661,7 +619,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import type { UploadFile } from 'element-plus'
 import { ElMessage } from 'element-plus'
@@ -693,12 +651,7 @@ import type {
 import { useRuntimeModels } from '@/composables/useRuntimeModels'
 import { usePageSession } from '@/composables/usePageSession'
 import { useTaskPolling } from '@/composables/useTaskPolling'
-import {
-  desensitizeModeOptions,
-  loadAppSettings,
-  normalizeDesensitizeMode,
-  type DesensitizeMode
-} from '@/utils/settings'
+import { DEFAULT_DESENSITIZE_MODE, loadAppSettings, type DesensitizeMode } from '@/utils/settings'
 
 const route = useRoute()
 type SelectedFolderFile = {
@@ -707,7 +660,6 @@ type SelectedFolderFile = {
 }
 
 const currentFile = ref<File | null>(null)
-const wpsDocxTemplateFile = ref<File | null>(null)
 const folderInputRef = ref<HTMLInputElement | null>(null)
 const currentFolderName = ref('')
 const currentFolderFiles = ref<SelectedFolderFile[]>([])
@@ -725,7 +677,7 @@ const resultDialogVisible = ref(false)
 const activeTab = ref('entities')
 const operatorConfig = ref<Record<string, any>>({})
 const templateName = ref<string | null>(null)
-const selectedDesensitizeMode = ref<DesensitizeMode>('high_quality_lowmem')
+const selectedDesensitizeMode = ref<DesensitizeMode>(DEFAULT_DESENSITIZE_MODE)
 const selectedLlmModel = ref('')
 const selectedAnonymizationStrategy = ref('official')
 const {
@@ -864,36 +816,15 @@ function resolveBatchStepIndex(item: BatchFileItem | null) {
 }
 
 const hasOperatorConfig = computed(() => Object.keys(operatorConfig.value).length > 0)
-const selectedDesensitizeModeOption = computed(
-  () => desensitizeModeOptions.find((item) => item.value === selectedDesensitizeMode.value) || null
-)
-const selectedDesensitizeModeDescription = computed(
-  () => selectedDesensitizeModeOption.value?.description || ''
-)
-const isSelectedHighQualityWorkflow = computed(() =>
-  ['local_high_quality', 'high_quality_lowmem'].includes(selectedDesensitizeMode.value)
-)
 const selectedModelOption = computed(
   () => llmModelOptions.value.find((item) => item.name === selectedLlmModel.value) || null
 )
-
-const canUseWpsTemplate = computed(() => {
-  const name = currentFile.value?.name || ''
-  return selectedDesensitizeMode.value === 'local_high_quality' && name.toLowerCase().endsWith('.pdf')
-})
-const requiresWpsTemplate = computed(() => canUseWpsTemplate.value)
 
 const selectedModelDescription = computed(() => {
   if (!selectedModelOption.value) {
     return ''
   }
-  if (selectedDesensitizeMode.value === 'local_high_quality') {
-    return 'PDF 使用 WPS 转换 DOCX 作为版式底稿，本系统只做 OCR 核查、修正和批注。'
-  }
-  if (selectedDesensitizeMode.value === 'high_quality_lowmem') {
-    return '按低内存三层工作流调度：小模型主召回，Qwen 只审风险片段。'
-  }
-  return `${selectedModelOption.value.strategy_label}：${selectedModelOption.value.strategy_description}`
+  return '按低内存三层工作流调度：小模型主召回，Qwen 只审风险片段。'
 })
 
 const modelServiceWarningTitle = computed(() => {
@@ -903,7 +834,7 @@ const modelServiceWarningTitle = computed(() => {
   if (isHighQualityWorkflow.value) {
     return '当前无法完整读取本地模型状态，主流程仍会优先使用已安装的中文实体模型；精审模型状态可能无法实时更新。'
   }
-  return '当前未连接到 Ollama 服务，模型安装状态可能无法实时获取。'
+  return ''
 })
 
 const selectedAnonymizationDescription = computed(() => {
@@ -1091,10 +1022,7 @@ const analysisReviewAlertType = computed(() => {
   if (metadata.requires_manual_review || metadata.review_error || metadata.review_model_installed === false) {
     return 'warning'
   }
-  if (
-    metadata.review_model_used &&
-    Number(metadata.qwen_raw_candidates || metadata.qwen_materialized_entities || 0) > 0
-  ) {
+  if (metadata.review_model_used) {
     return 'success'
   }
   return 'info'
@@ -1180,16 +1108,6 @@ const analysisOcrSummary = computed(() => {
     const pageText = totalPages > 0 ? `扫描页 ${ocrPages}/${totalPages} 页` : `扫描页 ${ocrPages} 页`
     const mainText = mainModel ? `；主识别模型仍为 ${mainModel}` : ''
     return `检测到${pageText}，OCR 已自动升级到 ${effectiveOcrModel}${mainText}。`
-  }
-
-  if (ocrPages > 0 && metadata.pdf_frontline_profile === 'glm_main_quality_gate') {
-    const pageText = totalPages > 0 ? `${ocrPages}/${totalPages} 页扫描内容` : `${ocrPages} 页扫描内容`
-    const vlPages = Array.isArray(metadata.vl_fallback_used_pages)
-      ? metadata.vl_fallback_used_pages.join('、')
-      : ''
-    return vlPages
-      ? `本机高质量 PDF 识别已完成：GLM-OCR 生成正文，第 ${vlPages} 页使用 VL 兜底。`
-      : `本机高质量 PDF 识别已完成：GLM-OCR 生成正文，质量门禁未触发 VL 兜底，处理 ${pageText}。`
   }
 
   if (ocrPages > 0 && effectiveOcrModel) {
@@ -1326,7 +1244,7 @@ const processingSummary = computed(() => {
   }
   if (!qualityGatePassed) {
     qualityParts.push(
-      qualityGateReason ? `质量闸未完全通过：${qualityGateReason}` : '质量闸未完全通过'
+      qualityGateReason ? `质量检查提示：${qualityGateReason}` : '质量检查提示'
     )
   }
 
@@ -1419,7 +1337,6 @@ const resetSingleState = () => {
   analysisPoller.stop()
   processPoller.stop()
   currentFile.value = null
-  wpsDocxTemplateFile.value = null
   analysisPending.value = false
   analysisTaskStatus.value = null
   analysisResult.value = null
@@ -1584,14 +1501,6 @@ const handleFileChange = (file: UploadFile) => {
   currentFile.value = file.raw instanceof File ? file.raw : null
 }
 
-const handleWpsTemplateChange = (file: UploadFile) => {
-  wpsDocxTemplateFile.value = file.raw instanceof File ? file.raw : null
-}
-
-const handleWpsTemplateRemove = () => {
-  wpsDocxTemplateFile.value = null
-}
-
 const triggerFolderPicker = () => {
   folderInputRef.value?.click()
 }
@@ -1645,7 +1554,7 @@ const handleFolderSelection = (event: Event) => {
 
 const loadDefaultSettings = () => {
   const settings = loadAppSettings()
-  selectedDesensitizeMode.value = normalizeDesensitizeMode(settings.desensitize_mode_default)
+  selectedDesensitizeMode.value = DEFAULT_DESENSITIZE_MODE
   options.value.use_llm = settings.use_llm_default
   options.value.use_custom = settings.use_custom_default
   selectedLlmModel.value = settings.llm_model_default
@@ -1676,12 +1585,7 @@ const uploadFile = async () => {
   }
 
   if (options.value.use_llm && !selectedLlmModel.value) {
-    ElMessage.warning(isSelectedHighQualityWorkflow.value ? '请先选择按需精审模型' : '请先选择识别模型')
-    return
-  }
-
-  if (requiresWpsTemplate.value && !wpsDocxTemplateFile.value) {
-    ElMessage.warning('本机高质量 PDF 线路必须先选择 WPS 转换 DOCX')
+    ElMessage.warning('请先选择按需精审模型')
     return
   }
 
@@ -1715,8 +1619,7 @@ const uploadFile = async () => {
       options.value.use_llm ? selectedLlmModel.value : undefined,
       selectedAnonymizationStrategy.value,
       selectedDesensitizeMode.value,
-      pageSessionId,
-      canUseWpsTemplate.value ? wpsDocxTemplateFile.value : null
+      pageSessionId
     )
     analysisTaskStatus.value = task
     analysisPending.value = true
@@ -1740,7 +1643,7 @@ const startBatchProcessing = async () => {
   }
 
   if (options.value.use_llm && !selectedLlmModel.value) {
-    ElMessage.warning(isSelectedHighQualityWorkflow.value ? '请先选择按需精审模型' : '请先选择识别模型')
+    ElMessage.warning('请先选择按需精审模型')
     return
   }
 
@@ -1866,29 +1769,9 @@ const openBatchItemMapping = (item: BatchFileItem) => {
 const getTypeName = (type: string) => {
   const typeMap: Record<string, string> = {
     PERSON: '人名',
-    PERSON_NAME: '人名',
     ORGANIZATION: '组织机构',
-    COMPANY_NAME: '公司名称',
-    COURT: '法院',
-    ADDRESS: '地址',
     LOCATION: '地址',
-    ALIAS: '简称',
-    POSITION: '职位',
-    CN_ID_CARD: '身份证号',
-    CN_PHONE: '手机号',
-    LANDLINE_PHONE: '座机号',
-    CN_BANK_CARD: '银行卡号',
-    CN_CREDIT_CODE: '统一社会信用代码',
-    EMAIL_ADDRESS: '邮箱',
-    AMOUNT: '金额',
-    PROJECT_CODE: '项目代号',
-    CONTRACT_NO: '合同编号',
-    CASE_NO: '案号',
-    PRODUCT_NAME: '产品名称',
-    SENSITIVE_TERM: '敏感术语',
-    PROJECT: '项目名称',
-    BANK_NAME: '开户行',
-    ACCOUNT_NAME: '户名'
+    GOVERNMENT: '政府机构'
   }
 
   return typeMap[type] || type
@@ -1897,19 +1780,9 @@ const getTypeName = (type: string) => {
 const getTagType = (type: string) => {
   const tagMap: Record<string, '' | 'success' | 'warning' | 'danger' | 'info' | 'primary'> = {
     PERSON: 'success',
-    PERSON_NAME: 'success',
     ORGANIZATION: 'warning',
-    COMPANY_NAME: 'warning',
     LOCATION: 'info',
-    POSITION: 'primary',
-    CN_ID_CARD: 'danger',
-    CN_PHONE: 'danger',
-    LANDLINE_PHONE: 'danger',
-    CN_BANK_CARD: 'danger',
-    CONTRACT_NO: 'primary',
-    PROJECT: 'info',
-    BANK_NAME: 'warning',
-    ACCOUNT_NAME: 'warning'
+    GOVERNMENT: 'primary'
   }
 
   return tagMap[type] || ''
@@ -1938,12 +1811,15 @@ const buildReviewSummary = (metadata: Record<string, any>) => {
     }
     return `小 Qwen：已参与，精审 ${selectedCount} 段，未返回可用候选。`
   }
+  if (metadata.review_quality_mode === 'rule_first') {
+    return '规则层质量检查已启用，小模型仅在高风险片段中兜底。'
+  }
   if (metadata.review_model_installed === false) {
-    return '小 Qwen：未参与，精审模型未安装。'
+    return '精审模型未参与，模型未安装。'
   }
   const reason = formatReviewSkipReason(metadata.review_skipped_reason)
   if (reason) {
-    return `小 Qwen：未参与，${reason}。`
+    return `精审模型未参与，${reason}。`
   }
   return ''
 }
@@ -2011,11 +1887,6 @@ const loadExistingAnalysis = async (taskId: string) => {
   }
 }
 
-watch(selectedDesensitizeMode, async () => {
-  await loadRuntimeStatusState(selectedDesensitizeMode.value)
-  await loadModelCatalog()
-})
-
 onMounted(async () => {
   loadDefaultSettings()
   await loadRuntimeStatusState(selectedDesensitizeMode.value)
@@ -2062,39 +1933,6 @@ onMounted(async () => {
 
 .hidden-folder-input {
   display: none;
-}
-
-.workflow-picker-card {
-  margin-bottom: 16px;
-  padding: 14px;
-  border-radius: 10px;
-  background: #eef6ff;
-  border: 1px solid #bfdbfe;
-}
-
-.workflow-picker-header {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.workflow-picker-title {
-  font-size: 15px;
-  font-weight: 700;
-  color: #1e3a8a;
-}
-
-.workflow-picker-subtitle {
-  margin-top: 6px;
-  font-size: 12px;
-  line-height: 1.6;
-  color: #475569;
-}
-
-.workflow-radio-group {
-  margin-top: 12px;
-  display: flex;
-  flex-wrap: wrap;
 }
 
 .folder-picker-card {
@@ -2360,18 +2198,6 @@ onMounted(async () => {
 
 :deep(.batch-failed-row) {
   --el-table-tr-bg-color: #fff7ed;
-}
-
-.wps-template-card {
-  margin-bottom: 16px;
-  padding: 14px;
-  border: 1px dashed #bfdbfe;
-  border-radius: 8px;
-  background: #f8fbff;
-}
-
-.template-upload {
-  margin-top: 10px;
 }
 
 .text-preview {

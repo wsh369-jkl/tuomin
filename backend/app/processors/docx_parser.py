@@ -3,7 +3,6 @@
 import asyncio
 import logging
 import zipfile
-from pathlib import Path
 from typing import Any, Dict, List
 from xml.etree import ElementTree as ET
 
@@ -11,11 +10,11 @@ from docx import Document
 
 from app.processors.base_parser import BaseParser
 from app.processors.docx_xml_utils import (
+    DocxVisibleTextUnit,
     count_paragraph_page_breaks,
     count_paragraph_section_page_breaks,
-    extract_docx_text,
+    extract_docx_visible_text_units,
 )
-from app.services.pdf_word_audit_v4.docx_evidence import DocxEvidenceExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -43,12 +42,17 @@ class DOCXParser(BaseParser):
         }
 
         try:
-            text, tracked_metadata = extract_docx_text(file_path)
+            estimated_page_count = self._estimate_page_count_from_package_hint(file_path)
+            text, tracked_metadata, text_units = extract_docx_visible_text_units(
+                file_path,
+                estimated_page_count=estimated_page_count,
+            )
         except Exception as exc:
             logger.warning(
                 "DOCX XML extraction failed, falling back to python-docx paragraphs: %s",
                 exc,
             )
+            text_units = []
             text_parts = []
             for paragraph in doc.paragraphs:
                 if paragraph.text.strip():
@@ -62,7 +66,7 @@ class DOCXParser(BaseParser):
 
             text = "\n".join(text_parts)
 
-        structure = self._build_structure(file_path, text=text)
+        structure = self._build_structure(file_path, text=text, text_units=text_units)
         metadata = {
             "paragraphs": len(doc.paragraphs),
             "tables": len(doc.tables),
@@ -87,20 +91,17 @@ class DOCXParser(BaseParser):
     def supports(self, file_extension: str) -> bool:
         return file_extension.lower() == ".docx"
 
-    def _build_structure(self, file_path: str, *, text: str) -> Dict[str, Any]:
+    def _build_structure(
+        self,
+        file_path: str,
+        *,
+        text: str,
+        text_units: List[DocxVisibleTextUnit] | None = None,
+    ) -> Dict[str, Any]:
         page_count = self._estimate_page_count(file_path, text=text)
-        try:
-            units = DocxEvidenceExtractor().extract(
-                docx_path=Path(file_path),
-                estimated_page_count=page_count,
-            )
-        except Exception as exc:
-            logger.warning("DOCX page structure extraction failed: %s", exc)
-            return {
-                "pages": self._build_fallback_pages(text=text, page_count=page_count),
-                "page_count": max(1, page_count),
-            }
-
+        units = list(text_units or [])
+        if units:
+            self._fill_missing_docx_page_numbers(units=units, page_count=page_count)
         pages = self._build_pages_from_units(text=text, units=units, page_count=page_count)
         if not pages:
             pages = self._build_fallback_pages(text=text, page_count=page_count)
@@ -108,7 +109,18 @@ class DOCXParser(BaseParser):
         return {
             "pages": pages,
             "page_count": resolved_page_count,
+            "docx_text_units": [unit.to_dict(include_fragments=True) for unit in units],
+            "docx_text_extraction": "ooxml_visible_text_units" if units else "fallback_text",
         }
+
+    def _estimate_page_count_from_package_hint(self, file_path: str) -> int:
+        app_page_count = self._read_app_page_count(file_path)
+        explicit_page_count = self._count_explicit_pages(file_path)
+        if app_page_count > 0:
+            return max(1, app_page_count, explicit_page_count)
+        if explicit_page_count > 0:
+            return max(1, explicit_page_count)
+        return 0
 
     def _estimate_page_count(self, file_path: str, *, text: str) -> int:
         explicit_page_count = self._count_explicit_pages(file_path)
@@ -189,7 +201,11 @@ class DOCXParser(BaseParser):
         last_page_no = 1
 
         for unit in units:
-            unit_dict = unit.to_dict() if hasattr(unit, "to_dict") else dict(unit)
+            unit_dict = (
+                unit.to_dict(include_fragments=True)
+                if hasattr(unit, "to_dict")
+                else dict(unit)
+            )
             if str(unit_dict.get("part_name") or "") != "word/document.xml":
                 continue
             unit_text = str(unit_dict.get("text", "") or "").strip()
@@ -210,6 +226,12 @@ class DOCXParser(BaseParser):
             page["units"].append(unit_dict)
             if unit_text:
                 page["texts"].append(unit_text)
+            if self._coerce_int(unit_dict.get("start"), -1) >= 0:
+                starts = page.setdefault("unit_starts", [])
+                starts.append(self._coerce_int(unit_dict.get("start"), -1))
+            if self._coerce_int(unit_dict.get("end"), -1) >= 0:
+                ends = page.setdefault("unit_ends", [])
+                ends.append(self._coerce_int(unit_dict.get("end"), -1))
 
         if not grouped:
             return []
@@ -220,7 +242,14 @@ class DOCXParser(BaseParser):
         for page_no in range(1, max_page_no + 1):
             page = grouped.get(page_no) or {"page_number": page_no, "texts": [], "units": []}
             page_text = "\n".join(page.get("texts", [])).strip()
-            start, end, cursor = self._locate_page_span(text=text, page_text=page_text, cursor=cursor)
+            unit_starts = [value for value in page.get("unit_starts", []) if isinstance(value, int) and value >= 0]
+            unit_ends = [value for value in page.get("unit_ends", []) if isinstance(value, int) and value >= 0]
+            if unit_starts and unit_ends:
+                start = min(unit_starts)
+                end = max(unit_ends)
+                cursor = end
+            else:
+                start, end, cursor = self._locate_page_span(text=text, page_text=page_text, cursor=cursor)
             ordered_pages.append(
                 {
                     "page_number": page_no,
@@ -288,3 +317,26 @@ class DOCXParser(BaseParser):
             )
             start = max(end, start + 1)
         return pages
+
+    def _fill_missing_docx_page_numbers(
+        self,
+        *,
+        units: List[DocxVisibleTextUnit],
+        page_count: int,
+    ) -> None:
+        body_units = [unit for unit in units if unit.part_name == "word/document.xml"]
+        total = max(1, len(body_units))
+        for index, unit in enumerate(body_units):
+            if isinstance(unit.estimated_page_no, int) and unit.estimated_page_no > 0:
+                continue
+            if page_count <= 1:
+                unit.estimated_page_no = 1
+                continue
+            estimated = int((index / total) * page_count) + 1
+            unit.estimated_page_no = max(1, min(page_count, estimated))
+
+    def _coerce_int(self, value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default

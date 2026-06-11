@@ -16,6 +16,8 @@ from app.services.lowmem_entity_utils import (
     has_identity_reference_prefix,
     is_identity_reference_term,
     is_generic_organization_term,
+    is_non_subject_action_or_function_term,
+    is_non_subject_generic_org_reference,
     is_org_like_text,
     is_position_title,
     is_probable_person,
@@ -24,10 +26,12 @@ from app.services.lowmem_entity_utils import (
     remap_results_to_source,
     sanitize_recognition_text,
     strip_identity_reference_prefix,
+    subject_noun_gate,
 )
 from app.services.lowmem_memory import release_runtime_memory
 from app.services.lowmem_model_assets import build_model_asset
 from app.services.hf_token_classifier import HFTokenClassificationPipeline
+from app.services.legal_text_segmenter import iter_legal_text_segments
 
 
 class ChineseNERService:
@@ -316,8 +320,10 @@ class ChineseNERService:
         if entity_type in {"ORGANIZATION", "COURT"}:
             org_trimmed = self._trim_to_semantic_org_value(value)
             if org_trimmed != value:
-                delta = len(value) - len(org_trimmed)
-                start += delta
+                delta = value.find(org_trimmed)
+                if delta < 0:
+                    delta = len(value) - len(org_trimmed) if value.endswith(org_trimmed) else 0
+                start += max(0, delta)
                 value = org_trimmed
                 end = start + len(value)
 
@@ -387,6 +393,9 @@ class ChineseNERService:
 
     def _trim_to_semantic_org_value(self, value: str) -> str:
         cleaned = value.strip(self.TRAILING_PUNCTUATION)
+        normalized = self._normalize_org_candidate_text(cleaned)
+        if normalized != cleaned:
+            return normalized
         separators = (
             "的是",
             "负责的是",
@@ -418,7 +427,7 @@ class ChineseNERService:
             if separator == "诉" and candidate.startswith("讼"):
                 continue
             if len(candidate) >= 2 and re.search(ORG_SUFFIX_PATTERN, candidate):
-                return candidate
+                return self._normalize_org_candidate_text(candidate)
         return cleaned
 
     def _is_valid_model_candidate(self, entity_type: str, value: str) -> bool:
@@ -429,27 +438,23 @@ class ChineseNERService:
         if entity_type == "LOCATION":
             if normalized in self.LOCATION_NOISE_TERMS:
                 return False
-            return True
+            return subject_noun_gate("LOCATION", normalized)[0]
 
         if entity_type == "ADDRESS":
             if normalized in self.LOCATION_NOISE_TERMS:
                 return False
             address_tokens = ["省", "市", "区", "县", "镇", "乡", "村", "路", "街", "道", "号", "栋", "室"]
-            return len(normalized) >= 6 or any(token in normalized for token in address_tokens)
+            return (len(normalized) >= 6 or any(token in normalized for token in address_tokens)) and subject_noun_gate("LOCATION", normalized)[0]
 
         if entity_type == "PERSON":
-            if normalized in self.PERSON_NOISE_TERMS or is_identity_reference_term(normalized):
-                return False
-            if is_org_like_text(normalized) or is_position_title(normalized):
-                return False
-            if any(token in normalized for token in ("省", "市", "区", "县", "镇", "乡", "村", "路", "街", "号", "室")):
-                return False
-            return re.fullmatch(r"[\u4e00-\u9fa5]{2,8}(?:·[\u4e00-\u9fa5]{2,8})?", normalized) is not None
+            return normalized not in self.PERSON_NOISE_TERMS and subject_noun_gate("PERSON", normalized)[0]
 
         if entity_type in {"ORGANIZATION", "COURT"}:
             prefixed_remainder = strip_identity_reference_prefix(normalized)
             if prefixed_remainder:
                 normalized = prefixed_remainder
+            if is_non_subject_generic_org_reference(normalized) or is_non_subject_action_or_function_term(normalized):
+                return False
             if normalized in {
                 "上诉人",
                 "被上诉人",
@@ -467,41 +472,31 @@ class ChineseNERService:
                 return False
             if is_generic_organization_term(normalized) or normalized in GENERIC_ORGANIZATION_TERMS:
                 return False
+            if self._valid_short_organization_model_candidate(normalized):
+                return True
             if is_probable_person(normalized) and not is_org_like_text(normalized):
                 return False
             if len(normalized) > 12 and any(token in normalized for token in self.ORGANIZATION_PROSE_NOISE):
                 return False
             if len(normalized) > 16 and any(token in normalized for token in ("的", "是", "至", "了")):
                 return False
-            return True
+            gate_type = "GOVERNMENT" if entity_type == "COURT" else "ORGANIZATION"
+            return subject_noun_gate(gate_type, normalized, allow_short_org=False)[0]
 
         return True
 
+    @staticmethod
+    def _valid_short_organization_model_candidate(normalized: str) -> bool:
+        if not looks_like_organization_short_name(normalized):
+            return False
+        if len(normalized) >= 4:
+            return True
+        if any(token in normalized for token in ("科技", "创新", "建设", "工程", "商贸", "投资", "实业", "产业", "物流")):
+            return True
+        return False
+
     def _iter_segments(self, text: str, *, max_chars: int = 450) -> Iterable[tuple[str, int]]:
-        cursor = 0
-        for raw_line in text.splitlines(keepends=True):
-            line_start = cursor
-            cursor += len(raw_line)
-            line = raw_line.rstrip("\r\n")
-            if not line.strip():
-                continue
-            if len(line) <= max_chars:
-                yield line, line_start
-                continue
-            start = 0
-            while start < len(line):
-                end = min(len(line), start + max_chars)
-                if end < len(line):
-                    split_at = max(
-                        line.rfind("。", start, end),
-                        line.rfind("；", start, end),
-                        line.rfind("，", start, end),
-                        line.rfind(" ", start, end),
-                    )
-                    if split_at > start + 40:
-                        end = split_at + 1
-                yield line[start:end], line_start + start
-                start = end
+        yield from iter_legal_text_segments(text, max_chars=max_chars, overlap_chars=80, min_split_chars=60)
 
     def _map_prediction_type(self, item: dict) -> Optional[str]:
         raw_label = str(item.get("entity_group") or item.get("entity") or "").strip()

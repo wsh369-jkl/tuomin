@@ -17,6 +17,7 @@ import requests
 from app.core.identifier_rules import ALL_IDENTIFIER_LABELS, compact_text, label_matches, looks_like_case_number
 from app.core.llm_strategy import get_llm_strategy_profile, get_runtime_llm_strategy_profile
 from app.core.config import settings
+from app.core.ollama_runtime import ensure_ollama_service_running
 
 logger = logging.getLogger(__name__)
 
@@ -635,6 +636,8 @@ class OllamaLLMService:
             logger.warning("Ollama is not reachable. Run `ollama serve` first.")
 
     def _check_connection(self) -> bool:
+        if ensure_ollama_service_running(self.base_url):
+            return True
         try:
             response = requests.get(f"{self.base_url}/api/tags", timeout=2)
             return response.status_code == 200

@@ -17,11 +17,7 @@ export const useRuntimeModels = () => {
       modelCatalog.value?.profile === 'high_quality_lowmem' ||
       runtimeStatus.value?.desensitize_mode === 'high_quality_lowmem'
   )
-  const isHighQualityWorkflow = computed(() =>
-    ['high_quality_lowmem', 'local_high_quality'].includes(
-      modelCatalog.value?.profile || runtimeStatus.value?.desensitize_mode || ''
-    )
-  )
+  const isHighQualityWorkflow = computed(() => isHighQualityLowmem.value)
   const allModelOptions = computed(() => modelCatalog.value?.models || [])
   const llmModelOptions = computed(() => {
     const models = allModelOptions.value

@@ -927,7 +927,7 @@ def run_pdf_word_audit_worker_blocking(
         },
         input_prefix="pdf-word-audit-in-",
         output_prefix="pdf-word-audit-out-",
-        timeout_seconds=max(int(settings.LOCAL_PDF_FRONTLINE_WORKER_TIMEOUT or 0), 7200),
+        timeout_seconds=max(int(settings.PDF_WORD_AUDIT_V4_WORKER_TIMEOUT or 0), 7200),
         progress_callback=progress_callback,
         env_overrides={
             "OMP_NUM_THREADS": str(audit_threads),

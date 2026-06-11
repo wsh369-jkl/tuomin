@@ -5,31 +5,14 @@
         <div class="eyebrow">Workspace</div>
         <h1>本地文档工作台</h1>
         <p>
-          当前系统分成三块独立功能区。文本脱敏负责识别、脱敏与导出；律师协助负责结构化审阅、
-          风险提示和证据定位；PDF 转 Word 核查负责复核 WPS 转换底稿，三边互不干扰。
+          当前系统分成两块独立功能区。文本脱敏负责识别、脱敏与导出；PDF 转 Word 核查负责复核
+          WPS 转换底稿，两边互不干扰。
         </p>
       </div>
       <div class="hero-status">
         <div class="status-card" :class="runtimeStatus?.ready ? 'is-ready' : 'is-pending'">
           <div class="status-label">运行状态</div>
           <div class="status-value">{{ runtimeStatus?.ready ? '已就绪' : '待初始化' }}</div>
-          <div class="workflow-selector">
-            <div class="status-label">默认线路</div>
-            <el-radio-group
-              v-model="selectedDesensitizeMode"
-              size="small"
-              @change="saveWorkspaceMode"
-            >
-              <el-radio-button
-                v-for="option in desensitizeModeOptions"
-                :key="option.value"
-                :label="option.value"
-              >
-                {{ option.label }}
-              </el-radio-button>
-            </el-radio-group>
-            <div class="workflow-hint">{{ selectedModeDescription }}</div>
-          </div>
           <div class="status-hint">
             {{ runtimeStatus?.recommended_action || '正在读取运行环境...' }}
           </div>
@@ -38,7 +21,7 @@
     </div>
 
     <el-row :gutter="20" class="entry-grid">
-      <el-col :xs="24" :lg="8">
+      <el-col :xs="24" :lg="12">
         <el-card shadow="hover" class="entry-card">
           <div class="entry-eyebrow">独立功能区 A</div>
           <div class="entry-title">文本脱敏</div>
@@ -56,34 +39,9 @@
         </el-card>
       </el-col>
 
-      <el-col :xs="24" :lg="8">
+      <el-col :xs="24" :lg="12">
         <el-card shadow="hover" class="entry-card">
           <div class="entry-eyebrow">独立功能区 B</div>
-          <div class="entry-title">律师协助</div>
-          <div class="entry-description">
-            当前阶段提供单文书律师协助，优先输出案件首页、请求事项拆解、程序信息核对、证据缺口和待补材料清单。
-          </div>
-          <div class="entry-points">
-            <el-tag type="success" effect="plain">案件首页</el-tag>
-            <el-tag type="warning" effect="plain">请求拆解</el-tag>
-            <el-tag type="info" effect="plain">程序核对</el-tag>
-            <el-tag type="danger" effect="plain">缺口清单</el-tag>
-          </div>
-          <el-button
-            type="primary"
-            plain
-            size="large"
-            :disabled="!runtimeStatus?.ready"
-            @click="router.push('/assistant')"
-          >
-            进入律师协助
-          </el-button>
-        </el-card>
-      </el-col>
-
-      <el-col :xs="24" :lg="8">
-        <el-card shadow="hover" class="entry-card">
-          <div class="entry-eyebrow">独立功能区 C</div>
           <div class="entry-title">PDF 转 Word 核查</div>
           <div class="entry-description">
             使用 WPS 转换 DOCX 保留版面，再用本机 OCR 和审查模型复核文本差异，只写入批注和证据报告。
@@ -109,44 +67,22 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { getRuntimeStatus, type RuntimeStatusResponse } from '@/api/desensitize'
-import {
-  desensitizeModeOptions,
-  loadAppSettings,
-  normalizeDesensitizeMode,
-  saveAppSettings,
-  type DesensitizeMode
-} from '@/utils/settings'
 
 const router = useRouter()
 const runtimeStatus = ref<RuntimeStatusResponse | null>(null)
-const selectedDesensitizeMode = ref<DesensitizeMode>('high_quality_lowmem')
-
-const selectedModeDescription = computed(
-  () =>
-    desensitizeModeOptions.find((item) => item.value === selectedDesensitizeMode.value)
-      ?.description || ''
-)
 
 const refreshRuntimeStatus = async () => {
   try {
-    runtimeStatus.value = await getRuntimeStatus(selectedDesensitizeMode.value)
+    runtimeStatus.value = await getRuntimeStatus()
   } catch {
     runtimeStatus.value = null
   }
 }
 
-const saveWorkspaceMode = async () => {
-  const settings = loadAppSettings()
-  settings.desensitize_mode_default = selectedDesensitizeMode.value
-  saveAppSettings(settings)
-  await refreshRuntimeStatus()
-}
-
 onMounted(async () => {
-  selectedDesensitizeMode.value = normalizeDesensitizeMode(loadAppSettings().desensitize_mode_default)
   await refreshRuntimeStatus()
 })
 </script>

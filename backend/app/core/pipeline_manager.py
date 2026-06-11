@@ -10,11 +10,14 @@ from app.core.operator_registry import OperatorRegistry
 from app.core.config import settings
 from app.core.recognizer_base import RecognizerResult
 from app.core.recognizer_registry import RecognizerRegistry
+from app.rules.default_subject_policy import DEFAULT_SUBJECT_TYPES, canonicalize_default_result
 from app.services.contextual_desensitization_service import ContextualDesensitizationService
 from app.services.lowmem_entity_utils import (
     IDENTITY_REFERENCE_TERMS,
     NON_ENTITY_ROLE_TERMS,
+    expand_subject_span_to_containing_shape,
     is_identity_reference_term,
+    is_official_institution_text,
     is_org_like_text,
     is_position_title,
     looks_like_organization_short_name,
@@ -28,6 +31,12 @@ class PipelineManager:
 
     PRIORITY_MAP = {
         "regex": 1,
+        "rule_format": 1,
+        "rule_organization": 2,
+        "rule_person": 2,
+        "rule_address": 2,
+        "rule_bank": 2,
+        "rule_alias": 2,
         "custom": 2,
         "contract": 3,
         "contract_structure_backfill": 4,
@@ -59,11 +68,13 @@ class PipelineManager:
         "COURT": 2,
         "PROJECT": 2,
         "LOCATION": 2,
+        "GOVERNMENT": 2,
         "POSITION": 2,
         "PERSON": 2,
         "PERSON_NAME": 2,
         "ORGANIZATION": 3,
         "COMPANY_NAME": 3,
+        "ALIAS": 3,
     }
 
     PROPAGATION_TYPES = {
@@ -75,9 +86,11 @@ class PipelineManager:
         "BANK_NAME",
         "PROJECT",
         "LOCATION",
+        "ADDRESS",
+        "GOVERNMENT",
+        "COURT",
         "CONTRACT_NO",
         "CASE_NO",
-        "ADDRESS",
         "ALIAS",
     }
 
@@ -308,14 +321,11 @@ class PipelineManager:
     ) -> str:
         logger.info("Anonymize pipeline started, entities=%s", len(entities))
 
-        if not entities:
-            return text
-
         config = self._get_default_operator_config()
         if operator_config:
             config.update(operator_config)
 
-        sorted_entities = sorted(entities, key=lambda item: item["start"], reverse=True)
+        sorted_entities = sorted(entities or [], key=lambda item: item["start"], reverse=True)
         result = text
 
         for entity in sorted_entities:
@@ -465,7 +475,10 @@ class PipelineManager:
     ) -> List[RecognizerResult]:
         validated: List[RecognizerResult] = []
 
-        for result in results:
+        for raw_result in results:
+            result = canonicalize_default_result(raw_result)
+            if result is None:
+                continue
             if result.start < 0 or result.end > len(text) or result.start >= result.end:
                 logger.warning("Invalid entity span skipped: %s", result)
                 continue
@@ -479,6 +492,8 @@ class PipelineManager:
                 )
                 continue
 
+            result = self._expand_result_to_containing_subject_shape(result, text)
+
             if not self._is_valid_entity_candidate(result, text):
                 logger.debug("Invalid entity candidate skipped: %s", result)
                 continue
@@ -488,32 +503,46 @@ class PipelineManager:
         logger.debug("Validated entities: %s -> %s", len(results), len(validated))
         return validated
 
+    @staticmethod
+    def _expand_result_to_containing_subject_shape(
+        result: RecognizerResult,
+        text: str,
+    ) -> RecognizerResult:
+        expanded_span = expand_subject_span_to_containing_shape(
+            text,
+            result.start,
+            result.end,
+            result.entity_type,
+        )
+        if expanded_span is None:
+            return result
+        expanded_start, expanded_end = expanded_span
+        if expanded_start == result.start and expanded_end == result.end:
+            return result
+        expanded_text = text[expanded_start:expanded_end]
+        if not expanded_text:
+            return result
+        metadata = dict(result.metadata or {})
+        metadata.setdefault(
+            "default_validation_expanded_from",
+            {
+                "start": result.start,
+                "end": result.end,
+                "text": result.text,
+            },
+        )
+        return RecognizerResult(
+            entity_type=result.entity_type,
+            start=expanded_start,
+            end=expanded_end,
+            score=max(float(result.score or 0.0), 0.86),
+            text=expanded_text,
+            source=result.source,
+            metadata=metadata,
+        )
+
     def _get_default_operator_config(self) -> Dict[str, Dict]:
         return {
-            "CN_ID_CARD": {
-                "operator": "mask",
-                "params": {"keep_start": 6, "keep_end": 4},
-            },
-            "CN_PHONE": {
-                "operator": "mask",
-                "params": {"keep_start": 3, "keep_end": 4},
-            },
-            "LANDLINE_PHONE": {
-                "operator": "mask",
-                "params": {"keep_start": 4, "keep_end": 2},
-            },
-            "CN_BANK_CARD": {
-                "operator": "mask",
-                "params": {"keep_start": 4, "keep_end": 4},
-            },
-            "CN_CREDIT_CODE": {
-                "operator": "mask",
-                "params": {"keep_start": 8, "keep_end": 2},
-            },
-            "EMAIL_ADDRESS": {
-                "operator": "mask",
-                "params": {"mask_email": True},
-            },
             "PERSON": {
                 "operator": "replace",
                 "params": {"new_value": "[\u59d3\u540d]"},
@@ -528,7 +557,7 @@ class PipelineManager:
             },
             "COMPANY_NAME": {
                 "operator": "replace",
-                "params": {"new_value": "[\u516c\u53f8]"},
+                "params": {"new_value": "[\u673a\u6784]"},
             },
             "LOCATION": {
                 "operator": "replace",
@@ -538,17 +567,29 @@ class PipelineManager:
                 "operator": "replace",
                 "params": {"new_value": "[\u5730\u5740]"},
             },
+            "GOVERNMENT": {
+                "operator": "replace",
+                "params": {"new_value": "[\u653f\u5e9c\u673a\u6784]"},
+            },
             "COURT": {
                 "operator": "replace",
-                "params": {"new_value": "[\u6cd5\u9662]"},
+                "params": {"new_value": "[\u653f\u5e9c\u673a\u6784]"},
             },
-            "POSITION": {
+            "BANK_NAME": {
                 "operator": "replace",
-                "params": {"new_value": ""},
+                "params": {"new_value": "[\u673a\u6784]"},
+            },
+            "ACCOUNT_NAME": {
+                "operator": "replace",
+                "params": {"new_value": "[\u673a\u6784]"},
+            },
+            "ALIAS": {
+                "operator": "replace",
+                "params": {"new_value": "[\u673a\u6784]"},
             },
             "PROJECT": {
                 "operator": "replace",
-                "params": {"new_value": "[\u9879\u76ee\u540d\u79f0]"},
+                "params": {"new_value": "[\u673a\u6784]"},
             },
             "CONTRACT_NO": {
                 "operator": "mask",
@@ -558,40 +599,11 @@ class PipelineManager:
                 "operator": "mask",
                 "params": {"keep_start": 0, "keep_end": 0},
             },
-            "BANK_NAME": {
-                "operator": "replace",
-                "params": {"new_value": "[\u5f00\u6237\u884c]"},
-            },
-            "ACCOUNT_NAME": {
-                "operator": "replace",
-                "params": {"new_value": "[\u6237\u540d]"},
-            },
-            "ALIAS": {
-                "operator": "replace",
-                "params": {"new_value": "[\u7b80\u79f0]"},
-            },
-            "PROJECT_CODE": {
-                "operator": "replace",
-                "params": {"new_value": "[\u9879\u76ee\u4ee3\u53f7]"},
-            },
-            "PRODUCT_NAME": {
-                "operator": "replace",
-                "params": {"new_value": "[\u4ea7\u54c1\u540d\u79f0]"},
-            },
-            "SENSITIVE_TERM": {
-                "operator": "replace",
-                "params": {"new_value": "[\u654f\u611f\u672f\u8bed]"},
-            },
-            "AMOUNT": {
-                "operator": "replace",
-                "params": {"new_value": ""},
-            },
             "default": {
                 "operator": "mask",
                 "params": {},
             },
         }
-
     def _expand_repeated_mentions(
         self,
         results: List[RecognizerResult],
@@ -603,11 +615,14 @@ class PipelineManager:
         for result in sorted(results, key=lambda item: (-(item.end - item.start), item.start)):
             if result.entity_type not in self.PROPAGATION_TYPES:
                 continue
+            if not self._stable_seed_for_default_propagation(result):
+                continue
 
             for candidate_text in self._derive_candidate_texts(result.text, result.entity_type):
                 if len(candidate_text.strip()) < 2:
                     continue
-                if not self._should_propagate_candidate(candidate_text, result.entity_type):
+                anchor_allows_short_org = self._allows_anchored_short_organization_propagation(result, candidate_text)
+                if not self._should_propagate_candidate(candidate_text, result.entity_type, anchor_allows_short_org=anchor_allows_short_org):
                     continue
 
                 for start, end, matched_text in self._find_all_occurrence_spans(text, candidate_text):
@@ -615,6 +630,8 @@ class PipelineManager:
                     if key in seen:
                         continue
                     if self._overlaps_existing(start, end, expanded):
+                        continue
+                    if anchor_allows_short_org and not self._has_short_organization_occurrence_context(text, start, end):
                         continue
 
                     expanded.append(
@@ -625,7 +642,12 @@ class PipelineManager:
                             score=max(0.72, float(result.score) - 0.08),
                             text=matched_text,
                             source="propagate",
-                            metadata={"derived_from": result.text, "candidate_text": candidate_text},
+                            metadata={
+                                **dict(result.metadata or {}),
+                                "derived_from": result.text,
+                                "candidate_text": candidate_text,
+                                "propagated_from_stable_seed": True,
+                            },
                         )
                     )
                     seen.add(key)
@@ -633,23 +655,51 @@ class PipelineManager:
         expanded.sort(key=lambda item: (item.start, item.end))
         return expanded
 
+    @staticmethod
+    def _stable_seed_for_default_propagation(result: RecognizerResult) -> bool:
+        metadata = dict(result.metadata or {})
+        if metadata.get("requires_manual_review"):
+            return False
+        if metadata.get("candidate_types") or metadata.get("boundary_repaired_from"):
+            return False
+        if metadata.get("default_subject_policy_type_from"):
+            return False
+        review_statuses = {
+            "ambiguous_short_subject",
+            "unresolved_alias",
+            "alias_without_anchor",
+            "weak_reference",
+            "weak_identity_edge",
+            "hard_conflict",
+        }
+        if str(metadata.get("subject_ledger_status") or "") in review_statuses:
+            return False
+        if str(metadata.get("subject_ledger_subject_status") or "") in review_statuses:
+            return False
+        rule_first = metadata.get("rule_first")
+        if isinstance(rule_first, dict) and (
+            str(rule_first.get("action") or "") == "review"
+            or str(rule_first.get("risk_level") or "") == "high"
+        ):
+            return False
+        return True
+
     def _is_valid_entity_candidate(self, result: RecognizerResult, text: str) -> bool:
         normalized = re.sub(r"[\s:：，,。；;（）()《》【】\"“”'`]", "", result.text or "")
         if not normalized:
             return False
         if normalized in self.NON_SENSITIVE_LABEL_TERMS:
             return False
-        if result.entity_type == "DATE" and result.source in {"uie", "ner", "secondary_ner", "propagate"}:
-            if not self._is_valid_date_candidate(result.text or ""):
-                return False
-        if result.entity_type in {"PERSON", "PERSON_NAME"}:
+        if result.entity_type in self.AUTHORITATIVE_TYPES:
+            return True
+        if result.entity_type in {"DATE", "AMOUNT"}:
+            return True
+        if result.entity_type == "ALIAS":
+            metadata = dict(result.metadata or {})
+            return bool(metadata.get("canonical") or metadata.get("definition_full_text") or metadata.get("definition_alias"))
+        if result.entity_type in {"PERSON", "PERSON_NAME", "LEGAL_REPRESENTATIVE", "CONTACT_PERSON", "SIGNATORY"}:
             if not self._is_valid_person_candidate(normalized, result.source):
                 return False
-        if result.entity_type in {"CASE_NO", "CONTRACT_NO"} and not self._is_valid_identifier_candidate(
-            normalized,
-            result.entity_type,
-        ):
-            return False
         if result.entity_type in {"LOCATION", "ADDRESS"}:
             if len(normalized) < 2 or normalized in self.SPATIAL_NOISE_TERMS:
                 return False
@@ -671,10 +721,10 @@ class PipelineManager:
                 and not self._is_detailed_location_candidate(normalized)
             ):
                 return False
-            if result.entity_type == "ADDRESS":
-                return len(normalized) >= 6 or self._is_valid_location_candidate(normalized)
-        if result.entity_type in {"ORGANIZATION", "COMPANY_NAME", "COURT"}:
-            if result.entity_type == "COURT":
+        if result.entity_type in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME", "BANK_NAME", "PROJECT", "GOVERNMENT", "COURT"}:
+            if result.entity_type in {"GOVERNMENT", "COURT", "BANK_NAME"} and not is_official_institution_text(normalized):
+                return False
+            if result.entity_type == "GOVERNMENT":
                 if self._is_procedural_court_reference(result):
                     return False
                 if normalized in {"法院", "人民法院"}:
@@ -685,7 +735,8 @@ class PipelineManager:
                 normalized,
                 result.source,
             ):
-                return False
+                if not self._is_valid_anchored_propagated_organization_alias(result, text, normalized):
+                    return False
         if result.entity_type == "POSITION":
             if normalized in {
                 "经销商",
@@ -713,17 +764,6 @@ class PipelineManager:
                 return False
             return is_position_title(normalized)
         return True
-
-    @classmethod
-    def _is_valid_date_candidate(cls, value: str) -> bool:
-        normalized = re.sub(r"\s+", "", value or "")
-        if not normalized:
-            return False
-        if normalized in {"签订日期", "合同期限", "同期限", "日期", "年月日", "月日"}:
-            return False
-        if re.fullmatch(r"[一二三四五六七八九十两\d]+个", normalized):
-            return False
-        return cls.DATE_VALUE_PATTERN.search(normalized) is not None
 
     @staticmethod
     def _is_valid_person_candidate(normalized: str, source: str) -> bool:
@@ -779,39 +819,6 @@ class PipelineManager:
             return re.fullmatch(r"[\u4e00-\u9fa5]{2,8}(?:·[\u4e00-\u9fa5]{2,8})?", normalized) is not None
         return True
 
-    @staticmethod
-    def _is_valid_identifier_candidate(normalized: str, entity_type: str) -> bool:
-        if not normalized:
-            return False
-        sentence_noise = (
-            "上诉人",
-            "被上诉人",
-            "原审",
-            "不服",
-            "提起上诉",
-            "诉讼请求",
-            "事实与理由",
-            "以下简称",
-            "判决书",
-            "判决如下",
-            "请求",
-            "认为",
-            "一案",
-        )
-        if any(token in normalized for token in sentence_noise):
-            return False
-        if entity_type == "CASE_NO":
-            if len(normalized) > 48:
-                return False
-            if not any(token in normalized for token in ("号", "字第", "案号")):
-                return False
-            return bool(re.search(r"[\d*＊]{2,}", normalized) or re.search(r"[（(][^)）]{2,}[)）]", normalized))
-        if entity_type == "CONTRACT_NO":
-            if len(normalized) > 80:
-                return False
-            return bool(re.search(r"\d|[A-Za-z]|号", normalized))
-        return True
-
     def _has_supported_location_context(self, result: RecognizerResult, text: str) -> bool:
         normalized = re.sub(r"\s+", "", result.text or "")
         before = text[max(0, result.start - 24) : result.start]
@@ -856,17 +863,105 @@ class PipelineManager:
         context = before + after
         return any(token in context for token in ("根据", "依据", "包括但不限于", "令第", "法律", "法规", "规定", "办法", "条例", "规章"))
 
-    def _should_propagate_candidate(self, candidate_text: str, entity_type: str) -> bool:
+    def _should_propagate_candidate(
+        self,
+        candidate_text: str,
+        entity_type: str,
+        *,
+        anchor_allows_short_org: bool = False,
+    ) -> bool:
         normalized = re.sub(r"[\s:：，,。；;（）()《》【】\"“”'`]", "", candidate_text or "")
         if not normalized or normalized in self.SPATIAL_NOISE_TERMS:
             return False
-        if entity_type == "LOCATION":
+        if entity_type in {"LOCATION", "ADDRESS"}:
             return self._is_detailed_location_candidate(normalized)
-        if entity_type == "ADDRESS":
-            return len(normalized) >= 6 and self._is_detailed_location_candidate(normalized) and not self._is_broad_region_list(normalized)
-        if entity_type in {"ORGANIZATION", "COMPANY_NAME"}:
+        if entity_type in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME", "BANK_NAME", "GOVERNMENT", "COURT", "PROJECT", "ALIAS"}:
+            if entity_type == "ALIAS" and normalized in self.NON_SENSITIVE_LABEL_TERMS:
+                return False
+            if anchor_allows_short_org and len(normalized) <= 6:
+                return True
             return self._is_valid_organization_candidate(normalized, "propagate")
         return True
+
+    def _allows_anchored_short_organization_propagation(self, result: RecognizerResult, candidate_text: str) -> bool:
+        entity_type = str(result.entity_type or "").upper()
+        if entity_type not in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME", "PROJECT", "ALIAS"}:
+            return False
+        normalized_candidate = re.sub(r"[\s:：，,。；;（）()《》【】\"“”'`]", "", candidate_text or "")
+        if not 2 <= len(normalized_candidate) <= 6:
+            return False
+        if normalized_candidate in self.NON_SENSITIVE_LABEL_TERMS:
+            return False
+        if self._is_low_information_organization_alias(normalized_candidate):
+            return False
+        normalized_source = re.sub(r"\s+", "", result.text or "")
+        if is_official_institution_text(normalized_source):
+            return False
+        metadata = dict(result.metadata or {})
+        canonical = str(metadata.get("canonical") or metadata.get("definition_full_text") or "")
+        if result.entity_type == "ALIAS" and canonical:
+            normalized_source = re.sub(r"\s+", "", canonical)
+            if is_official_institution_text(normalized_source):
+                return False
+        if not self.ORGANIZATION_SUFFIX_PATTERN.search(normalized_source):
+            return False
+        if normalized_candidate not in re.sub(r"\s+", "", normalized_source):
+            return False
+        source = str(result.source or "")
+        if source in {"contract_structure_backfill", "rule_organization", "rule_alias", "rule_first"}:
+            return True
+        if metadata.get("source_layer") in {"structure", "rule"}:
+            return True
+        if metadata.get("trigger") in {"party_label", "alias_definition", "signature_subject", "inline_party_role"}:
+            return True
+        return False
+
+    def _is_valid_anchored_propagated_organization_alias(
+        self,
+        result: RecognizerResult,
+        text: str,
+        normalized: str,
+    ) -> bool:
+        if str(result.source or "") != "propagate":
+            return False
+        metadata = dict(result.metadata or {})
+        if not metadata.get("propagated_from_stable_seed"):
+            return False
+        if not 2 <= len(normalized) <= 6:
+            return False
+        if normalized in self.NON_SENSITIVE_LABEL_TERMS:
+            return False
+        if self._is_low_information_organization_alias(normalized):
+            return False
+        if self._looks_like_location_alias(normalized):
+            return False
+        derived_from = re.sub(r"\s+", "", str(metadata.get("derived_from") or ""))
+        if not derived_from or not self.ORGANIZATION_SUFFIX_PATTERN.search(derived_from):
+            return False
+        if normalized not in derived_from:
+            return False
+        return self._has_short_organization_occurrence_context(text, result.start, result.end)
+
+    @staticmethod
+    def _has_short_organization_occurrence_context(text: str, start: int, end: int) -> bool:
+        before = text[max(0, start - 18) : start]
+        after = text[end : min(len(text), end + 24)]
+        sentence_before = re.split(r"[。；;\n\r]", before)[-1]
+        sentence_after = re.split(r"[。；;\n\r]", after, maxsplit=1)[0]
+        context = sentence_before + sentence_after
+        if re.search(r"(?:甲方|乙方|丙方|委托方|受托方|发包人|承包人|供应商|申请人|被申请人|原告|被告|第三人)\s*[:：]?\s*$", sentence_before):
+            return True
+        if re.search(
+            r"(?:负责|继续|履约|履行|结算|付款|收款|交付|供货|签署|签订|盖章|落款|承担|"
+            r"确认|通知|函告|起诉|上诉|申请|被申请|委托|授权|指定|收款|付款|签章)",
+            context,
+        ):
+            return True
+        if re.search(r"(?:以下简称|下称|简称|又称)\s*[“\"'‘’]?$", sentence_before):
+            return True
+        if re.search(r"^(?:公司|集团|商行|工作室|合作社|经营部)", sentence_after):
+            return True
+        return False
 
     def _is_valid_organization_candidate(self, normalized: str, source: str) -> bool:
         if not normalized or normalized in self.SPATIAL_NOISE_TERMS:
@@ -889,11 +984,6 @@ class PipelineManager:
         if source in {"uie", "ner", "secondary_ner", "propagate"} and len(normalized) <= 2 and not self.ORGANIZATION_SUFFIX_PATTERN.search(normalized):
             return False
         if source in {"uie", "ner", "secondary_ner", "propagate"} and normalized in {"气象", "中心", "服务", "和国"}:
-            return False
-        if source in {"uie", "ner", "secondary_ner", "propagate"} and any(
-            token in normalized
-            for token in ("缴款至下列银行", "下列银行", "检测技术服务费用", "项目所在地人民法院")
-        ):
             return False
         if source in {"ner", "secondary_ner", "uie", "propagate"} and normalized.endswith(("部", "部门")) and not self.ORGANIZATION_SUFFIX_PATTERN.search(normalized):
             return False
@@ -983,43 +1073,51 @@ class PipelineManager:
         candidates = [text]
         trimmed = text.strip()
 
-        if entity_type in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME", "PROJECT", "LOCATION"}:
+        organization_family = {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME", "PROJECT", "ALIAS"}
+        official_family = {"BANK_NAME", "GOVERNMENT", "COURT"}
+        if entity_type in {"ORGANIZATION", "LOCATION", "GOVERNMENT", "COMPANY_NAME", "ACCOUNT_NAME", "BANK_NAME", "COURT", "PROJECT"}:
             stripped = re.sub(r"^(?:[\u4e00-\u9fa5]{2,9}(?:省|市|区|县|镇|乡|街道))+", "", trimmed)
             if len(stripped) >= 4 and stripped != trimmed:
                 if entity_type != "LOCATION" or self._is_valid_location_candidate(stripped):
                     candidates.append(stripped)
 
-        if entity_type in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME"}:
+        if entity_type in organization_family:
             match = re.search(
                 r"([\u4e00-\u9fa5A-Za-z0-9]{2,}(?:股份有限公司|有限责任公司|有限公司|集团有限公司|服务中心|技术中心|研究院|事务所|银行|支行|分行|研究所))$",
                 trimmed,
             )
             if match:
                 candidates.append(match.group(1))
+        elif entity_type in official_family:
+            if is_official_institution_text(trimmed):
+                candidates.append(trimmed)
 
-        if entity_type == "PROJECT":
-            match = re.search(r"([\u4e00-\u9fa5A-Za-z0-9.\-]{2,}(?:项目|工程|标段))$", trimmed)
-            if match:
-                candidates.append(match.group(1))
-
-        if entity_type == "BANK_NAME":
-            match = re.search(r"([\u4e00-\u9fa5A-Za-z0-9]{2,}银行(?:股份有限公司)?[\u4e00-\u9fa5A-Za-z0-9]{0,10}(?:支行|分行)?)$", trimmed)
-            if match:
-                candidates.append(match.group(1))
-
-        if entity_type in {"PERSON", "PERSON_NAME"}:
+        if entity_type in {"PERSON", "PERSON_NAME", "LEGAL_REPRESENTATIVE", "CONTACT_PERSON", "SIGNATORY"}:
             candidates.extend(self._derive_person_aliases(trimmed))
 
-        if entity_type in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME"}:
-            candidates.extend(self._derive_organization_aliases(trimmed))
+        if entity_type == "ALIAS":
+            metadata_text = ""
+            # ALIAS seeds carry their full subject in metadata; the caller passes
+            # only text here, so keep direct alias propagation conservative.
+            metadata_text = trimmed
+            if metadata_text:
+                candidates.append(metadata_text)
 
-        if entity_type == "PROJECT":
-            candidates.extend(self._derive_project_aliases(trimmed))
+        if entity_type in organization_family and not is_official_institution_text(trimmed):
+            candidates.extend(self._derive_organization_aliases(trimmed))
 
         deduplicated: List[str] = []
         for candidate in candidates:
             if candidate and candidate not in deduplicated:
                 deduplicated.append(candidate)
+        if entity_type in organization_family:
+            deduplicated = [
+                item
+                for _index, item in sorted(
+                    enumerate(deduplicated),
+                    key=lambda row: (-len(re.sub(r"\s+", "", row[1] or "")), row[0]),
+                )
+            ]
         return deduplicated
 
     def _derive_organization_aliases(self, text: str) -> List[str]:

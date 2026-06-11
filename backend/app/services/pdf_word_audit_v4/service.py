@@ -3177,6 +3177,11 @@ class PdfWordAuditV4Service:
             "账号",
             "账户",
             "电话",
+            "完票",
+            "销账",
+            "销帐",
+            "未销",
+            "预销",
             "清单",
             "明细",
             "统计",
@@ -3810,6 +3815,24 @@ class PdfWordAuditV4Service:
             if compact_place and cleaned_place and self._edit_similarity(compact_place, cleaned_place) < 0.55:
                 return True
         return False
+
+    def _edit_similarity(self, left: str, right: str) -> float:
+        if not left and not right:
+            return 1.0
+        if not left or not right:
+            return 0.0
+        max_len = max(len(left), len(right), 1)
+        previous = list(range(len(right) + 1))
+        for left_index, left_char in enumerate(left, start=1):
+            current = [left_index]
+            for right_index, right_char in enumerate(right, start=1):
+                insert_cost = current[right_index - 1] + 1
+                delete_cost = previous[right_index] + 1
+                replace_cost = previous[right_index - 1] + (0 if left_char == right_char else 1)
+                current.append(min(insert_cost, delete_cost, replace_cost))
+            previous = current
+        distance = previous[-1]
+        return max(0.0, 1.0 - distance / max_len)
 
     def _page_is_image_or_scan(self, *, preflight_result: ConversionPreflightResult, page_no: int) -> bool:
         if page_no <= 0:

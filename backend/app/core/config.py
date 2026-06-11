@@ -30,30 +30,20 @@ PROJECT_ROOT = SOURCE_BACKEND_ROOT.parent
 BUNDLED_RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", SOURCE_BACKEND_ROOT))
 APP_DATA_DIR_NAME = "ContractDesensitize"
 STABLE_OLLAMA_MODEL = "qwen3.5:4b"
-FAST_REVIEW_OLLAMA_MODEL = "qwen3:8b"
-MID_REVIEW_OLLAMA_MODEL = "qwen3.5:9b"
+FAST_REVIEW_OLLAMA_MODEL = STABLE_OLLAMA_MODEL
 MID_REVIEW_FALLBACK_OLLAMA_MODEL = "qwen3:14b"
 DEFAULT_REVIEW_OLLAMA_MODEL = "qwen3.5:27b-q4_K_M"
 HEAVY_ARBITRATION_OLLAMA_MODEL = "qwen3.6:27b"
 REVIEW_OLLAMA_MODEL_PREFIX = "qwen3.5:27b"
+RETIRED_REVIEW_OLLAMA_MODELS = {"qwen3:8b"}
 HIGH_QUALITY_LOWMEM_MODE = "high_quality_lowmem"
-LOCAL_HIGH_QUALITY_MODE = "local_high_quality"
-LEGACY_DESENSITIZE_MODE = "legacy"
 SUPPORTED_DESENSITIZE_MODES = {
     HIGH_QUALITY_LOWMEM_MODE,
-    LOCAL_HIGH_QUALITY_MODE,
-    LEGACY_DESENSITIZE_MODE,
 }
 DESENSITIZE_MODE_ALIASES = {
     "lowmem": HIGH_QUALITY_LOWMEM_MODE,
     "high_quality": HIGH_QUALITY_LOWMEM_MODE,
     "high_quality_low_memory": HIGH_QUALITY_LOWMEM_MODE,
-    "local": LOCAL_HIGH_QUALITY_MODE,
-    "local_high": LOCAL_HIGH_QUALITY_MODE,
-    "local_quality": LOCAL_HIGH_QUALITY_MODE,
-    "baseline": LEGACY_DESENSITIZE_MODE,
-    "standard": LEGACY_DESENSITIZE_MODE,
-    "ollama": LEGACY_DESENSITIZE_MODE,
 }
 _DESENSITIZE_MODE_OVERRIDE: ContextVar[Optional[str]] = ContextVar(
     "desensitize_mode_override",
@@ -82,7 +72,7 @@ def is_supported_desensitize_mode(value: Optional[str]) -> bool:
 @contextmanager
 def desensitize_mode_context(value: Optional[str]) -> Iterator[None]:
     normalized = normalize_desensitize_mode(value)
-    if not normalized:
+    if not normalized or normalized not in SUPPORTED_DESENSITIZE_MODES:
         yield
         return
 
@@ -143,13 +133,13 @@ class Settings(BaseSettings):
     APP_PORT: int = 8000
     CORS_ALLOW_ORIGIN_REGEX: str = LOCAL_CORS_ORIGIN_REGEX
 
-    LLM_BACKEND: str = "ollama"
+    LLM_BACKEND: str = "local"
     DESENSITIZE_MODE: str = HIGH_QUALITY_LOWMEM_MODE
     OLLAMA_BASE_URL: str = "http://127.0.0.1:11434"
     OLLAMA_MODEL: str = STABLE_OLLAMA_MODEL
     OLLAMA_MODEL_OPTIONS: str = (
-        f"{MID_REVIEW_OLLAMA_MODEL},{MID_REVIEW_FALLBACK_OLLAMA_MODEL},{FAST_REVIEW_OLLAMA_MODEL},"
-        f"{STABLE_OLLAMA_MODEL},{HEAVY_ARBITRATION_OLLAMA_MODEL},{DEFAULT_REVIEW_OLLAMA_MODEL}"
+        f"{FAST_REVIEW_OLLAMA_MODEL},{STABLE_OLLAMA_MODEL},"
+        f"{MID_REVIEW_FALLBACK_OLLAMA_MODEL},{HEAVY_ARBITRATION_OLLAMA_MODEL},{DEFAULT_REVIEW_OLLAMA_MODEL}"
     )
     OLLAMA_TIMEOUT: int = 600
     OLLAMA_NUM_CTX: int = 4096
@@ -190,21 +180,10 @@ class Settings(BaseSettings):
     PDF_OCR_QUALITY_GATE_MAX_ABNORMAL_RATIO: float = 0.10
     PDF_OCR_PAGE_RISK_THRESHOLD: float = 0.45
     PDF_OCR_UNPAPER_MODE: str = "off"
-    LOCAL_PDF_FRONTLINE_ENABLED: bool = True
-    LOCAL_PDF_FRONTLINE_PROFILE: str = "quality_first_adaptive"
-    LOCAL_PDF_GLM_MODEL: str = "glm-ocr:latest"
-    LOCAL_PDF_GLM_API_MODE: str = "ollama_generate"
-    LOCAL_PDF_GLM_POLICY: str = "quality_gate"
-    LOCAL_PDF_GLM_SCOPE: str = "page_or_block"
-    LOCAL_PDF_GLM_MAX_WORKERS: int = 1
-    LOCAL_PDF_GLM_MAX_TOKENS: int = 8192
-    LOCAL_PDF_GLM_RENDER_DPI: int = 160
-    LOCAL_PDF_GLM_HIGH_RES_DPI: int = 180
-    LOCAL_PDF_AUDIT_GLM_MAX_PAGES: int = 3
-    LOCAL_PDF_AUDIT_GLM_MAX_PAGE_RATIO: float = 0.25
     PDF_WORD_AUDIT_REVIEW_MODEL: str = ""
     PDF_WORD_AUDIT_REVIEW_PROMPT_PROFILE: str = "evidence_arbitration_v2"
     PDF_WORD_AUDIT_V4_WORKER_THREADS: int = 1
+    PDF_WORD_AUDIT_V4_WORKER_TIMEOUT: int = 7200
     PDF_WORD_AUDIT_V4_RENDER_DPI: int = 180
     PDF_WORD_AUDIT_V4_RENDER_MAX_EDGE: int = 1900
     PDF_WORD_AUDIT_V4_PAGE_ORIENTATION_NORMALIZE_ENABLED: bool = True
@@ -320,59 +299,6 @@ class Settings(BaseSettings):
     PDF_WORD_AUDIT_V4_COVERAGE_BACKFILL_RESOLVE_FUZZY_THRESHOLD: float = 0.9
     PDF_WORD_AUDIT_V4_COVERAGE_SCHEDULER_ENABLED: bool = True
     PDF_WORD_AUDIT_V4_COVERAGE_SCHEDULER_MAX_TASKS: int = 9999
-    LOCAL_PDF_DOCX_RECOVERY_ENGINE: str = "layout_ir_docx_renderer"
-    LOCAL_PDF_DOCX_RECOVERY_TIMEOUT: int = 180
-    LOCAL_PDF_DOCX_RECOVERY_PYTHON: Optional[str] = None
-    LOCAL_PDF_DOCX_RECOVERY_TABLE: bool = False
-    LOCAL_PDF_DOCX_RECOVERY_FORMULA: bool = False
-    LOCAL_PDF_OCR_PYTHON: Optional[str] = None
-    LOCAL_PDF_PPOCRV5_ENABLED: bool = True
-    LOCAL_PDF_PPOCRV5_POLICY: str = "always"
-    LOCAL_PDF_FAST_ANCHOR_MIN_CONFIDENCE: float = 0.93
-    LOCAL_PDF_FAST_ANCHOR_MIN_CHARS: int = 120
-    LOCAL_PDF_FAST_ANCHOR_MAX_LOW_CONF_RATIO: float = 0.10
-    LOCAL_PDF_FAST_ANCHOR_MAX_ABNORMAL_RATIO: float = 0.025
-    LOCAL_PDF_PPSTRUCTUREV3_ENABLED: bool = True
-    LOCAL_PDF_PPSTRUCTUREV3_API_MODE: str = "auto"
-    LOCAL_PDF_PPSTRUCTUREV3_POLICY: str = "always"
-    LOCAL_PDF_PPSTRUCTUREV3_CONFIG: Optional[str] = "models/local_pdf/PP-StructureV3.local.yaml"
-    LOCAL_PDF_PPSTRUCTUREV3_COMMAND: Optional[str] = None
-    LOCAL_PDF_PPSTRUCTUREV3_TIMEOUT: int = 900
-    LOCAL_PDF_PPSTRUCTUREV3_THREADS: int = 1
-    LOCAL_PDF_PPSTRUCTUREV3_PAGE_BATCH_SIZE: int = 1
-    LOCAL_PDF_PPSTRUCTUREV3_DOC_ORIENTATION: bool = True
-    LOCAL_PDF_PPSTRUCTUREV3_DOC_UNWARPING: Any = "auto"
-    LOCAL_PDF_PPSTRUCTUREV3_TEXTLINE_ORIENTATION: bool = True
-    LOCAL_PDF_PPSTRUCTUREV3_TABLE_RECOGNITION: bool = True
-    LOCAL_PDF_PPSTRUCTUREV3_REGION_DETECTION: bool = True
-    LOCAL_PDF_PPSTRUCTUREV3_SEAL_RECOGNITION: bool = False
-    LOCAL_PDF_PPSTRUCTUREV3_FORMULA_RECOGNITION: bool = False
-    LOCAL_PDF_PPSTRUCTUREV3_CHART_RECOGNITION: bool = False
-    LOCAL_PDF_VL_FALLBACK_ENABLED: bool = True
-    LOCAL_PDF_VL_FALLBACK_POLICY: str = "quality_gate"
-    LOCAL_PDF_VL_MAX_PAGES: int = 2
-    LOCAL_PDF_VL_MAX_PAGE_RATIO: float = 0.15
-    LOCAL_PDF_VL_API_MODE: str = "paddleocr_python"
-    LOCAL_PDF_VL_COMMAND: Optional[str] = None
-    LOCAL_PDF_VL_MODEL: str = "PaddlePaddle/PaddleOCR-VL-1.5"
-    LOCAL_PDF_VL_MODEL_DIR: Optional[str] = None
-    LOCAL_PDF_VL_REC_BACKEND: str = "auto"
-    LOCAL_PDF_VL_REC_SERVER_URL: str = "http://localhost:8111/"
-    LOCAL_PDF_VL_LAYOUT_DETECTION: bool = True
-    LOCAL_PDF_VL_DOC_ORIENTATION: bool = True
-    LOCAL_PDF_VL_DOC_UNWARPING: Any = "auto"
-    LOCAL_PDF_VL_OCR_FOR_IMAGE_BLOCK: bool = True
-    LOCAL_PDF_VL_SEAL_RECOGNITION: bool = False
-    LOCAL_PDF_VL_CHART_RECOGNITION: bool = False
-    LOCAL_PDF_VL_MIN_PIXELS: int = 112896
-    LOCAL_PDF_VL_MAX_PIXELS: int = 1605632
-    LOCAL_PDF_VL_TIMEOUT: int = 600
-    LOCAL_PDF_VL_THREADS: int = 1
-    LOCAL_PDF_PAGE_CHECKPOINT_ENABLED: bool = True
-    LOCAL_PDF_CHECKPOINT_TTL_HOURS: int = 24
-    LOCAL_PDF_RENDER_DPI: int = 200
-    LOCAL_PDF_HIGH_RES_DPI: int = 260
-    LOCAL_PDF_FRONTLINE_WORKER_TIMEOUT: int = 7200
     PDF_REVIEW_OCR_RENDER_SCALE: float = 1.45
     PDF_REVIEW_OCR_IMAGE_MAX_EDGE: int = 1700
     PAGE_SESSION_HEARTBEAT_GRACE_SECONDS: int = 15
@@ -401,25 +327,22 @@ class Settings(BaseSettings):
     LMSTUDIO_BASE_URL: str = "http://127.0.0.1:1234/v1"
     REVIEW_LAZY_LOAD: bool = True
     REVIEW_UNLOAD_AFTER_TASK: bool = True
-    REVIEW_NUM_CTX: int = 1536
-    REVIEW_MAX_TOKENS: int = 384
+    REVIEW_NUM_CTX: int = 2048
+    REVIEW_MAX_TOKENS: int = 512
     REVIEW_THINKING_MAX_TOKENS: int = 1024
     REVIEW_TEMPERATURE: float = 0.0
     REVIEW_MAX_SNIPPETS: int = 10
     REVIEW_MAX_CHARS_PER_SNIPPET: int = 1200
-    MID_REVIEW_MODEL: str = MID_REVIEW_OLLAMA_MODEL
-    MID_REVIEW_FALLBACK_MODEL: str = MID_REVIEW_FALLBACK_OLLAMA_MODEL
-    FAST_REVIEW_MODEL: str = FAST_REVIEW_OLLAMA_MODEL
-    LOWMEM_ALLOW_MID_REVIEW_MODEL: bool = False
+    MID_REVIEW_MODEL: str = DEFAULT_LOW_MEM_REVIEW_MODEL
+    MID_REVIEW_FALLBACK_MODEL: str = DEFAULT_LOW_MEM_REVIEW_FALLBACK_MODEL
+    FAST_REVIEW_MODEL: str = DEFAULT_LOW_MEM_REVIEW_MODEL
     LOWMEM_ENABLE_LOCAL_REVIEW_FALLBACK: bool = False
-    LOWMEM_ENABLE_HEAVY_ARBITRATION: bool = False
-    REVIEW_WORKER_TIMEOUT: int = 180
+    REVIEW_WORKER_TIMEOUT: int = 600
     REVIEW_OLLAMA_TIMEOUT: int = 60
-    LOWMEM_REVIEW_OLLAMA_TIMEOUT: int = 45
     HEAVY_ARBITRATION_MODEL: str = HEAVY_ARBITRATION_OLLAMA_MODEL
     ENABLE_HEAVY_ARBITRATION: bool = True
     HEAVY_ARBITRATION_MAX_SNIPPETS: int = 3
-    MID_REVIEW_MAX_SNIPPETS: int = 12
+    MID_REVIEW_MAX_SNIPPETS: int = 36
     REVIEW_THINKING_MODE: str = "mid_review"
     ENABLE_PRIMARY_UIE: bool = True
     ENABLE_PRIMARY_NER: bool = True
@@ -466,34 +389,27 @@ class Settings(BaseSettings):
         return STABLE_OLLAMA_MODEL
 
     def get_effective_desensitize_mode(self) -> str:
-        return (
-            normalize_desensitize_mode(_DESENSITIZE_MODE_OVERRIDE.get())
-            or normalize_desensitize_mode(self.DESENSITIZE_MODE)
-            or HIGH_QUALITY_LOWMEM_MODE
-        )
+        for candidate in (
+            normalize_desensitize_mode(_DESENSITIZE_MODE_OVERRIDE.get()),
+            normalize_desensitize_mode(self.DESENSITIZE_MODE),
+        ):
+            if candidate in SUPPORTED_DESENSITIZE_MODES:
+                return candidate
+        return HIGH_QUALITY_LOWMEM_MODE
 
     def is_high_quality_lowmem_mode(self) -> bool:
         return self.get_effective_desensitize_mode() == HIGH_QUALITY_LOWMEM_MODE
 
-    def is_local_high_quality_mode(self) -> bool:
-        return self.get_effective_desensitize_mode() == LOCAL_HIGH_QUALITY_MODE
-
     def is_high_quality_desensitize_mode(self) -> bool:
-        return self.is_high_quality_lowmem_mode() or self.is_local_high_quality_mode()
+        return self.is_high_quality_lowmem_mode()
 
     def get_high_quality_profile_key(self) -> str:
-        if self.is_local_high_quality_mode():
-            return LOCAL_HIGH_QUALITY_MODE
         return HIGH_QUALITY_LOWMEM_MODE
 
     def get_high_quality_profile_label(self) -> str:
-        if self.is_local_high_quality_mode():
-            return "本机高质量脱敏模式"
         return "高质量低内存模式"
 
     def get_high_quality_memory_tier(self) -> str:
-        if self.is_local_high_quality_mode():
-            return "local_high_quality"
         return "lowmem_high_quality"
 
     def _parse_configured_ollama_model_options(self) -> List[str]:
@@ -523,6 +439,8 @@ class Settings(BaseSettings):
 
     def is_fast_primary_ollama_model(self, model_name: str | None) -> bool:
         normalized = str(model_name or "").strip().lower()
+        if normalized in RETIRED_REVIEW_OLLAMA_MODELS:
+            return False
         size_in_b = self._parse_model_size_in_b(normalized)
         return normalized in {self.get_effective_ollama_model().lower(), self.FAST_REVIEW_MODEL.lower()} or (
             0 < size_in_b < 9 and normalized.startswith(("qwen", "qwen3"))
@@ -530,18 +448,20 @@ class Settings(BaseSettings):
 
     def is_mid_review_ollama_model(self, model_name: str | None) -> bool:
         normalized = str(model_name or "").strip().lower()
+        if normalized in RETIRED_REVIEW_OLLAMA_MODELS:
+            return False
         size_in_b = self._parse_model_size_in_b(normalized)
         if normalized in {
             self.MID_REVIEW_MODEL.lower(),
             self.MID_REVIEW_FALLBACK_MODEL.lower(),
-            self.FAST_REVIEW_MODEL.lower(),
-            "qwen3.5:9b",
         }:
             return True
-        return normalized.startswith(("qwen", "qwen3")) and 8 <= size_in_b < 20
+        return normalized.startswith(("qwen", "qwen3")) and 10 <= size_in_b < 20
 
     def is_heavy_arbitration_ollama_model(self, model_name: str | None) -> bool:
         normalized = str(model_name or "").strip().lower()
+        if normalized in RETIRED_REVIEW_OLLAMA_MODELS:
+            return False
         size_in_b = self._parse_model_size_in_b(normalized)
         return (
             normalized in {self.HEAVY_ARBITRATION_MODEL.lower(), DEFAULT_REVIEW_OLLAMA_MODEL.lower()}
@@ -553,32 +473,11 @@ class Settings(BaseSettings):
     def is_review_capable_ollama_model(self, model_name: str | None) -> bool:
         return self.is_mid_review_ollama_model(model_name) or self.is_heavy_arbitration_ollama_model(model_name)
 
-    def get_lowmem_ollama_review_candidates(self, available_models: Optional[List[str]] = None) -> List[str]:
-        ordered: List[str] = []
-        seen: set[str] = set()
-
-        def _append(model_name: str | None) -> None:
-            normalized = str(model_name or "").strip()
-            if not normalized or normalized in seen:
-                return
-            if self.is_fast_primary_ollama_model(normalized):
-                seen.add(normalized)
-                ordered.append(normalized)
-
-        _append(self.FAST_REVIEW_MODEL)
-        _append(self.get_effective_ollama_model())
-        for item in self._parse_configured_ollama_model_options():
-            _append(item)
-        for item in available_models or []:
-            _append(item)
-        return ordered
-
     def get_route_review_model_candidates(self, available_models: Optional[List[str]] = None) -> List[str]:
         if self.is_high_quality_lowmem_mode():
             return [
                 self.REVIEW_MODEL,
                 self.REVIEW_MODEL_FALLBACK,
-                *self.get_lowmem_ollama_review_candidates(available_models=available_models),
             ]
         return [
             self.MID_REVIEW_MODEL,
@@ -594,6 +493,8 @@ class Settings(BaseSettings):
         def _append(model_name: str | None) -> None:
             normalized = str(model_name or "").strip()
             if not normalized or normalized in seen:
+                return
+            if normalized.lower() in RETIRED_REVIEW_OLLAMA_MODELS:
                 return
             if (
                 normalized == self.get_effective_ollama_model()
@@ -617,10 +518,7 @@ class Settings(BaseSettings):
 
     def get_preferred_ollama_review_model(self, available_models: Optional[List[str]] = None) -> Optional[str]:
         available = {str(item).strip() for item in available_models or [] if str(item).strip()}
-        if self.is_high_quality_lowmem_mode() and not self.LOWMEM_ALLOW_MID_REVIEW_MODEL:
-            for candidate in self.get_lowmem_ollama_review_candidates(available_models=available_models):
-                if not available or candidate in available:
-                    return candidate
+        if self.is_high_quality_lowmem_mode():
             return None
 
         options = self.get_ollama_model_options(available_models=available_models)
@@ -650,7 +548,7 @@ class Settings(BaseSettings):
             for candidate in (self.REVIEW_MODEL, self.REVIEW_MODEL_FALLBACK):
                 if not available or candidate in available:
                     return candidate
-            return self.get_preferred_ollama_review_model(available_models=available_models)
+            return None
         return self.get_preferred_ollama_review_model(available_models=available_models)
 
     def get_default_llm_model(self) -> str:

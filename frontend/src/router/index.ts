@@ -39,7 +39,7 @@ const router = createRouter({
               component: () => import('@/views/Workspace.vue'),
               meta: {
                 title: '工作台',
-                description: '从这里进入文本脱敏、律师协助或 PDF 转 Word 核查，三块功能分区独立运行。'
+                description: '从这里进入文本脱敏或 PDF 转 Word 核查，两块功能分区独立运行。'
               }
             },
             {
@@ -57,16 +57,7 @@ const router = createRouter({
               component: () => import('@/views/Desensitize.vue'),
               meta: {
                 title: '文本脱敏',
-                description: '这里只处理文本识别、脱敏和导出，不承载律师协助功能。'
-              }
-            },
-            {
-              path: 'assistant',
-              name: 'Assistant',
-              component: () => import('@/views/Review.vue'),
-              meta: {
-                title: '律师协助',
-                description: '独立的律师辅助工作流，优先面向诉讼、执行、保全和证据材料。'
+                description: '这里只处理文本识别、脱敏和导出。'
               }
             },
             {
@@ -77,13 +68,6 @@ const router = createRouter({
                 title: 'PDF 转 Word 核查',
                 description: '上传原 PDF 和 WPS 转换 DOCX，核查 OCR 差异并输出带批注的 Word 文档和证据报告。'
               }
-            },
-            {
-              path: 'review',
-              redirect: (to) => ({
-                path: '/assistant',
-                query: to.query
-              })
             },
             {
               path: 'custom-rules',

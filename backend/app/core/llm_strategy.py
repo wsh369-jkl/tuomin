@@ -76,9 +76,9 @@ FAST_4B_PROFILE = STABLE_4B_PROFILE
 
 MID_REVIEW_PROFILE = LLMStrategyProfile(
     key="review_mid_14b",
-    label="9B 片段主审查策略",
+    label="14B 片段补充审查策略",
     description=(
-        "面向 qwen3.5:9b / qwen3:14b / qwen3:8b 的中档审查路线。"
+        "面向 qwen3:14b 等中档模型的补充审查路线。"
         "不做全文长轮次推理，只接收规则和低内存主识别后的高风险片段，"
         "用于补漏、拒绝误识别、归并别名和标注角色。"
     ),
@@ -112,7 +112,7 @@ REVIEW_27B_PROFILE = LLMStrategyProfile(
     key="review_27b",
     label="27B 精审策略",
     description=(
-        "面向律师审阅和高精度识别的 27B 路线。保持分块和重点片段汇总，但显著提高专项召回、"
+        "面向高精度识别的 27B 路线。保持分块和重点片段汇总，但显著提高专项召回、"
         "上下文复审和高风险块覆盖能力，适合手动触发的精查任务。"
     ),
     chunk_target_size=2200,
@@ -153,7 +153,9 @@ def get_llm_strategy_profile(model_name: str | None) -> LLMStrategyProfile:
     normalized = str(model_name or "").lower()
     if size_in_b >= 20 or ":27b" in normalized:
         return REVIEW_27B_PROFILE
-    if 8 <= size_in_b < 20 or normalized in {"qwen3:8b", "qwen3.5:9b"}:
+    if normalized == "qwen3:8b":
+        return STABLE_4B_PROFILE
+    if 10 <= size_in_b < 20:
         return MID_REVIEW_PROFILE
     return STABLE_4B_PROFILE
 

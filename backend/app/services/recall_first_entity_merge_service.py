@@ -6,7 +6,14 @@ import re
 from typing import Iterable, List
 
 from app.core.recognizer_base import RecognizerResult
-from app.services.lowmem_entity_utils import ORG_PATTERN, P0_ENTITY_TYPES, iter_exact_matches, looks_like_organization_short_name
+from app.rules.default_subject_policy import DEFAULT_SUBJECT_TYPES, canonicalize_default_result
+from app.services.lowmem_entity_utils import (
+    ORG_PATTERN,
+    P0_ENTITY_TYPES,
+    iter_exact_matches,
+    is_org_like_text,
+    looks_like_organization_short_name,
+)
 
 
 class RecallFirstEntityMergeService:
@@ -14,9 +21,17 @@ class RecallFirstEntityMergeService:
 
     SOURCE_PRIORITY = {
         "regex": 100,
+        "rule_format": 100,
+        "rule_organization": 92,
+        "rule_person": 92,
+        "rule_address": 92,
+        "rule_alias": 92,
+        "rule_docx_structure": 94,
         "custom": 95,
         "contract_structure_backfill": 90,
         "contract": 85,
+        "docx_structure_uie": 96,
+        "docx_structure_ner": 94,
         "qwen_fragment_review": 78,
         "uie": 70,
         "ner": 65,
@@ -27,6 +42,7 @@ class RecallFirstEntityMergeService:
     HIGH_RISK_TYPES = {
         "CN_ID_CARD",
         "CN_PHONE",
+        "LANDLINE_PHONE",
         "CN_BANK_CARD",
         "CN_CREDIT_CODE",
         "EMAIL_ADDRESS",
@@ -38,13 +54,22 @@ class RecallFirstEntityMergeService:
         "BANK_NAME",
         "ADDRESS",
         "LOCATION",
+        "GOVERNMENT",
+        "COURT",
         "CONTRACT_NO",
         "CASE_NO",
+        "ALIAS",
     }
 
     def merge(self, results: Iterable[RecognizerResult]) -> List[RecognizerResult]:
         merged: list[RecognizerResult] = []
-        for result in sorted(results, key=self._sort_key):
+        canonical_results = [
+            updated
+            for result in results
+            for updated in [canonicalize_default_result(result)]
+            if updated is not None
+        ]
+        for result in sorted(canonical_results, key=self._sort_key):
             overlap_index = self._find_overlap(result, merged)
             if overlap_index is None:
                 merged.append(result)
@@ -78,46 +103,73 @@ class RecallFirstEntityMergeService:
         aliases = [
             item
             for item in expanded
-            if item.entity_type == "ALIAS" and len(item.text.strip()) >= 2
+            if item.entity_type in {"ALIAS", "ORGANIZATION", "COMPANY_NAME"}
+            and len(item.text.strip()) >= 2
+            and (
+                item.entity_type == "ALIAS"
+                or (item.metadata or {}).get("definition_alias")
+                or (item.metadata or {}).get("alias_surface")
+            )
         ]
         for alias in aliases:
-            canonical = str((alias.metadata or {}).get("canonical") or "").strip()
-            for start, end, matched_text in iter_exact_matches(text, alias.text):
-                key = ("ALIAS", start, end, matched_text)
-                if key in seen:
-                    continue
-                if self._span_overlaps(start, end, expanded):
-                    continue
-                expanded.append(
-                    RecognizerResult(
-                        entity_type="ALIAS",
-                        start=start,
-                        end=end,
-                        score=max(0.76, float(alias.score) - 0.08),
-                        text=matched_text,
-                        source="alias_propagation",
-                        metadata={
-                            "source": "alias_propagation",
-                            "canonical": canonical or None,
-                            "requires_manual_review": not bool(canonical),
-                        },
+            alias_text = str(
+                (alias.metadata or {}).get("alias_surface")
+                or ((alias.metadata or {}).get("definition_alias") if isinstance((alias.metadata or {}).get("definition_alias"), str) else "")
+                or alias.text
+            ).strip()
+            canonical = str(
+                (alias.metadata or {}).get("canonical")
+                or (alias.metadata or {}).get("definition_full_text")
+                or ""
+            ).strip()
+            if alias_text:
+                output_type = "GOVERNMENT" if "法院" in canonical else "ORGANIZATION"
+                for start, end, matched_text in iter_exact_matches(text, alias_text):
+                    key = (output_type, start, end, matched_text)
+                    if key in seen:
+                        continue
+                    if self._span_overlaps(start, end, expanded):
+                        continue
+                    expanded.append(
+                        RecognizerResult(
+                            entity_type=output_type,
+                            start=start,
+                            end=end,
+                            score=max(0.78, float(alias.score) - 0.06),
+                            text=matched_text,
+                            source="alias_propagation",
+                            metadata={
+                                "source": "alias_propagation",
+                                "canonical": canonical or None,
+                                "definition_full_text": canonical or None,
+                                "definition_alias": alias_text,
+                                "alias_surface": alias_text,
+                                "requires_manual_review": not bool(canonical),
+                            },
+                        )
                     )
-                )
-                seen.add(key)
+                    seen.add(key)
             if canonical:
                 for start, end, matched_text in iter_exact_matches(text, canonical):
-                    key = ("ORGANIZATION", start, end, matched_text)
+                    output_type = "GOVERNMENT" if "法院" in matched_text else "ORGANIZATION"
+                    key = (output_type, start, end, matched_text)
                     if key in seen or self._span_overlaps(start, end, expanded):
                         continue
                     expanded.append(
                         RecognizerResult(
-                            entity_type="ORGANIZATION",
+                            entity_type=output_type,
                             start=start,
                             end=end,
                             score=0.88,
                             text=matched_text,
                             source="alias_propagation",
-                            metadata={"source": "alias_propagation", "alias": alias.text},
+                            metadata={
+                                "source": "alias_propagation",
+                                "alias": alias_text or alias.text,
+                                "canonical": canonical,
+                                "definition_full_text": canonical,
+                                "definition_alias": alias_text or None,
+                            },
                         )
                     )
                     seen.add(key)
@@ -160,14 +212,19 @@ class RecallFirstEntityMergeService:
                 return candidate
             return existing
 
+        subject_location_preference = self._prefer_complete_org_over_embedded_location(existing, candidate)
+        if subject_location_preference is not None:
+            return subject_location_preference
+
         existing_len = existing.end - existing.start
         candidate_len = candidate.end - candidate.start
         if (
             candidate.entity_type in self.HIGH_RISK_TYPES
             and candidate_len >= existing_len + 3
-            and candidate_priority >= existing_priority - 5
         ):
-            return candidate
+            if self._text_noise_score(candidate) <= self._text_noise_score(existing) and candidate_priority > existing_priority + 10:
+                return candidate
+            return existing
 
         if candidate_priority > existing_priority + 10:
             return candidate
@@ -176,6 +233,29 @@ class RecallFirstEntityMergeService:
             return candidate
 
         return existing
+
+    @staticmethod
+    def _prefer_complete_org_over_embedded_location(
+        existing: RecognizerResult,
+        candidate: RecognizerResult,
+    ) -> RecognizerResult | None:
+        pairs = ((existing, candidate), (candidate, existing))
+        for org, location in pairs:
+            if org.entity_type not in {"ORGANIZATION", "GOVERNMENT"} or location.entity_type != "LOCATION":
+                continue
+            if org.start <= location.start and org.end >= location.end and is_org_like_text(org.text):
+                metadata = dict(org.metadata or {})
+                metadata["embedded_location_absorbed"] = location.text
+                return RecognizerResult(
+                    entity_type=org.entity_type,
+                    start=org.start,
+                    end=org.end,
+                    score=max(float(org.score or 0.0), float(location.score or 0.0), 0.86),
+                    text=org.text,
+                    source=org.source,
+                    metadata=metadata,
+                )
+        return None
 
     def _choose_same_type_overlap(
         self,

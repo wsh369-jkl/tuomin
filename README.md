@@ -1,218 +1,261 @@
-# 合同脱敏系统
+# 本地文档工作台
 
-本项目当前定位为一个 `macOS 本地客户端` 形态的合同脱敏成品。
+这是一个面向中文合同、法律文书和业务文档的本地处理系统。当前产品形态包含两个相互独立的功能区：
 
-## 一键启动
+- 文本脱敏：上传 TXT、DOCX、PDF 后完成主体识别、脱敏替换、结果导出和脱敏目录生成。
+- PDF 转 Word 核查：上传原始 PDF 和 WPS 转换后的 DOCX，对转换底稿进行 OCR/版面/文本一致性复核，并输出带批注的 Word 文档、审查报告和证据包。
 
-直接双击仓库根目录的 [start.command](/Users/wendyhan/Desktop/contract-desensitize/start.command) 即可进入系统。
+系统默认在本机运行，后端绑定 `127.0.0.1`，运行数据、上传文件、输出文件、任务状态和日志均保存在本地目录，不作为源码提交内容。
 
-首次运行时会自动完成这些准备工作：
+## 功能概览
 
-- 创建 `backend/venv`
-- 安装后端依赖
-- 当前端静态资源缺失时自动构建 `frontend/dist`
-- 启动本地桌面启动器，并自动打开系统入口
+### 文本脱敏
 
-系统默认以本地运行方式工作：
+文本脱敏功能负责对合同、法律文书、业务材料中的敏感主体进行识别、分组、替换和导出。当前默认路线是高质量低内存脱敏流程，重点面向本地环境稳定运行。
 
-- 前端界面由后端内嵌或开发态代理提供
-- 后端服务运行在本机 `127.0.0.1`
-- 大模型能力默认走本地 `Ollama`
-- 文档、日志、数据库都保存在本机私有目录
+主要能力：
 
-当前产品已经收敛，不再包含批量处理页和历史记录页。
+- 支持 `TXT`、`DOCX`、`PDF` 输入。
+- DOCX 尽量保留原文档结构、段落、表格、页眉页脚、批注等可回写区域。
+- PDF 优先抽取原生文本；必要时使用 OCR 与文档结构修复能力补充识别。
+- 默认主体分类以规则层要求为基础，面向人员、组织机构、地名、官方机构等主体进行识别与归并。
+- 数字类内容按默认数字脱敏策略处理，日期和金额等可按规则保留。
+- 识别阶段包含规则召回、结构回填、主体台账、边界修复、上下文分组、模型复核和最终导出。
+- 导出脱敏文件，并同时生成脱敏目录，目录展示实际参与脱敏的替换项。
 
-## 当前架构
+核心设计：
 
-- `desktop/`
-  - Python 桌面启动器
-  - 负责探测 Ollama、启动后端、打开浏览器入口
-  - macOS 打包后会生成 `.app`
-- `backend/`
-  - FastAPI API
-  - 脱敏引擎、识别器注册表、操作器注册表
-  - 文档解析、上下文替换、导出
-- `frontend/`
-  - Vue 3 + Element Plus
-  - 当前保留的页面：
-    - 启动检查
-    - 文档脱敏
-    - 自定义规则
-    - 系统设置
-- `build/`
-  - PyInstaller 打包脚本
-  - macOS DMG 打包脚本
+- `backend/app/rules/`：默认线规则层，包括格式识别、主体规则、边界修复、误识别过滤、主体台账和目录质量检查。
+- `backend/app/services/coverage_first/`：以最终覆盖和回写为中心的候选、目录、替换和验证链路。
+- `backend/app/services/contextual_desensitization_service.py`：上下文分组、替换编号和最终脱敏实体准备。
+- `backend/app/processors/document_exporter.py`：脱敏文件和目录导出。
+- `backend/app/processors/docx_xml_utils.py`：DOCX 可见文本抽取、精确回写和包级 XML 处理。
 
-## 当前功能
+### PDF 转 Word 核查
 
-### 文档输入
+PDF 转 Word 核查功能用于复核“原始 PDF”和“WPS 转换 DOCX”之间的转换质量。它不是脱敏流程的一部分，而是独立的转换审查工具。
 
-- `PDF`
-  - 优先抽取原生文本
-  - 对低文本页可按配置触发 OCR 回退
-- `DOCX`
-- `TXT`
+典型使用场景：
 
-### 识别来源
+- 原 PDF 经过 WPS 转换成 Word 后，需要确认文字是否漏识别、错识别、顺序错乱或表格错位。
+- 需要保留 WPS 转换后的 Word 版面，只在 DOCX 中写入批注，不直接改正文。
+- 需要输出可追溯证据包，方便人工复核和定位问题页。
 
-- 合同字段标签识别
-- 正则规则识别
-- 自定义关键词 / 正则规则
-- LLM 语义识别
+主要能力：
 
-### 脱敏输出
+- 同时上传原始 `PDF` 和 WPS 转换后的 `DOCX`。
+- 对 PDF 页面渲染、OCR 文本、DOCX 文本单元进行证据抽取。
+- 对正文、表格、图片页、阅读顺序、缺失文本、疑似替换错误进行分流审查。
+- 结合本机 OCR、规则检查、表格专项审查、视觉/文本模型门控等模块生成风险项。
+- 输出带批注的 reviewed DOCX、JSON 审查报告和 evidence zip 证据包。
+- 前端展示页面风险、表格摘要、覆盖摘要、审查项和人工复核队列。
 
-- `DOCX`
-  - 尽量保留结构和格式
-- `TXT`
-- `PDF`
-  - 当前导出为重建后的 `DOCX`
-  - 无法重建时回退为 `TXT`
+核心设计：
 
-### 当前前端页面
+- `backend/app/api/pdf_word_audit.py`：PDF 转 Word 核查 API、任务状态、下载入口。
+- `backend/app/services/pdf_word_audit_v4/`：v4 审查主线，包括预检、渲染、OCR 证据、DOCX 证据、页面映射、表格审查、视觉门控、报告构建和证据包输出。
+- `frontend/src/views/PdfWordAudit.vue`：前端上传、进度展示、结果查看和下载入口。
 
-- `启动检查`
-  - 检查 Ollama、固定模型和运行环境状态
-- `文档脱敏`
-  - 上传文档、识别实体、生成脱敏结果、下载导出文件
-- `自定义规则`
-  - 管理关键词规则和正则规则
-- `系统设置`
-  - 默认识别配置、匿名策略、模板管理、运行时信息
+## 系统架构
 
-## 固定运行路线
-
-当前成品路线默认锁定本地稳定模型：
-
-```env
-LLM_BACKEND=ollama
-OLLAMA_BASE_URL=http://127.0.0.1:11434
-OLLAMA_MODEL=qwen3.5:4b
+```text
+contract-desensitize/
+├── backend/                  # FastAPI 后端、文档处理、识别、审查、导出
+│   ├── app/api/              # API 路由
+│   ├── app/processors/       # DOCX/PDF/TXT 解析与导出
+│   ├── app/rules/            # 默认脱敏规则层
+│   ├── app/services/         # 脱敏服务、模型服务、PDF 转 Word 审查服务
+│   └── app/workers/          # 后台任务 worker
+├── frontend/                 # Vue 3 + TypeScript + Element Plus 前端
+├── desktop/                  # macOS 本地启动器
+├── build/                    # 打包脚本和发布构建工具
+├── script/                   # 本地构建/运行辅助脚本
+└── start.command             # macOS 一键启动入口
 ```
 
-如果本机未安装模型，可执行：
+后端负责文档解析、实体识别、模型审查、脱敏替换、PDF 转 Word 核查、结果导出和证据产物生成。前端提供工作台、文本脱敏、PDF 转 Word 核查、自定义规则和系统设置页面。桌面启动器用于 macOS 本地客户端形态。
+
+## 前端页面
+
+当前主界面包含：
+
+- 工作台：进入文本脱敏或 PDF 转 Word 核查。
+- 启动检查：检查本机运行环境、模型和 OCR 能力状态。
+- 文本脱敏：上传文档、查看识别结果、生成脱敏文件和脱敏目录。
+- PDF 转 Word 核查：上传原 PDF 和 WPS DOCX，查看审查结果并下载批注文档和证据包。
+- 自定义规则：维护脱敏识别使用的自定义关键词、正则和模板。
+- 系统设置：配置默认识别与脱敏参数。
+
+在 `VITE_HIGH_QUALITY_ONLY=1` 的构建模式下，前端可以收敛为只展示高质量脱敏入口。
+
+## API 概览
+
+默认后端地址：
+
+```text
+http://127.0.0.1:8000
+```
+
+健康检查：
+
+```text
+GET /health
+```
+
+主要 API 前缀：
+
+```text
+/api/v1
+```
+
+文本脱敏相关：
+
+- `POST /api/v1/desensitize/upload`
+- `POST /api/v1/desensitize/process`
+- `GET /api/v1/desensitize/status/{task_id}`
+- `GET /api/v1/desensitize/result/{task_id}`
+- `GET /api/v1/desensitize/processed-result/{task_id}`
+- `GET /api/v1/desensitize/download/{task_id}`
+- `GET /api/v1/desensitize/download/mapping/{task_id}`
+- `GET /api/v1/desensitize/runtime-status`
+- `GET /api/v1/desensitize/models`
+- `GET /api/v1/desensitize/info`
+
+PDF 转 Word 核查相关：
+
+- `POST /api/v1/pdf-word-audit/upload`
+- `GET /api/v1/pdf-word-audit/status/{audit_id}`
+- `GET /api/v1/pdf-word-audit/result/{audit_id}`
+- `GET /api/v1/pdf-word-audit/download/{audit_id}`
+- `GET /api/v1/pdf-word-audit/report/{audit_id}`
+- `GET /api/v1/pdf-word-audit/evidence/{audit_id}`
+
+自定义规则和模板相关：
+
+- `GET /api/v1/custom/config`
+- `POST /api/v1/custom/keywords`
+- `POST /api/v1/custom/patterns`
+- `POST /api/v1/custom/reload`
+- `GET /api/v1/custom/test`
+- `GET /api/v1/history/templates`
+- `POST /api/v1/history/templates`
+- `DELETE /api/v1/history/templates/{template_id}`
+
+## 本地运行
+
+### 一键启动
+
+macOS 下可直接双击仓库根目录的：
+
+```text
+start.command
+```
+
+一键启动脚本会按需准备后端虚拟环境、安装依赖、构建前端静态资源并启动本地服务。
+
+### 开发模式启动后端
 
 ```bash
-ollama pull qwen3.5:4b
+cd backend
+python3 -m pip install -r requirements.txt
+python3 main.py
 ```
 
-或在打包产物中运行：
+后端默认地址：
+
+```text
+http://127.0.0.1:8000
+```
+
+API 文档：
+
+```text
+http://127.0.0.1:8000/docs
+```
+
+### 开发模式启动前端
 
 ```bash
-./download_ollama_model.command
+cd frontend
+npm install
+npm run dev
 ```
 
-## macOS 客户端打包
+前端默认地址：
 
-### 1. 准备依赖
+```text
+http://127.0.0.1:5173
+```
 
-后端依赖：
+开发服务器默认将 `/api` 代理到后端 `http://127.0.0.1:8000`。
+
+## 构建和打包
+
+安装构建依赖：
 
 ```bash
 python3 -m pip install -r backend/requirements.txt
 python3 -m pip install -r build/requirements-build.txt
-```
-
-前端依赖：
-
-```bash
 cd frontend
 npm install
 cd ..
 ```
 
-### 2. 生成发布目录
+构建前端：
+
+```bash
+cd frontend
+npm run build
+cd ..
+```
+
+生成 macOS 发布目录：
 
 ```bash
 python3 build/build.py
 ```
 
-输出目录：
-
-```text
-release-macos/
-```
-
-其中会包含：
-
-- `contract-desensitize.app`
-- `start.command`
-- `download_ollama_model.command`
-- `USAGE.txt`
-- `MAC_QUICK_START.txt`
-
-### 3. 生成 DMG
+生成 macOS 安装包：
 
 ```bash
 python3 build/package_macos_installer.py
 ```
 
-输出文件：
+发布产物通常位于：
 
 ```text
-release-macos/ContractDesensitize-macOS.dmg
+release-macos/
 ```
 
-### 4. 生成对外分发元数据
+## 运行数据和 Git 仓库边界
 
-```bash
-python3 build/prepare_macos_distribution.py
-```
+以下内容属于本地运行数据，不应提交到 GitHub：
 
-附加产物：
+- `backend/uploads/`
+- `backend/outputs/`
+- `backend/logs/`
+- `backend/task_state/`
+- `backend/desensitize.db`
+- `backend/analysis-review-*.json`
+- `backend/pdf_word_audit/`
+- `backend/pdf_normalized/`
+- `backend/tmp/`
+- `backend/models/`
+- `.env`
+- `backend/.env`
+- `*.log`
+- `*.pid`
 
-- `release-macos/ContractDesensitize-macOS-portable.tar.gz`
-- `release-macos/DISTRIBUTION_MANIFEST.txt`
-- `release-macos/SHA256SUMS.txt`
-
-建议对外分发时优先发送：
-
-- `ContractDesensitize-macOS.dmg`
-
-内部备份或手工回传时可附带：
-
-- `ContractDesensitize-macOS-portable.tar.gz`
-- `SHA256SUMS.txt`
-
-## 开发模式
-
-### 启动后端
-
-```bash
-cd backend
-python3 main.py
-```
-
-### 启动前端
-
-```bash
-cd frontend
-npm run dev
-```
-
-开发态默认地址：
-
-- 前端：`http://127.0.0.1:5173`
-- 后端：`http://127.0.0.1:8000`
-- API 文档：`http://127.0.0.1:8000/docs`
+这些路径已经通过 `.gitignore` 排除。对于曾经被 Git 跟踪过的运行数据，需要使用 `git rm --cached` 从索引中移除，保留本地文件但不再上传。
 
 ## 当前限制
 
-- 不支持旧版 `.doc`
-- 扫描版 PDF 的效果仍依赖 OCR 与模型状态
-- 任务状态当前以进程内任务表为主，不是完整的持久化任务中心
-- 产品已去除批量处理和历史记录页面
+- 不支持旧版 `.doc` 文件直接处理，需要先转换为 `.docx`。
+- 扫描版 PDF 的识别质量依赖本机 OCR、页面质量和模型配置。
+- PDF 转 Word 核查只对 WPS 转换 DOCX 写入批注和证据，不把审查建议直接改写进正文。
+- 本地任务状态用于运行期恢复和状态展示，不等同于完整的云端任务历史系统。
+- 仓库中可能保留历史设计文档或旧路线文档，当前实际功能以代码、根 README 和前端工作台入口为准。
 
-## 仓库说明
+## 项目定位
 
-仓库里仍可能存在一些历史文档或 Windows 辅助脚本，它们不代表当前主交付路径。当前以本 README、`build/build.py` 和 macOS 打包脚本为准。
-
-## 对外分发建议
-
-如果要发给其他 Mac 用户直接安装使用，建议目标形态是：
-
-1. 已签名
-2. 已 notarize
-3. 已 staple 的 `ContractDesensitize-macOS.dmg`
-
-仓库中的 GitHub Actions macOS workflow 已经按这个方向准备，可在打 `v*` tag 时直接生成发布资产。
+本项目不是在线 SaaS，而是本地化文档处理工具。设计目标是将敏感文档处理、OCR、模型审查、脱敏导出和转换核查尽量留在本机环境中完成，并为复杂合同/法律文书提供可追溯、可复核的处理产物。

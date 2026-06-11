@@ -4,7 +4,7 @@
       <el-aside width="220px" class="layout-aside">
         <div class="logo">
           <h2>{{ highQualityOnly ? '合同脱敏系统' : '本地文档工作台' }}</h2>
-          <p>{{ highQualityOnly ? 'High Quality Low Memory' : 'Text Desensitize / Lawyer Assist' }}</p>
+          <p>{{ highQualityOnly ? 'High Quality Low Memory' : 'Text Desensitize / PDF Audit' }}</p>
         </div>
 
         <el-menu
@@ -29,10 +29,6 @@
               <el-menu-item index="/desensitize">
                 <el-icon><Document /></el-icon>
                 <span>文本脱敏</span>
-              </el-menu-item>
-              <el-menu-item index="/assistant">
-                <el-icon><Reading /></el-icon>
-                <span>律师协助</span>
               </el-menu-item>
               <el-menu-item index="/pdf-word-audit">
                 <el-icon><Tickets /></el-icon>
@@ -92,7 +88,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Document, Grid, Monitor, Reading, SetUp, Tickets, Tools } from '@element-plus/icons-vue'
+import { Document, Grid, Monitor, SetUp, Tickets, Tools } from '@element-plus/icons-vue'
 import { getRuntimeStatus, type RuntimeStatusResponse } from '@/api/desensitize'
 
 const route = useRoute()

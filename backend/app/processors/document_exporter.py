@@ -25,8 +25,11 @@ from app.engine.desensitization_engine import get_engine
 from app.processors.docx_xml_utils import (
     apply_replacements_to_fragments,
     docx_contains_tracked_changes,
+    normalize_docx_chinese_inline_spaces,
     replace_text_in_docx,
 )
+from app.services.default_numeric_masking import mask_default_numeric_text
+from app.services.lowmem_entity_utils import sanitize_recognition_text
 
 logger = logging.getLogger(__name__)
 
@@ -109,8 +112,19 @@ class DocumentExporter:
         entities: List[Dict],
         anonymized_text: str,
         operator_config: Dict | None = None,
+        coverage_first_final_export: Dict[str, Any] | None = None,
     ) -> Dict[str, str | bool | None]:
         suffix = Path(source_path).suffix.lower()
+        coverage_first_final_export = (
+            dict(coverage_first_final_export)
+            if isinstance(coverage_first_final_export, dict)
+            else {}
+        )
+        anonymized_text, text_inline_space_removed = self._normalize_export_text(anonymized_text or "")
+        mapping_entities = self._build_mapping_export_entities(
+            entities=entities,
+            coverage_first_final_export=coverage_first_final_export,
+        )
         replacement_entries = self._build_export_replacement_entries(entities, operator_config)
 
         if suffix == ".docx":
@@ -131,11 +145,15 @@ class DocumentExporter:
                     warning="DOCX export failed, so the result was saved as TXT.",
                     preserves_format=False,
                 )
+            primary_result = self._attach_text_inline_space_metadata(
+                primary_result,
+                removed_count=text_inline_space_removed,
+            )
             return self._attach_mapping_export(
                 primary_result=primary_result,
                 task_id=task_id,
                 original_filename=original_filename,
-                entities=entities,
+                entities=mapping_entities,
             )
 
         if suffix == ".txt":
@@ -146,11 +164,15 @@ class DocumentExporter:
                 warning=None,
                 preserves_format=True,
             )
+            primary_result = self._attach_text_inline_space_metadata(
+                primary_result,
+                removed_count=text_inline_space_removed,
+            )
             return self._attach_mapping_export(
                 primary_result=primary_result,
                 task_id=task_id,
                 original_filename=original_filename,
-                entities=entities,
+                entities=mapping_entities,
             )
 
         if suffix == ".pdf":
@@ -160,11 +182,15 @@ class DocumentExporter:
                 anonymized_text=anonymized_text,
                 source_metadata=source_metadata,
             )
+            primary_result = self._attach_text_inline_space_metadata(
+                primary_result,
+                removed_count=text_inline_space_removed,
+            )
             return self._attach_mapping_export(
                 primary_result=primary_result,
                 task_id=task_id,
                 original_filename=original_filename,
-                entities=entities,
+                entities=mapping_entities,
             )
 
         primary_result = self._export_text(
@@ -174,12 +200,32 @@ class DocumentExporter:
             warning="Format-preserving export is currently available for DOCX and TXT. PDF currently falls back to TXT.",
             preserves_format=False,
         )
+        primary_result = self._attach_text_inline_space_metadata(
+            primary_result,
+            removed_count=text_inline_space_removed,
+        )
         return self._attach_mapping_export(
             primary_result=primary_result,
             task_id=task_id,
             original_filename=original_filename,
-            entities=entities,
+            entities=mapping_entities,
         )
+
+    def _normalize_export_text(self, value: str) -> tuple[str, int]:
+        sanitized, index_map = sanitize_recognition_text(value or "")
+        removed_count = max(0, len(value or "") - len(index_map))
+        return mask_default_numeric_text(sanitized), removed_count
+
+    def _attach_text_inline_space_metadata(
+        self,
+        result: Dict[str, str | bool | None],
+        *,
+        removed_count: int,
+    ) -> Dict[str, str | bool | int | None]:
+        updated = dict(result)
+        updated["text_chinese_inline_space_normalized"] = removed_count > 0
+        updated["text_chinese_inline_space_removed_count"] = int(removed_count)
+        return updated
 
     def _attach_mapping_export(
         self,
@@ -205,6 +251,124 @@ class DocumentExporter:
 
         result.update(mapping_result)
         return result
+
+    def _build_mapping_export_entities(
+        self,
+        *,
+        entities: Iterable[Dict[str, Any]],
+        coverage_first_final_export: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Build mapping rows from the same occurrence layer used for final rewrite."""
+
+        if isinstance(coverage_first_final_export, dict):
+            from_rewrite_entries = self._mapping_entities_from_rewrite_entries(coverage_first_final_export)
+            if from_rewrite_entries:
+                return from_rewrite_entries
+            from_directory_rows = self._mapping_entities_from_directory_rows(coverage_first_final_export)
+            if from_directory_rows:
+                return from_directory_rows
+        return [dict(entity) for entity in entities or [] if isinstance(entity, dict)]
+
+    def _mapping_entities_from_rewrite_entries(
+        self,
+        coverage_first_final_export: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        rewrite_entries = [
+            item
+            for item in coverage_first_final_export.get("rewrite_entries") or []
+            if isinstance(item, dict)
+        ]
+        if not rewrite_entries:
+            return []
+        row_metadata = self._coverage_directory_row_metadata(coverage_first_final_export)
+        mapping_entities: List[Dict[str, Any]] = []
+        for input_order, entry in enumerate(rewrite_entries):
+            status = str(entry.get("verification_status") or "").strip()
+            if status == "blocked":
+                continue
+            source_text = str(entry.get("source_text") or "").strip()
+            replacement = self._coerce_replacement_text(entry.get("replacement"))
+            if not source_text or not replacement or source_text == replacement:
+                continue
+            subject_id = str(entry.get("subject_id") or "").strip()
+            metadata = dict(row_metadata.get(subject_id) or {})
+            mapping_entities.append(
+                {
+                    "type": str(entry.get("entity_type") or metadata.get("subject_type") or "").strip(),
+                    "text": source_text,
+                    "replacement": replacement,
+                    "start": self._coerce_int(entry.get("start"), 10**12),
+                    "end": self._coerce_int(entry.get("end"), 10**12),
+                    "context_label": metadata.get("context_label") or "未命名字段",
+                    "context_role": metadata.get("context_role") or "通用上下文",
+                    "metadata": {
+                        "coverage_first_subject_id": subject_id,
+                        "coverage_first_mapping_source": "rewrite_entries",
+                        "coverage_first_input_order": self._coerce_int(entry.get("input_order"), input_order),
+                    },
+                }
+            )
+        return mapping_entities
+
+    def _mapping_entities_from_directory_rows(
+        self,
+        coverage_first_final_export: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        directory_rows = [
+            item
+            for item in coverage_first_final_export.get("directory_rows") or []
+            if isinstance(item, dict)
+        ]
+        mapping_entities: List[Dict[str, Any]] = []
+        for row in directory_rows:
+            replacement = self._coerce_replacement_text(row.get("replacement"))
+            if not replacement:
+                continue
+            subject_id = str(row.get("subject_id") or "").strip()
+            for occurrence_index, occurrence in enumerate(row.get("occurrences") or [], start=1):
+                if not isinstance(occurrence, dict):
+                    continue
+                source_text = str(occurrence.get("text") or "").strip()
+                if not source_text or source_text == replacement:
+                    continue
+                mapping_entities.append(
+                    {
+                        "type": str(occurrence.get("type") or row.get("subject_type") or "").strip(),
+                        "text": source_text,
+                        "replacement": replacement,
+                        "start": self._coerce_int(occurrence.get("start"), 10**12),
+                        "end": self._coerce_int(occurrence.get("end"), 10**12),
+                        "context_label": row.get("context_label") or "未命名字段",
+                        "context_role": row.get("context_role") or "通用上下文",
+                        "metadata": {
+                            "coverage_first_subject_id": subject_id,
+                            "coverage_first_mapping_source": "directory_rows",
+                            "coverage_first_occurrence_index": occurrence_index,
+                        },
+                    }
+                )
+        return mapping_entities
+
+    def _coverage_directory_row_metadata(
+        self,
+        coverage_first_final_export: Dict[str, Any],
+    ) -> Dict[str, Dict[str, Any]]:
+        rows = [
+            item
+            for item in coverage_first_final_export.get("directory_rows") or []
+            if isinstance(item, dict)
+        ]
+        metadata: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            subject_id = str(row.get("subject_id") or "").strip()
+            if not subject_id:
+                continue
+            metadata[subject_id] = {
+                "subject_type": row.get("subject_type"),
+                "context_label": row.get("context_label"),
+                "context_role": row.get("context_role"),
+            }
+        return metadata
 
     def _export_text(
         self,
@@ -280,6 +444,16 @@ class DocumentExporter:
                     replace_text_in_docx(output_path, replacements)
             except Exception:
                 logger.exception("DOCX tracked-change XML replacement failed for %s", output_path)
+        inline_space_report: Dict[str, Any] = {
+            "applied": False,
+            "removed_space_count": 0,
+            "modified_part_count": 0,
+            "modified_parts": [],
+        }
+        try:
+            inline_space_report = normalize_docx_chinese_inline_spaces(output_path)
+        except Exception:
+            logger.exception("DOCX Chinese inline space normalization failed for %s", output_path)
         ensure_private_file(output_path)
 
         return {
@@ -289,6 +463,10 @@ class DocumentExporter:
             "media_type": DOCX_MIME_TYPE,
             "preserves_format": True,
             "warning": None,
+            "docx_chinese_inline_space_normalized": bool(inline_space_report.get("applied")),
+            "docx_chinese_inline_space_removed_count": int(inline_space_report.get("removed_space_count") or 0),
+            "docx_chinese_inline_space_modified_part_count": int(inline_space_report.get("modified_part_count") or 0),
+            "docx_chinese_inline_space_modified_parts": list(inline_space_report.get("modified_parts") or [])[:20],
         }
 
     def _replace_in_container(self, container, replacements: List[Tuple[str, str]]) -> None:
@@ -309,6 +487,7 @@ class DocumentExporter:
             return
 
         updated_texts = apply_replacements_to_fragments(run_texts, replacements)
+        updated_texts = [mask_default_numeric_text(text) for text in updated_texts]
         if updated_texts == run_texts:
             return
 
@@ -1574,7 +1753,7 @@ class DocumentExporter:
         updated = text
         for original, replacement in replacements:
             updated = updated.replace(original, replacement)
-        return updated
+        return mask_default_numeric_text(updated)
 
     def _coerce_float(self, value: Any, default: float) -> float:
         try:

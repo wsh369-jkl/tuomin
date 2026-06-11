@@ -41,6 +41,12 @@ class ContractStructureBackfillService:
         {"label": "甲方", "type": "ORGANIZATION", "role": "甲方"},
         {"label": "乙方", "type": "ORGANIZATION", "role": "乙方"},
         {"label": "丙方", "type": "ORGANIZATION", "role": "丙方"},
+        {"label": "委托方", "type": "ORGANIZATION", "role": "委托方"},
+        {"label": "受托方", "type": "ORGANIZATION", "role": "受托方"},
+        {"label": "发包人", "type": "ORGANIZATION", "role": "发包人"},
+        {"label": "承包人", "type": "ORGANIZATION", "role": "承包人"},
+        {"label": "采购人", "type": "ORGANIZATION", "role": "采购人"},
+        {"label": "供应商", "type": "ORGANIZATION", "role": "供应商"},
         {"label": "上诉人", "type": "ROLE_SUBJECT", "role": "上诉人"},
         {"label": "被上诉人", "type": "ROLE_SUBJECT", "role": "被上诉人"},
         {"label": "原审原告", "type": "ROLE_SUBJECT", "role": "原审原告"},
@@ -68,32 +74,27 @@ class ContractStructureBackfillService:
         {"label": "委托代理人", "type": "PERSON", "role": "委托代理人"},
         {"label": "代理人", "type": "PERSON", "role": "代理人"},
         {"label": "负责人", "type": "PERSON", "role": "负责人"},
-        {"label": "开户行", "type": "BANK_NAME", "role": "开户行"},
-        {"label": "户名", "type": "ACCOUNT_NAME", "role": "户名"},
-        {"label": "账户名称", "type": "ACCOUNT_NAME", "role": "账户名称"},
         {"label": "收款单位", "type": "ORGANIZATION", "role": "收款单位"},
         {"label": "付款单位", "type": "ORGANIZATION", "role": "付款单位"},
-        {"label": "项目名称", "type": "PROJECT", "role": "项目名称"},
-        {"label": "工程名称", "type": "PROJECT", "role": "工程名称"},
-        {"label": "项目地址", "type": "ADDRESS", "role": "项目地址"},
-        {"label": "工程地址", "type": "ADDRESS", "role": "工程地址"},
-        {"label": "住所", "type": "ADDRESS", "role": "住所"},
-        {"label": "住所地", "type": "ADDRESS", "role": "住所地"},
-        {"label": "地址", "type": "ADDRESS", "role": "地址"},
-        {"label": "住址", "type": "ADDRESS", "role": "住址"},
-        {"label": "现住址", "type": "ADDRESS", "role": "现住址"},
-        {"label": "户籍地", "type": "ADDRESS", "role": "户籍地"},
-        {"label": "户籍地址", "type": "ADDRESS", "role": "户籍地址"},
-        {"label": "身份证住址", "type": "ADDRESS", "role": "身份证住址"},
-        {"label": "经常居住地", "type": "ADDRESS", "role": "经常居住地"},
-        {"label": "通讯地址", "type": "ADDRESS", "role": "通讯地址"},
-        {"label": "工作地址", "type": "ADDRESS", "role": "工作地址"},
-        {"label": "送达地址", "type": "ADDRESS", "role": "送达地址"},
-        {"label": "注册地址", "type": "ADDRESS", "role": "注册地址"},
+        {"label": "项目地址", "type": "LOCATION", "role": "项目地址"},
+        {"label": "工程地址", "type": "LOCATION", "role": "工程地址"},
+        {"label": "住所", "type": "LOCATION", "role": "住所"},
+        {"label": "住所地", "type": "LOCATION", "role": "住所地"},
+        {"label": "地址", "type": "LOCATION", "role": "地址"},
+        {"label": "住址", "type": "LOCATION", "role": "住址"},
+        {"label": "现住址", "type": "LOCATION", "role": "现住址"},
+        {"label": "户籍地", "type": "LOCATION", "role": "户籍地"},
+        {"label": "户籍地址", "type": "LOCATION", "role": "户籍地址"},
+        {"label": "身份证住址", "type": "LOCATION", "role": "身份证住址"},
+        {"label": "经常居住地", "type": "LOCATION", "role": "经常居住地"},
+        {"label": "通讯地址", "type": "LOCATION", "role": "通讯地址"},
+        {"label": "工作地址", "type": "LOCATION", "role": "工作地址"},
+        {"label": "送达地址", "type": "LOCATION", "role": "送达地址"},
+        {"label": "注册地址", "type": "LOCATION", "role": "注册地址"},
     ]
 
     LABEL_TAIL = re.compile(
-        r"(?=\s*(?:甲方|乙方|丙方|申请人|被申请人|原告|被告|第三人|"
+        r"(?=\s*(?:甲方|乙方|丙方|委托方|受托方|发包人|承包人|采购人|供应商|申请人|被申请人|原告|被告|第三人|"
         r"控告人|被控告人|举报人|被举报人|申诉人|被申诉人|起诉人|自诉人|"
         r"上诉人|被上诉人|原审原告|原审被告|一审原告|一审被告|"
         r"法定代表人|法定代理人|负责人|联系人|委托诉讼代理人|诉讼代理人|委托代理人|代理人|"
@@ -118,6 +119,12 @@ class ContractStructureBackfillService:
         "甲方",
         "乙方",
         "丙方",
+        "委托方",
+        "受托方",
+        "发包人",
+        "承包人",
+        "采购人",
+        "供应商",
         "上诉人",
         "被上诉人",
         "原审原告",
@@ -205,6 +212,12 @@ class ContractStructureBackfillService:
         "甲方",
         "乙方",
         "丙方",
+        "委托方",
+        "受托方",
+        "发包人",
+        "承包人",
+        "采购人",
+        "供应商",
         "上诉人",
         "被上诉人",
         "原审原告",
@@ -292,10 +305,14 @@ class ContractStructureBackfillService:
                 resolved_type = entity_type
                 if entity_type == "ROLE_SUBJECT":
                     resolved_type = infer_semantic_type(value, label)
+                    if not resolved_type and looks_like_organization_short_name(value):
+                        resolved_type = "ORGANIZATION"
                 elif entity_type == "ORGANIZATION" and is_probable_person(value):
-                    resolved_type = "PERSON"
+                    resolved_type = "ORGANIZATION" if looks_like_organization_short_name(value) else "PERSON"
                 elif entity_type == "ORGANIZATION":
                     resolved_type = infer_semantic_type(value, label)
+                    if not resolved_type and looks_like_organization_short_name(value):
+                        resolved_type = "ORGANIZATION"
                 result = make_entity(
                     text=text,
                     start=span[0],
@@ -404,7 +421,7 @@ class ContractStructureBackfillService:
                     text=text,
                     start=candidate_start,
                     end=candidate_start + len(candidate),
-                    entity_type="ADDRESS",
+                    entity_type="LOCATION",
                     source="contract_structure_backfill",
                     score=0.93,
                     metadata={
@@ -458,7 +475,7 @@ class ContractStructureBackfillService:
                 text=text,
                 start=span[0],
                 end=span[1],
-                entity_type="ADDRESS",
+                entity_type="LOCATION",
                 source="contract_structure_backfill",
                 score=0.94,
                 metadata={
@@ -493,7 +510,7 @@ class ContractStructureBackfillService:
                 text=text,
                 start=span[0],
                 end=span[1],
-                entity_type="ADDRESS",
+                entity_type="LOCATION",
                 source="contract_structure_backfill",
                 score=0.93,
                 metadata={
@@ -844,8 +861,9 @@ class ContractStructureBackfillService:
 
     def _clean_label_value(self, value: str, entity_type: str, label: str) -> str:
         cleaned = clean_candidate_text(value)
+        cleaned = self._truncate_at_following_field_label(cleaned, entity_type, label)
         cleaned = self.LABEL_TAIL.split(cleaned, maxsplit=1)[0].strip()
-        if entity_type in {"ORGANIZATION", "ACCOUNT_NAME", "PROJECT"}:
+        if entity_type == "ORGANIZATION":
             cleaned = self._strip_inline_alias_segments(cleaned)
             cleaned = self._truncate_at_following_field_label(cleaned, entity_type, label)
             cleaned = self._truncate_party_like_narrative_tail(cleaned, entity_type, label)
@@ -865,7 +883,7 @@ class ContractStructureBackfillService:
                 return ""
             person = person_match.group()
             return "" if self._looks_like_action_phrase_person(person) else person
-        if entity_type == "ADDRESS" and not self._looks_like_address_value(normalized):
+        if entity_type == "LOCATION" and not self._looks_like_address_value(normalized):
             return ""
         return cleaned
 
@@ -890,7 +908,7 @@ class ContractStructureBackfillService:
             cleaned = stripped
 
     def _truncate_at_following_field_label(self, value: str, entity_type: str, label: str) -> str:
-        if entity_type not in {"ORGANIZATION", "ACCOUNT_NAME", "PROJECT"}:
+        if entity_type not in {"ORGANIZATION", "LOCATION"}:
             return value
         best = len(value)
         for token in self.FOLLOWING_FIELD_LABELS:
