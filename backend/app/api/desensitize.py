@@ -50,6 +50,7 @@ from app.processors.document_exporter import (
     DocumentExporter,
 )
 from app.processors.document_parser import DocumentParser
+from app.services.coverage_first.final_export import build_coverage_first_final_export_bundle
 from app.schemas.desensitize import (
     AnalyzeResponse,
     BatchFileItem,
@@ -921,6 +922,9 @@ def _run_stage_isolated_analysis_worker_blocking(
     primary_memory_peak_mib, primary_memory_peak_source = _peak_memory_mib_from_worker(primary_worker)
     primary_entities = primary_result.get("entities") or []
     primary_review_entities = primary_result.get("review_entities") or []
+    primary_review_only_candidates = primary_result.get("review_only_candidates") or []
+    if not isinstance(primary_review_only_candidates, list):
+        primary_review_only_candidates = []
     primary_metadata = dict(primary_result.get("analysis_metadata") or {})
     large_document_pre_routed = str((analysis_workflow or {}).get("mode") or "").strip() == "large_document_pre_routed"
 
@@ -940,9 +944,15 @@ def _run_stage_isolated_analysis_worker_blocking(
 
     if large_document_pre_routed or not settings.ENABLE_QWEN_REVIEW:
         metadata = dict(primary_metadata)
+        stage_counts = dict(metadata.get("stage_counts") or {})
+        stage_counts["primary_entity_return_count"] = len(primary_entities)
+        stage_counts["primary_review_surface_count"] = len(primary_review_entities)
         metadata.update(
             {
                 **workflow_metadata,
+                "stage_counts": stage_counts,
+                "primary_entity_return_count": len(primary_entities),
+                "primary_review_surface_count": len(primary_review_entities),
                 "analysis_worker_process": True,
                 "analysis_stage_isolation": True,
                 "review_configured": bool(settings.ENABLE_QWEN_REVIEW) if large_document_pre_routed else False,
@@ -987,6 +997,9 @@ def _run_stage_isolated_analysis_worker_blocking(
     compacted_stage_counts = dict(compacted_primary_metadata.get("stage_counts") or {})
     compacted_stage_counts["review_input_primary_compacted"] = len(compacted_primary_entities)
     compacted_stage_counts["review_input_surface_compacted"] = len(compacted_review_entities)
+    compacted_stage_counts["review_input_review_only_candidates"] = len(primary_review_only_candidates)
+    compacted_stage_counts["primary_entity_return_count"] = len(primary_entities)
+    compacted_stage_counts["primary_review_surface_count"] = len(primary_review_entities)
     compacted_primary_metadata["stage_counts"] = compacted_stage_counts
 
     try:
@@ -1005,6 +1018,7 @@ def _run_stage_isolated_analysis_worker_blocking(
                 "text": text,
                 "entities": compacted_primary_entities,
                 "review_entities": compacted_review_entities,
+                "review_only_candidates": primary_review_only_candidates,
                 "entities_filter": entities,
                 "analysis_metadata": compacted_primary_metadata,
                 "source_metadata": source_metadata or {},
@@ -3223,6 +3237,31 @@ async def _run_batch_task(batch_id: str) -> None:
                         entities=entities,
                         operator_config=operator_config,
                     )
+                coverage_first_final_export = build_coverage_first_final_export_bundle(
+                    entities=entities,
+                    source_text=text,
+                )
+                if coverage_first_final_export.get("enabled"):
+                    summary = dict(coverage_first_final_export.get("summary") or {})
+                    quality_metadata = {
+                        **(quality_metadata or {}),
+                        "coverage_first_final_export_used": True,
+                        "coverage_first_final_entity_input_count": int(summary.get("final_entity_input_count") or 0),
+                        "coverage_first_final_desensitized_entity_input_count": int(
+                            summary.get("final_desensitized_entity_input_count") or 0
+                        ),
+                        "coverage_first_final_directory_subject_count": int(
+                            summary.get("final_directory_subject_count") or 0
+                        ),
+                        "coverage_first_final_directory_occurrence_count": int(
+                            summary.get("final_directory_occurrence_count") or 0
+                        ),
+                        "coverage_first_final_mapping_entity_count": int(summary.get("final_mapping_entity_count") or 0),
+                        "coverage_first_final_missing_directory_entity_count": int(
+                            summary.get("final_missing_directory_entity_count") or 0
+                        ),
+                        "coverage_first_final_export_ready": bool(summary.get("final_export_ready")),
+                    }
                 export_result = document_exporter.export(
                     task_id=str(item.get("item_id") or uuid.uuid4()),
                     source_path=_source_path_for_export(item),
@@ -3233,6 +3272,7 @@ async def _run_batch_task(batch_id: str) -> None:
                     entities=entities,
                     anonymized_text=anonymized_text,
                     operator_config=operator_config,
+                    coverage_first_final_export=coverage_first_final_export,
                 )
 
                 target_path = _build_batch_output_path(

@@ -9,6 +9,7 @@ from typing import Any, Iterable, List
 from app.core.config import settings
 from app.core.recognizer_base import RecognizerResult
 from app.rules.default_subject_policy import DEFAULT_SUBJECT_TYPES, projected_default_subject_type
+from app.services.lowmem_entity_utils import iter_docx_structure_units, resolve_docx_unit_spans
 
 
 @dataclass(frozen=True)
@@ -56,18 +57,23 @@ class RiskSnippetScheduler:
         "ocr_anomaly_block": ["□", "�", "　　"],
     }
 
+    def __init__(self) -> None:
+        self.last_metadata: dict[str, int] = {}
+
     def build_snippets(
         self,
         text: str,
         entities: Iterable[RecognizerResult],
         *,
         source_structure: dict[str, Any] | None = None,
+        rejected_entities: Iterable[RecognizerResult] | None = None,
         max_snippets: int | None = None,
         max_chars_per_snippet: int | None = None,
     ) -> List[RiskSnippet]:
         max_count = max_snippets or settings.REVIEW_MAX_SNIPPETS
         max_chars = max_chars_per_snippet or settings.REVIEW_MAX_CHARS_PER_SNIPPET
         snippets: list[RiskSnippet] = []
+        self.last_metadata = {}
 
         if not text:
             return snippets
@@ -82,12 +88,26 @@ class RiskSnippetScheduler:
             )
         )
         snippets.extend(
+            self._build_missing_candidate_review_snippets(
+                text=text,
+                rejected_entities=list(rejected_entities or []),
+                max_chars=max_chars,
+            )
+        )
+        snippets.extend(
             self._build_structure_snippets(
                 text=text,
                 source_structure=source_structure,
                 max_chars=max_chars,
             )
         )
+        coverage_discovery = self._build_coverage_discovery_snippets(
+            text=text,
+            entities=entity_list,
+            source_structure=source_structure,
+            max_chars=max_chars,
+        )
+        snippets.extend(coverage_discovery)
 
         for snippet_type, keywords in self.KEYWORDS.items():
             added_for_type = 0
@@ -142,7 +162,64 @@ class RiskSnippetScheduler:
                 )
             )
 
-        return self._dedupe(snippets, max_count=max_count)
+        deduped = self._dedupe(snippets, max_count=max_count)
+        self.last_metadata.update(
+            {
+                "risk_snippet_raw_count": len(snippets),
+                "risk_snippet_deduped_count": len(deduped),
+                "risk_snippet_coverage_discovery_raw_count": len(coverage_discovery),
+                "risk_snippet_coverage_discovery_deduped_count": sum(
+                    1 for snippet in deduped if snippet.snippet_type == "qwen_coverage_discovery"
+                ),
+            }
+        )
+        return deduped
+
+    def _build_missing_candidate_review_snippets(
+        self,
+        *,
+        text: str,
+        rejected_entities: list[RecognizerResult],
+        max_chars: int,
+    ) -> List[RiskSnippet]:
+        snippets: list[RiskSnippet] = []
+        for entity in rejected_entities:
+            metadata = dict(entity.metadata or {})
+            if not metadata.get("rule_first_review_only_candidate"):
+                continue
+            start = max(0, int(entity.start))
+            end = min(len(text), int(entity.end))
+            if end <= start:
+                continue
+            window = self._make_window_snippet(
+                text,
+                start,
+                snippet_type="missing_candidate_review",
+                risk_reason="rule_first:review_only_rejected",
+                max_chars=max_chars,
+            )
+            target_metadata = dict(metadata)
+            target_metadata.setdefault("missing_candidate_review", True)
+            target_metadata.setdefault("review_only_rejected_candidate", True)
+            target_metadata.setdefault("rule_first_rejected_text", entity.text)
+            snippets.append(
+                RiskSnippet(
+                    snippet_type=window.snippet_type,
+                    risk_reason=window.risk_reason,
+                    start=window.start,
+                    end=window.end,
+                    text=window.text,
+                    target_entity={
+                        "type": entity.entity_type,
+                        "text": entity.text,
+                        "start": entity.start,
+                        "end": entity.end,
+                        "source": entity.source,
+                        "metadata": target_metadata,
+                    },
+                )
+            )
+        return snippets
 
     def _build_rule_first_review_snippets(
         self,
@@ -257,7 +334,8 @@ class RiskSnippetScheduler:
         if not isinstance(source_structure, dict):
             return []
         snippets: List[RiskSnippet] = []
-        for unit in self._iter_structure_units(source_structure):
+        units = resolve_docx_unit_spans(text or "", self._iter_structure_units(source_structure))
+        for unit in units:
             unit_text = str(unit.get("text") or "").strip()
             if not unit_text:
                 continue
@@ -266,11 +344,10 @@ class RiskSnippetScheduler:
                 continue
             if not self._structure_unit_has_sensitive_cue(unit_text, container_type):
                 continue
-            start = self._coerce_int(unit.get("start"), -1)
-            if start < 0 or text[start : start + len(unit_text)] != unit_text:
-                start = text.find(unit_text)
+            start = self._coerce_int(unit.get("_resolved_start"), -1)
+            end = self._coerce_int(unit.get("_resolved_end"), -1)
             if start >= 0:
-                unit_end = min(len(text), start + min(len(unit_text), max_chars))
+                unit_end = min(len(text), end, start + min(len(unit_text), max_chars))
                 snippets.append(
                     RiskSnippet(
                         snippet_type=f"docx_{container_type}_block",
@@ -292,35 +369,242 @@ class RiskSnippetScheduler:
             )
         return snippets
 
-    def _iter_structure_units(self, source_structure: dict[str, Any]):
-        seen_unit_ids: set[str] = set()
-        raw_units = source_structure.get("docx_text_units")
-        if isinstance(raw_units, list):
-            for unit in raw_units:
-                if not isinstance(unit, dict):
-                    continue
-                unit_id = str(unit.get("unit_id") or "")
-                if unit_id:
-                    seen_unit_ids.add(unit_id)
-                yield unit
+    def _build_coverage_discovery_snippets(
+        self,
+        *,
+        text: str,
+        entities: list[RecognizerResult],
+        source_structure: dict[str, Any] | None,
+        max_chars: int,
+    ) -> List[RiskSnippet]:
+        if not isinstance(source_structure, dict):
+            return []
+        snippets: list[RiskSnippet] = []
+        units = resolve_docx_unit_spans(text or "", self._iter_structure_units(source_structure))
+        total_units = 0
+        signal_units = 0
+        partial_units = 0
+        uncovered_signal_units = 0
+        for unit in units:
+            unit_text = str(unit.get("text") or "").strip()
+            if not unit_text:
+                continue
+            container_type = str(unit.get("container_type") or unit.get("unit_type") or "").strip()
+            if container_type not in {"paragraph", "table_cell", "textbox", "header", "footer", "footnote", "endnote"}:
+                continue
+            total_units += 1
+            start = self._coerce_int(unit.get("_resolved_start"), -1)
+            end = self._coerce_int(unit.get("_resolved_end"), -1)
+            if start < 0 or end <= start:
+                continue
+            if not self._structure_unit_has_discovery_signal(unit_text, container_type):
+                continue
+            signal_units += 1
+            covered_count = self._covered_subject_count(
+                start,
+                end,
+                self._subject_entity_spans(entities),
+            )
+            if covered_count > 0:
+                partial_units += 1
+            else:
+                uncovered_signal_units += 1
+            snippet_end = min(len(text), end, start + max_chars)
+            snippets.append(
+                RiskSnippet(
+                    snippet_type="qwen_coverage_discovery",
+                    risk_reason=f"qwen_discovery:uncovered_{container_type}",
+                    start=start,
+                    end=snippet_end,
+                    text=text[start:snippet_end],
+                    target_entity={
+                        "type": "DISCOVERY",
+                        "start": start,
+                        "end": end,
+                        "source": "coverage_discovery",
+                        "metadata": {
+                            "qwen_coverage_discovery": True,
+                            "docx_unit_id": unit.get("unit_id"),
+                            "docx_container_type": container_type,
+                            "docx_part_name": unit.get("part_name"),
+                            "docx_table_index": unit.get("table_index"),
+                            "docx_row_index": unit.get("row_index"),
+                            "docx_col_index": unit.get("col_index"),
+                            "span_resolution": unit.get("_span_resolution"),
+                        },
+                    },
+                )
+            )
+        self.last_metadata.update(
+            {
+                "coverage_discovery_unit_total_count": total_units,
+                "coverage_discovery_signal_unit_count": signal_units,
+                "coverage_discovery_fully_covered_unit_count": 0,
+                "coverage_discovery_partial_unit_count": partial_units,
+                "coverage_discovery_uncovered_signal_unit_count": uncovered_signal_units,
+                "coverage_discovery_snippet_raw_count": len(snippets),
+            }
+        )
+        return snippets
 
-        pages = source_structure.get("pages")
-        if not isinstance(pages, list):
-            return
-        for page in pages:
-            if not isinstance(page, dict):
+    @staticmethod
+    def _subject_entity_spans(entities: list[RecognizerResult]) -> list[tuple[int, int]]:
+        spans: list[tuple[int, int]] = []
+        for entity in entities or []:
+            if projected_default_subject_type(entity) not in DEFAULT_SUBJECT_TYPES:
                 continue
-            units = page.get("units")
-            if not isinstance(units, list):
+            try:
+                start = int(entity.start)
+                end = int(entity.end)
+            except (TypeError, ValueError):
                 continue
-            for unit in units:
-                if isinstance(unit, dict):
-                    unit_id = str(unit.get("unit_id") or "")
-                    if unit_id and unit_id in seen_unit_ids:
-                        continue
-                    if unit_id:
-                        seen_unit_ids.add(unit_id)
-                    yield unit
+            if end > start:
+                spans.append((start, end))
+        return spans
+
+    def _unit_subject_coverage_sufficient(
+        self,
+        *,
+        unit_text: str,
+        container_type: str,
+        unit_start: int,
+        unit_end: int,
+        covered_spans: list[tuple[int, int]],
+    ) -> bool:
+        return self._unit_subject_coverage_status(
+            unit_text=unit_text,
+            container_type=container_type,
+            unit_start=unit_start,
+            unit_end=unit_end,
+            covered_spans=covered_spans,
+        ) == "full"
+
+    def _unit_subject_coverage_status(
+        self,
+        *,
+        unit_text: str,
+        container_type: str,
+        unit_start: int,
+        unit_end: int,
+        covered_spans: list[tuple[int, int]],
+    ) -> str:
+        covered_count = self._covered_subject_count(unit_start, unit_end, covered_spans)
+        if covered_count <= 0:
+            return "none"
+        expected_count = self._expected_subject_mention_count(unit_text, container_type)
+        if expected_count <= 0:
+            return "full"
+        return "full" if covered_count >= expected_count else "partial"
+
+    @staticmethod
+    def _covered_subject_count(start: int, end: int, subject_spans: list[tuple[int, int]]) -> int:
+        covered: set[tuple[int, int]] = set()
+        for span_start, span_end in subject_spans:
+            if span_start < end and span_end > start:
+                covered.add((max(start, span_start), min(end, span_end)))
+        return len(covered)
+
+    def _expected_subject_mention_count(self, unit_text: str, container_type: str) -> int:
+        compact = re.sub(r"\s+", "", unit_text or "")
+        if not compact:
+            return 0
+        counts = [
+            self._party_label_mention_count(compact),
+            self._organization_mention_count(compact),
+            self._person_role_mention_count(compact),
+            self._official_institution_mention_count(compact),
+        ]
+        expected = max(counts)
+        if expected <= 1 and container_type in {"table_cell", "textbox"}:
+            expected = max(expected, self._separator_subject_hint_count(compact))
+        return expected
+
+    @staticmethod
+    def _party_label_mention_count(compact: str) -> int:
+        return len(
+            re.findall(
+                r"(?:甲方|乙方|丙方|丁方|委托方|受托方|发包人|承包人|采购人|供应商|"
+                r"原告|被告|上诉人|被上诉人|申请人|被申请人|第三人|收款单位|付款单位)"
+                r"[:：]",
+                compact,
+            )
+        )
+
+    @staticmethod
+    def _organization_mention_count(compact: str) -> int:
+        return len(
+            re.findall(
+                r"[\u4e00-\u9fa5A-Za-z0-9·（）()]{2,60}?"
+                r"(?:股份有限公司|有限责任公司|集团有限公司|有限公司|分公司|子公司|公司|集团|"
+                r"商行|合作社|工作室|经营部|事务所|研究院|研究所|服务中心|技术中心)",
+                compact,
+            )
+        )
+
+    @staticmethod
+    def _person_role_mention_count(compact: str) -> int:
+        return len(
+            re.findall(
+                r"(?:法定代表人|法人代表|负责人|联系人|经办人|代理人|签署人)"
+                r"[:：]?[一-龥·]{2,8}",
+                compact,
+            )
+        )
+
+    @staticmethod
+    def _official_institution_mention_count(compact: str) -> int:
+        return len(
+            re.findall(
+                r"[\u4e00-\u9fa5]{2,30}?"
+                r"(?:人民法院|检察院|仲裁委员会|公安局|市场监督管理局|税务局|"
+                r"银行|支行|分行|管理委员会|管委会)",
+                compact,
+            )
+        )
+
+    @staticmethod
+    def _separator_subject_hint_count(compact: str) -> int:
+        if not re.search(r"(?:和|与|及|、|，|,)", compact):
+            return 0
+        suffix_count = len(
+            re.findall(
+                r"(?:公司|集团|分公司|子公司|商行|合作社|工作室|经营部|事务所|研究院|研究所|银行|法院)",
+                compact,
+            )
+        )
+        return suffix_count
+
+    def _structure_unit_has_discovery_signal(self, unit_text: str, container_type: str) -> bool:
+        compact = re.sub(r"\s+", "", unit_text or "")
+        if not compact or len(compact) < 2:
+            return False
+        if self._structure_unit_has_sensitive_cue(unit_text, container_type):
+            return True
+        if re.search(
+            r"(?:甲方|乙方|丙方|原告|被告|上诉人|被上诉人|申请人|被申请人|第三人|"
+            r"委托方|受托方|发包人|承包人|采购人|供应商|签约方|合同主体|交易主体)",
+            compact,
+        ):
+            return True
+        if re.search(
+            r"[\u4e00-\u9fa5A-Za-z0-9·]{2,32}"
+            r"(?:股份有限公司|有限责任公司|集团有限公司|有限公司|分公司|子公司|公司|集团|"
+            r"商行|合作社|工作室|经营部|事务所|研究院|研究所|服务中心|技术中心)",
+            compact,
+        ):
+            return True
+        if re.search(
+            r"[\u4e00-\u9fa5A-Za-z0-9·]{2,18}"
+            r"(?:继续履约|负责(?:结算|付款|收款|交付|供货|施工|对账)|"
+            r"签订(?:合同|协议)|承担(?:责任|付款|结算|交付)|"
+            r"付款|收款|结算|供货|施工|盖章|签章|落款)",
+            compact,
+        ):
+            return True
+        return False
+
+    def _iter_structure_units(self, source_structure: dict[str, Any]):
+        yield from iter_docx_structure_units(source_structure)
 
     def _coerce_int(self, value: Any, default: int = 0) -> int:
         try:
@@ -459,6 +743,8 @@ class RiskSnippetScheduler:
                 ledger_snippets.append(snippet)
             elif RiskSnippetScheduler._is_rule_first_review_snippet(snippet):
                 final_subject_snippets.append(snippet)
+            elif RiskSnippetScheduler._is_discovery_snippet(snippet):
+                structure_snippets.append(snippet)
             elif RiskSnippetScheduler._is_docx_structure_snippet(snippet):
                 structure_snippets.append(snippet)
             else:
@@ -501,6 +787,16 @@ class RiskSnippetScheduler:
             target_start = target.get("start")
             target_end = target.get("end")
             return ("rule_first_review", target_type, target_start, target_end, target_text)
+        if RiskSnippetScheduler._is_discovery_snippet(snippet):
+            target = snippet.target_entity if isinstance(snippet.target_entity, dict) else {}
+            metadata = target.get("metadata") if isinstance(target.get("metadata"), dict) else {}
+            return (
+                "qwen_discovery",
+                metadata.get("docx_unit_id") or "",
+                metadata.get("docx_container_type") or "",
+                snippet.start,
+                snippet.end,
+            )
         return (snippet.start, snippet.end, snippet.snippet_type)
 
     @staticmethod
@@ -515,6 +811,13 @@ class RiskSnippetScheduler:
         return str(snippet.risk_reason or "").startswith("docx_structure:")
 
     @staticmethod
+    def _is_discovery_snippet(snippet: RiskSnippet) -> bool:
+        return (
+            snippet.snippet_type == "qwen_coverage_discovery"
+            or str(snippet.risk_reason or "").startswith("qwen_discovery:")
+        )
+
+    @staticmethod
     def _is_rule_first_review_snippet(snippet: RiskSnippet) -> bool:
         return (
             snippet.snippet_type == "rule_first_review_block"
@@ -525,8 +828,10 @@ class RiskSnippetScheduler:
     def _snippet_priority(snippet: RiskSnippet, index: int) -> tuple[int, int]:
         if RiskSnippetScheduler._is_ledger_review_snippet(snippet):
             return (0, index)
-        if snippet.snippet_type == "rule_first_review_block":
+        if snippet.snippet_type in {"rule_first_review_block", "missing_candidate_review"}:
             return (1, index)
+        if RiskSnippetScheduler._is_discovery_snippet(snippet):
+            return (2, index)
         if str(snippet.risk_reason or "").startswith("docx_structure:"):
             return (2, index)
         if snippet.snippet_type in {"conflict_block", "legal_party_block", "header_party_block"}:

@@ -91,6 +91,7 @@ def _structure_short_org_counts(entities: Iterable[Dict[str, Any]]) -> Dict[str,
         "ambiguous": 0,
         "confirmed": 0,
         "review_backed": 0,
+        "publication_review_required": 0,
     }
     for entity in entities or []:
         if not isinstance(entity, dict):
@@ -119,6 +120,8 @@ def _structure_short_org_counts(entities: Iterable[Dict[str, Any]]) -> Dict[str,
             or source in {"qwen_fragment_review", "qwen_heavy_arbitration"}
         ):
             counts["review_backed"] += 1
+        if metadata.get("short_org_publication_review_required"):
+            counts["publication_review_required"] += 1
     return counts
 
 
@@ -179,6 +182,7 @@ async def _run(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         primary_entities = _results_from_payload(payload.get("entities") or [])
         review_surface_entities = _results_from_payload(payload.get("review_entities") or [])
+        review_only_candidates = _results_from_payload(payload.get("review_only_candidates") or [])
         if not review_surface_entities:
             review_surface_entities = list(primary_entities)
         primary_entity_input_count = len(primary_entities)
@@ -197,8 +201,10 @@ async def _run(payload: Dict[str, Any]) -> Dict[str, Any]:
             text,
             review_surface_entities,
             source_structure=source_structure,
+            rejected_entities=review_only_candidates,
             max_snippets=ordinary_review_budget,
         )
+        snippet_scheduler_metadata = dict(getattr(recognizer.snippet_scheduler, "last_metadata", {}) or {})
         review_snippets = recognizer._select_review_snippets_requiring_semantic_recovery(
             snippets,
             review_surface_entities,
@@ -211,6 +217,8 @@ async def _run(payload: Dict[str, Any]) -> Dict[str, Any]:
         stage_counts["review_worker_primary_compacted_count"] = len(primary_entities)
         stage_counts["review_worker_surface_input_count"] = review_surface_input_count
         stage_counts["review_worker_surface_compacted_count"] = len(review_surface_entities)
+        stage_counts["review_worker_review_only_candidate_count"] = len(review_only_candidates)
+        stage_counts.update(recognizer._safe_int_metadata(snippet_scheduler_metadata))
         quality_flags = list(metadata.get("quality_flags") or [])
         requires_manual_review = bool(metadata.get("requires_manual_review"))
         review_result = None
@@ -316,10 +324,18 @@ async def _run(payload: Dict[str, Any]) -> Dict[str, Any]:
         else:
             review_skipped_reason = "review_disabled"
 
+        post_review_merge_input_count = len(results)
         merged = recognizer.merge_service.merge(results)
+        stage_counts["post_review_merge_input_count"] = post_review_merge_input_count
         stage_counts["primary_review_surface"] = len(review_surface_entities)
         stage_counts["primary_fallback_entities"] = len(primary_entities)
         stage_counts["risk_snippets"] = len(snippets)
+        stage_counts["missing_candidate_review_snippets"] = sum(
+            1 for snippet in snippets if str(snippet.snippet_type or "") == "missing_candidate_review"
+        )
+        stage_counts["qwen_discovery_snippets"] = sum(
+            1 for snippet in snippets if str(snippet.snippet_type or "") == "qwen_coverage_discovery"
+        )
         stage_counts["docx_structure_snippets"] = sum(
             1 for snippet in snippets if snippet.risk_reason.startswith("docx_structure:")
         )
@@ -327,6 +343,12 @@ async def _run(payload: Dict[str, Any]) -> Dict[str, Any]:
             1 for snippet in snippets if snippet.snippet_type == "docx_table_cell_block"
         )
         stage_counts["review_snippets_selected"] = len(review_snippets)
+        stage_counts["missing_candidate_review_snippets_selected"] = sum(
+            1 for snippet in review_snippets if str(snippet.snippet_type or "") == "missing_candidate_review"
+        )
+        stage_counts["qwen_discovery_snippets_selected"] = sum(
+            1 for snippet in review_snippets if str(snippet.snippet_type or "") == "qwen_coverage_discovery"
+        )
         stage_counts["docx_structure_snippets_selected"] = sum(
             1 for snippet in review_snippets if str(snippet.risk_reason or "").startswith("docx_structure:")
         )
@@ -354,6 +376,26 @@ async def _run(payload: Dict[str, Any]) -> Dict[str, Any]:
             )
             stage_counts["review_scheduled_standard_snippets"] = int(
                 review_metadata.get("review_scheduled_standard_snippet_count") or 0
+            )
+            stage_counts["review_scheduled_missing_candidate_snippets"] = int(
+                review_metadata.get("review_scheduled_missing_candidate_snippet_count") or 0
+            )
+            stage_counts["qwen_discovery_snippets_selected"] = int(
+                review_metadata.get("qwen_discovery_snippet_selected_count")
+                or stage_counts.get("qwen_discovery_snippets_selected")
+                or 0
+            )
+            stage_counts["qwen_discovery_raw_candidates"] = int(
+                review_metadata.get("qwen_discovery_raw_candidate_count") or 0
+            )
+            stage_counts["qwen_discovery_materialized_entities"] = int(
+                review_metadata.get("qwen_discovery_materialized_entity_count") or 0
+            )
+            stage_counts["qwen_discovery_rejected_by_gate"] = int(
+                review_metadata.get("qwen_discovery_rejected_by_gate_count") or 0
+            )
+            stage_counts["qwen_discovery_span_miss"] = int(
+                review_metadata.get("qwen_discovery_span_miss_count") or 0
             )
             stage_counts["review_deterministic_rejections"] = int(
                 review_metadata.get("review_deterministic_rejection_count") or 0
@@ -397,17 +439,53 @@ async def _run(payload: Dict[str, Any]) -> Dict[str, Any]:
             requires_manual_review = True
             quality_flags.append("quality_anomaly_detected")
 
-        if entities_filter:
-            merged = recognizer._filter_entities(merged, entities_filter)
-
         project_default_public_results = getattr(recognizer, "_project_default_public_results", None)
+        qwen_discovery_counts = getattr(recognizer, "_qwen_discovery_projection_stage_counts", None)
+        if callable(qwen_discovery_counts):
+            stage_counts.update(
+                qwen_discovery_counts(
+                    merged,
+                    prefix="qwen_discovery_projection_input",
+                )
+            )
+        stage_counts["projection_input_count"] = len(merged)
         merged = (
             project_default_public_results(merged)
             if callable(project_default_public_results)
             else list(merged)
         )
+        if callable(qwen_discovery_counts):
+            stage_counts.update(
+                qwen_discovery_counts(
+                    merged,
+                    prefix="qwen_discovery_projection_output",
+                )
+            )
+        stage_counts["projection_output_count"] = len(merged)
+        if entities_filter:
+            merged = recognizer._filter_entities(merged, entities_filter)
+        if callable(qwen_discovery_counts):
+            stage_counts.update(
+                qwen_discovery_counts(
+                    merged,
+                    prefix="qwen_discovery_filter_output",
+                )
+            )
+        stage_counts["qwen_discovery_lost_before_projection"] = max(
+            0,
+            int(stage_counts.get("qwen_discovery_projection_input_count") or 0)
+            - int(stage_counts.get("qwen_discovery_projection_output_count") or 0),
+        )
+        stage_counts["qwen_discovery_lost_before_filter"] = max(
+            0,
+            int(stage_counts.get("qwen_discovery_projection_output_count") or 0)
+            - int(stage_counts.get("qwen_discovery_filter_output_count") or 0),
+        )
+        stage_counts["filter_output_count"] = len(merged)
         final_results = _validate_and_expand(text, merged)
+        stage_counts["validate_expand_output_count"] = len(final_results)
         final_entities = [result.to_dict() for result in final_results]
+        stage_counts["contextual_refine_input_count"] = len(final_entities)
         contextual_service = ContextualDesensitizationService(
             review_service=recognizer.review_service,
         )
@@ -424,8 +502,11 @@ async def _run(payload: Dict[str, Any]) -> Dict[str, Any]:
             source_structure=source_structure,
             progress_callback=None,
         )
+        stage_counts["contextual_refine_output_count"] = len(final_entities)
         structure_short_org_before_postprocess = _structure_short_org_counts(final_entities)
+        stage_counts["postprocess_input_count"] = len(final_entities)
         final_entities = _postprocess_final_entities(contextual_service, text, final_entities)
+        stage_counts["postprocess_output_count"] = len(final_entities)
         structure_short_org_after_postprocess = _structure_short_org_counts(final_entities)
         contextual_quality_metadata = contextual_service.get_last_quality_metadata()
         contextual_quality_passed = bool(contextual_quality_metadata.get("quality_gate_passed", True))
@@ -448,6 +529,9 @@ async def _run(payload: Dict[str, Any]) -> Dict[str, Any]:
         )
         stage_counts["structure_short_org_ambiguous_after_postprocess"] = int(
             structure_short_org_after_postprocess.get("ambiguous") or 0
+        )
+        stage_counts["structure_short_org_publication_review_required_after_postprocess"] = int(
+            structure_short_org_after_postprocess.get("publication_review_required") or 0
         )
         removed_structure_short_org = max(
             0,
@@ -545,6 +629,72 @@ async def _run(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "replacement_reused_by_multi_subject_count": 0,
                 "qwen_trigger_reasons": review_trigger_reasons,
                 **qwen_contribution,
+                "qwen_discovery_snippet_count": int(
+                    stage_counts.get("qwen_discovery_snippets") or 0
+                ),
+                "qwen_discovery_snippet_selected_count": int(
+                    stage_counts.get("qwen_discovery_snippets_selected") or 0
+                ),
+                "qwen_discovery_raw_candidate_count": int(
+                    stage_counts.get("qwen_discovery_raw_candidates") or 0
+                ),
+                "qwen_discovery_materialized_entity_count": int(
+                    stage_counts.get("qwen_discovery_materialized_entities") or 0
+                ),
+                "qwen_discovery_projection_input_count": int(
+                    stage_counts.get("qwen_discovery_projection_input_count") or 0
+                ),
+                "qwen_discovery_projection_input_subject_count": int(
+                    stage_counts.get("qwen_discovery_projection_input_subject_count") or 0
+                ),
+                "qwen_discovery_projection_output_count": int(
+                    stage_counts.get("qwen_discovery_projection_output_count") or 0
+                ),
+                "qwen_discovery_projection_output_subject_count": int(
+                    stage_counts.get("qwen_discovery_projection_output_subject_count") or 0
+                ),
+                "qwen_discovery_filter_output_count": int(
+                    stage_counts.get("qwen_discovery_filter_output_count") or 0
+                ),
+                "qwen_discovery_filter_output_subject_count": int(
+                    stage_counts.get("qwen_discovery_filter_output_subject_count") or 0
+                ),
+                "qwen_discovery_lost_before_projection_count": int(
+                    stage_counts.get("qwen_discovery_lost_before_projection") or 0
+                ),
+                "qwen_discovery_lost_before_filter_count": int(
+                    stage_counts.get("qwen_discovery_lost_before_filter") or 0
+                ),
+                "qwen_discovery_rejected_by_gate_count": int(
+                    stage_counts.get("qwen_discovery_rejected_by_gate") or 0
+                ),
+                "qwen_discovery_span_miss_count": int(
+                    stage_counts.get("qwen_discovery_span_miss") or 0
+                ),
+                "coverage_discovery_unit_total_count": int(
+                    stage_counts.get("coverage_discovery_unit_total_count") or 0
+                ),
+                "coverage_discovery_signal_unit_count": int(
+                    stage_counts.get("coverage_discovery_signal_unit_count") or 0
+                ),
+                "coverage_discovery_fully_covered_unit_count": int(
+                    stage_counts.get("coverage_discovery_fully_covered_unit_count") or 0
+                ),
+                "coverage_discovery_partial_unit_count": int(
+                    stage_counts.get("coverage_discovery_partial_unit_count") or 0
+                ),
+                "coverage_discovery_uncovered_signal_unit_count": int(
+                    stage_counts.get("coverage_discovery_uncovered_signal_unit_count") or 0
+                ),
+                "coverage_discovery_snippet_raw_count": int(
+                    stage_counts.get("coverage_discovery_snippet_raw_count") or 0
+                ),
+                "risk_snippet_coverage_discovery_raw_count": int(
+                    stage_counts.get("risk_snippet_coverage_discovery_raw_count") or 0
+                ),
+                "risk_snippet_coverage_discovery_deduped_count": int(
+                    stage_counts.get("risk_snippet_coverage_discovery_deduped_count") or 0
+                ),
                 "ledger_conflict_adjudication_enabled": bool(
                     review_result and review_metadata.get("ledger_conflict_adjudication_enabled")
                 ),
@@ -563,6 +713,18 @@ async def _run(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "review_scheduled_standard_snippet_count": int(
                     review_metadata.get("review_scheduled_standard_snippet_count") or 0
                 ) if review_result else 0,
+                "missing_candidate_review_snippet_count": int(
+                    stage_counts.get("missing_candidate_review_snippets") or 0
+                ),
+                "missing_candidate_review_snippet_selected_count": int(
+                    stage_counts.get("missing_candidate_review_snippets_selected") or 0
+                ),
+                "review_scheduled_missing_candidate_snippet_count": int(
+                    review_metadata.get("review_scheduled_missing_candidate_snippet_count") or 0
+                ) if review_result else 0,
+                "review_worker_review_only_candidate_count": int(len(review_only_candidates)),
+                "primary_entity_return_count": int(stage_counts.get("primary_entity_return_count") or 0),
+                "primary_review_surface_count": int(stage_counts.get("primary_review_surface_count") or 0),
                 "review_deterministic_rejection_count": int(
                     review_metadata.get("review_deterministic_rejection_count") or 0
                 ) if review_result else 0,

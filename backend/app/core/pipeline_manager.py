@@ -611,8 +611,60 @@ class PipelineManager:
     ) -> List[RecognizerResult]:
         expanded = list(results)
         seen = {(item.entity_type, item.start, item.end, item.text) for item in results}
+        ledger_added = 0
 
         for result in sorted(results, key=lambda item: (-(item.end - item.start), item.start)):
+            for candidate_text in self._derive_subject_ledger_propagation_texts(result):
+                if len(candidate_text.strip()) < 2:
+                    continue
+                normalized_candidate = re.sub(r"[\s:：，,。；;（）()《》【】\"“”'`]", "", candidate_text or "")
+                if not self._should_propagate_ledger_subject_surface(
+                    candidate_text,
+                    result.entity_type,
+                    normalized_candidate=normalized_candidate,
+                ):
+                    continue
+                anchor_allows_short_org = self._allows_anchored_short_organization_propagation(
+                    result,
+                    candidate_text,
+                )
+                for start, end, matched_text in self._find_all_occurrence_spans(text, candidate_text):
+                    key = (result.entity_type, start, end, matched_text)
+                    if key in seen:
+                        continue
+                    if self._overlaps_existing(start, end, expanded):
+                        continue
+                    if (
+                        result.entity_type in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME", "PROJECT", "ALIAS"}
+                        and len(normalized_candidate) <= 6
+                        and not self.ORGANIZATION_SUFFIX_PATTERN.search(normalized_candidate)
+                        and not self._has_short_organization_occurrence_context(text, start, end)
+                    ):
+                        continue
+                    metadata = dict(result.metadata or {})
+                    metadata.update(
+                        {
+                            "derived_from": result.text,
+                            "candidate_text": candidate_text,
+                            "propagated_from_subject_ledger": True,
+                            "propagated_from_stable_seed": True,
+                        }
+                    )
+                    if anchor_allows_short_org:
+                        metadata["anchored_short_org_propagation"] = True
+                    expanded.append(
+                        RecognizerResult(
+                            entity_type=result.entity_type,
+                            start=start,
+                            end=end,
+                            score=max(0.74, float(result.score) - 0.06),
+                            text=matched_text,
+                            source="propagate",
+                            metadata=metadata,
+                        )
+                    )
+                    seen.add(key)
+                    ledger_added += 1
             if result.entity_type not in self.PROPAGATION_TYPES:
                 continue
             if not self._stable_seed_for_default_propagation(result):
@@ -653,7 +705,69 @@ class PipelineManager:
                     seen.add(key)
 
         expanded.sort(key=lambda item: (item.start, item.end))
+        if ledger_added:
+            logger.info("Subject ledger propagation added %s repeated mentions.", ledger_added)
         return expanded
+
+    def _derive_subject_ledger_propagation_texts(self, result: RecognizerResult) -> List[str]:
+        if result.entity_type not in self.PROPAGATION_TYPES:
+            return []
+        metadata = dict(result.metadata or {})
+        if str(metadata.get("subject_ledger_status") or "") not in {"", "confirmed_subject"}:
+            return []
+        if str(metadata.get("subject_ledger_subject_status") or "") not in {"", "confirmed_subject"}:
+            return []
+        candidates: List[str] = []
+        for value in (
+            metadata.get("subject_ledger_canonical_text"),
+            metadata.get("canonical_subject_text"),
+            metadata.get("canonical"),
+            metadata.get("definition_full_text"),
+            result.text,
+        ):
+            if isinstance(value, str) and value.strip():
+                candidates.append(value.strip())
+        for value in metadata.get("subject_surfaces") or []:
+            if isinstance(value, str) and value.strip():
+                candidates.append(value.strip())
+        deduped: List[str] = []
+        result_normalized = re.sub(r"\s+", "", result.text or "")
+        for candidate in candidates:
+            normalized = re.sub(r"\s+", "", candidate or "")
+            if not normalized:
+                continue
+            if normalized in self.NON_SENSITIVE_LABEL_TERMS:
+                continue
+            if normalized not in deduped:
+                deduped.append(normalized if normalized != result_normalized else candidate)
+        return sorted(deduped, key=lambda item: (-len(re.sub(r"\s+", "", item or "")), item))
+
+    def _should_propagate_ledger_subject_surface(
+        self,
+        candidate_text: str,
+        entity_type: str,
+        *,
+        normalized_candidate: str,
+    ) -> bool:
+        if not normalized_candidate or normalized_candidate in self.NON_SENSITIVE_LABEL_TERMS:
+            return False
+        if entity_type in {"GOVERNMENT", "COURT", "BANK_NAME"}:
+            return is_official_institution_text(normalized_candidate)
+        if entity_type in {"LOCATION", "ADDRESS"}:
+            return self._is_detailed_location_candidate(normalized_candidate)
+        if entity_type in {"PERSON", "PERSON_NAME", "LEGAL_REPRESENTATIVE", "CONTACT_PERSON", "SIGNATORY"}:
+            return self._is_valid_person_candidate(normalized_candidate, "propagate")
+        if entity_type in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME", "PROJECT", "ALIAS"}:
+            if self.ORGANIZATION_SUFFIX_PATTERN.search(normalized_candidate):
+                return self._is_valid_organization_candidate(normalized_candidate, "propagate")
+            if 2 <= len(normalized_candidate) <= 6:
+                return (
+                    looks_like_organization_short_name(normalized_candidate)
+                    and not self._is_low_information_organization_alias(normalized_candidate)
+                    and not self._looks_like_location_alias(normalized_candidate)
+                )
+            return self._is_valid_organization_candidate(normalized_candidate, "propagate")
+        return self._should_propagate_candidate(candidate_text, entity_type)
 
     @staticmethod
     def _stable_seed_for_default_propagation(result: RecognizerResult) -> bool:

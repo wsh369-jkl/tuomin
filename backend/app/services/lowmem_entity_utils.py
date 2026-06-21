@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import re
-from typing import Dict, Iterable, Iterator, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 from app.core.recognizer_base import RecognizerResult
 
@@ -1096,7 +1097,17 @@ def is_weak_function_stripped_org(value: str) -> bool:
     return len(core) <= 2
 
 
-def sanitize_recognition_text(text: str) -> tuple[str, list[int]]:
+@dataclass(frozen=True)
+class RecognitionView:
+    original_text: str
+    sanitized_text: str
+    original_to_sanitized: list[int]
+    sanitized_to_original: list[int]
+    removed_inline_space_count: int
+    span_remap_fail_count: int = 0
+
+
+def build_recognition_view(text: str) -> RecognitionView:
     """Remove intrusive inline whitespace without touching structural newlines.
 
     The legal source files sometimes contain OCR- or copy-induced spaces inside
@@ -1106,38 +1117,62 @@ def sanitize_recognition_text(text: str) -> tuple[str, list[int]]:
     to the original source text.
     """
 
+    source_text = text or ""
     if not text:
-        return "", []
+        return RecognitionView(
+            original_text=source_text,
+            sanitized_text="",
+            original_to_sanitized=[],
+            sanitized_to_original=[],
+            removed_inline_space_count=0,
+        )
 
     sanitized_chars: list[str] = []
-    index_map: list[int] = []
-    text_length = len(text)
+    original_to_sanitized: list[int] = [-1] * len(source_text)
+    sanitized_to_original: list[int] = []
+    removed_inline_space_count = 0
+    text_length = len(source_text)
     cursor = 0
     while cursor < text_length:
-        char = text[cursor]
+        char = source_text[cursor]
         if char in "\r\n":
             sanitized_chars.append(char)
-            index_map.append(cursor)
+            original_to_sanitized[cursor] = len(sanitized_to_original)
+            sanitized_to_original.append(cursor)
             cursor += 1
             continue
         if char.isspace():
             space_end = cursor + 1
-            while space_end < text_length and text[space_end].isspace() and text[space_end] not in "\r\n":
+            while space_end < text_length and source_text[space_end].isspace() and source_text[space_end] not in "\r\n":
                 space_end += 1
             left_char = sanitized_chars[-1] if sanitized_chars else ""
-            right_char = text[space_end] if space_end < text_length else ""
+            right_char = source_text[space_end] if space_end < text_length else ""
             if _is_intrusive_inline_space(left_char, right_char):
+                removed_inline_space_count += space_end - cursor
                 cursor = space_end
                 continue
             for original_index in range(cursor, space_end):
-                sanitized_chars.append(text[original_index])
-                index_map.append(original_index)
+                sanitized_chars.append(source_text[original_index])
+                original_to_sanitized[original_index] = len(sanitized_to_original)
+                sanitized_to_original.append(original_index)
             cursor = space_end
             continue
         sanitized_chars.append(char)
-        index_map.append(cursor)
+        original_to_sanitized[cursor] = len(sanitized_to_original)
+        sanitized_to_original.append(cursor)
         cursor += 1
-    return "".join(sanitized_chars), index_map
+    return RecognitionView(
+        original_text=source_text,
+        sanitized_text="".join(sanitized_chars),
+        original_to_sanitized=original_to_sanitized,
+        sanitized_to_original=sanitized_to_original,
+        removed_inline_space_count=removed_inline_space_count,
+    )
+
+
+def sanitize_recognition_text(text: str) -> tuple[str, list[int]]:
+    view = build_recognition_view(text or "")
+    return view.sanitized_text, view.sanitized_to_original
 
 
 def _is_intrusive_inline_space(left_char: str, right_char: str) -> bool:
@@ -1184,6 +1219,186 @@ def remap_results_to_source(
             )
         )
     return remapped
+
+
+def resolve_docx_unit_spans(text: str, units: Iterable[dict]) -> list[dict]:
+    """Resolve DOCX text-unit spans with document-order constraints.
+
+    A stale or missing unit span must not fall back to a global first match:
+    repeated labels and repeated table values are common in legal documents.
+    The fallback therefore searches forward from the previously resolved unit,
+    preserving the parser's structural order. Unresolved units are kept with
+    diagnostic metadata so they can be counted and reviewed without producing
+    writable entities at the wrong location.
+    """
+
+    source_text = text or ""
+    source_view = build_recognition_view(source_text)
+    resolved_units: list[dict] = []
+    cursor = 0
+    for order_index, raw_unit in enumerate(units or []):
+        if not isinstance(raw_unit, dict):
+            continue
+        unit = dict(raw_unit)
+        unit_text = str(unit.get("text") or "")
+        start = _coerce_docx_unit_int(unit.get("start"), -1)
+        end = _coerce_docx_unit_int(unit.get("end"), -1)
+        resolved_start = -1
+        resolved_end = -1
+        resolution = "unresolved"
+        if not unit_text:
+            resolution = "missing_text"
+        elif (
+            start >= 0
+            and end > start
+            and end <= len(source_text)
+            and source_text[start:end] == unit_text
+        ):
+            resolved_start = start
+            resolved_end = end
+            resolution = "exact"
+            cursor = max(cursor, resolved_end)
+        else:
+            found = source_text.find(unit_text, max(0, min(cursor, len(source_text))))
+            if found >= 0:
+                resolved_start = found
+                resolved_end = found + len(unit_text)
+                resolution = "ordered_forward"
+                cursor = max(cursor, resolved_end)
+            else:
+                sanitized_unit_text, _unit_index_map = sanitize_recognition_text(unit_text)
+                if sanitized_unit_text:
+                    sanitized_cursor = 0
+                    if 0 <= cursor < len(source_view.original_to_sanitized):
+                        mapped_cursor = source_view.original_to_sanitized[cursor]
+                        sanitized_cursor = max(0, mapped_cursor if mapped_cursor >= 0 else 0)
+                    sanitized_found = source_view.sanitized_text.find(sanitized_unit_text, sanitized_cursor)
+                    span = remap_sanitized_span(
+                        source_view.sanitized_to_original,
+                        sanitized_found,
+                        sanitized_found + len(sanitized_unit_text),
+                    ) if sanitized_found >= 0 else None
+                    if span is not None:
+                        resolved_start, resolved_end = span
+                        resolution = "sanitized_ordered_forward"
+                        cursor = max(cursor, resolved_end)
+        unit["_resolved_order_index"] = order_index
+        unit["_resolved_start"] = resolved_start
+        unit["_resolved_end"] = resolved_end
+        unit["_span_resolution"] = resolution
+        resolved_units.append(unit)
+    return resolved_units
+
+
+def iter_docx_structure_units(source_structure: dict[str, Any] | None) -> Iterator[dict[str, Any]]:
+    """Yield the canonical DOCX structure-unit stream used by recognition.
+
+    ``docx_text_units`` is the parser's complete source-map stream. ``pages[*].units``
+    is a page-oriented view built from the same units and therefore mostly a
+    duplicate view. Feeding both streams directly into ordered span resolution
+    pushes the resolver cursor through the document twice, which can turn real
+    coverage into misleading duplicate/unresolved diagnostics. Keep raw units as
+    the canonical stream and only add page units that are not already present in
+    the raw stream.
+    """
+
+    if not isinstance(source_structure, dict):
+        return
+
+    raw_unit_ids: set[str] = set()
+    raw_units = source_structure.get("docx_text_units")
+    if isinstance(raw_units, list):
+        for unit in raw_units:
+            if not isinstance(unit, dict):
+                continue
+            unit_id = str(unit.get("unit_id") or "").strip()
+            if unit_id:
+                raw_unit_ids.add(unit_id)
+            yield unit
+
+    pages = source_structure.get("pages")
+    if not isinstance(pages, list):
+        return
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        page_units = page.get("units")
+        if not isinstance(page_units, list):
+            continue
+        for unit in page_units:
+            if not isinstance(unit, dict):
+                continue
+            unit_id = str(unit.get("unit_id") or "").strip()
+            if unit_id and unit_id in raw_unit_ids:
+                continue
+            yield unit
+
+
+def docx_structure_unit_inventory(source_structure: dict[str, Any] | None) -> dict[str, int]:
+    """Return privacy-safe counters for DOCX structure-unit source views."""
+
+    if not isinstance(source_structure, dict):
+        return {
+            "raw_docx_text_unit_count": 0,
+            "page_docx_unit_count": 0,
+            "page_docx_unit_duplicate_raw_id_count": 0,
+            "page_docx_unit_unique_extra_count": 0,
+            "canonical_docx_structure_unit_count": 0,
+            "raw_docx_text_unit_duplicate_id_count": 0,
+        }
+
+    raw_unit_ids: set[str] = set()
+    duplicate_raw_ids = 0
+    raw_count = 0
+    raw_units = source_structure.get("docx_text_units")
+    if isinstance(raw_units, list):
+        for unit in raw_units:
+            if not isinstance(unit, dict):
+                continue
+            raw_count += 1
+            unit_id = str(unit.get("unit_id") or "").strip()
+            if not unit_id:
+                continue
+            if unit_id in raw_unit_ids:
+                duplicate_raw_ids += 1
+            raw_unit_ids.add(unit_id)
+
+    page_count = 0
+    duplicate_page_ids = 0
+    unique_page_extra = 0
+    pages = source_structure.get("pages")
+    if isinstance(pages, list):
+        for page in pages:
+            if not isinstance(page, dict):
+                continue
+            page_units = page.get("units")
+            if not isinstance(page_units, list):
+                continue
+            for unit in page_units:
+                if not isinstance(unit, dict):
+                    continue
+                page_count += 1
+                unit_id = str(unit.get("unit_id") or "").strip()
+                if unit_id and unit_id in raw_unit_ids:
+                    duplicate_page_ids += 1
+                else:
+                    unique_page_extra += 1
+
+    return {
+        "raw_docx_text_unit_count": raw_count,
+        "page_docx_unit_count": page_count,
+        "page_docx_unit_duplicate_raw_id_count": duplicate_page_ids,
+        "page_docx_unit_unique_extra_count": unique_page_extra,
+        "canonical_docx_structure_unit_count": raw_count + unique_page_extra,
+        "raw_docx_text_unit_duplicate_id_count": duplicate_raw_ids,
+    }
+
+
+def _coerce_docx_unit_int(value: object, default: int = -1) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def is_identity_reference_term(value: str) -> bool:
@@ -1458,7 +1673,7 @@ def _strip_short_org_leading_function_prefix_span(value: str) -> Optional[tuple[
 
 def _is_valid_short_org_boundary_subject(value: str) -> bool:
     normalized = normalize_entity_text(value)
-    if not looks_like_organization_short_name(normalized):
+    if not looks_like_organization_short_name(normalized) and not looks_like_short_org_with_company_suffix(normalized):
         return False
     if any(
         normalized.startswith(prefix) and len(normalized) > len(prefix) + 1
@@ -1471,9 +1686,28 @@ def _is_valid_short_org_boundary_subject(value: str) -> bool:
         return False
     if any(token in normalized for token in NON_SUBJECT_ACTION_VERBS):
         return False
-    if any(token in normalized for token in ORGANIZATION_MARKERS):
+    if any(
+        token in normalized
+        for token in ORGANIZATION_MARKERS
+        if token not in {"公司", "分公司"}
+    ):
         return False
     return True
+
+
+def looks_like_short_org_with_company_suffix(value: str) -> bool:
+    normalized = normalize_entity_text(value)
+    if not 4 <= len(normalized) <= 9:
+        return False
+    suffix = ""
+    for item in ("分公司", "公司"):
+        if normalized.endswith(item):
+            suffix = item
+            break
+    if not suffix:
+        return False
+    stem = normalized[: -len(suffix)]
+    return looks_like_organization_short_name(stem)
 
 
 def find_short_org_prefix_before_non_subject_boundary(value: str) -> Optional[tuple[int, int, str]]:
@@ -1492,7 +1726,7 @@ def find_short_org_prefix_before_non_subject_boundary(value: str) -> Optional[tu
     while local_start < len(text) and text[local_start] in " \t\r\n:：,，;；。.!！?？、":
         local_start += 1
     candidates: list[tuple[tuple[int, int, int], tuple[int, int, str]]] = []
-    max_end = min(len(text), local_start + 6)
+    max_end = min(len(text), local_start + 9)
     for local_end in range(local_start + 2, max_end + 1):
         subject = text[local_start:local_end]
         normalized_subject = normalize_entity_text(subject)

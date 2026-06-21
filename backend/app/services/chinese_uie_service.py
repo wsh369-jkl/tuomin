@@ -7,6 +7,7 @@ from typing import Any, Iterable, Iterator, List, Optional
 
 from app.core.config import settings
 from app.core.recognizer_base import RecognizerResult
+from app.rules.subject_admission_gate import SubjectAdmissionGate
 from app.services.lowmem_entity_utils import (
     GENERIC_ORGANIZATION_TERMS,
     NON_ENTITY_ROLE_TERMS,
@@ -19,8 +20,6 @@ from app.services.lowmem_entity_utils import (
     infer_semantic_type,
     is_identity_reference_term,
     is_generic_organization_term,
-    is_non_subject_action_or_function_term,
-    is_non_subject_generic_org_reference,
     is_org_like_text,
     is_position_title,
     is_probable_person,
@@ -29,11 +28,11 @@ from app.services.lowmem_entity_utils import (
     remap_results_to_source,
     sanitize_recognition_text,
     strip_identity_reference_prefix,
-    subject_noun_gate,
 )
 from app.services.lowmem_memory import release_runtime_memory
 from app.services.lowmem_model_assets import build_model_asset
 from app.services.hf_token_classifier import HFTokenClassificationPipeline
+from app.services.legal_text_segmenter import build_legal_text_segment_metadata
 from app.services.legal_text_segmenter import iter_legal_text_segments
 
 
@@ -236,6 +235,7 @@ class ChineseUIEService:
         self.backend_available = False
         self.backend_error: Optional[str] = None
         self._pipeline = None
+        self.last_extract_metadata: dict[str, object] = {}
 
     @property
     def ready(self) -> bool:
@@ -244,6 +244,19 @@ class ChineseUIEService:
     def extract(self, text: str) -> List[RecognizerResult]:
         sanitized_text, index_map = sanitize_recognition_text(text)
         working_text = sanitized_text or text
+        self.last_extract_metadata = {
+            "uie_input_length": len(text or ""),
+            "uie_working_text_length": len(working_text or ""),
+            **{
+                f"uie_{key}": value
+                for key, value in build_legal_text_segment_metadata(
+                    working_text,
+                    max_chars=420,
+                    overlap_chars=80,
+                    min_split_chars=60,
+                ).items()
+            },
+        }
         model_results: list[RecognizerResult] = []
         if self.backend.lower() == "deterministic":
             self.backend_available = True
@@ -272,6 +285,13 @@ class ChineseUIEService:
 
         fallback_results = self._fallback_extract(working_text)
         remapped = remap_results_to_source([*model_results, *fallback_results], text, index_map)
+        self.last_extract_metadata.update(
+            {
+                "uie_model_result_count": len(model_results),
+                "uie_fallback_result_count": len(fallback_results),
+                "uie_remapped_result_count": len(remapped),
+            }
+        )
         return deduplicate_results(remapped)
 
     def _extract_with_modelscope(self, text: str) -> List[RecognizerResult]:
@@ -472,18 +492,18 @@ class ChineseUIEService:
         if normalized in self.NON_VALUE_TERMS:
             return None
         if entity_type == "PERSON":
-            if not subject_noun_gate("PERSON", normalized)[0]:
+            if not SubjectAdmissionGate.passes_subject_shape("PERSON", normalized)[0]:
                 return None
         if entity_type in {"ADDRESS", "LOCATION"}:
             if self.DATE_LIKE.fullmatch(normalized) or normalized in self.NON_VALUE_TERMS:
                 return None
             if entity_type == "ADDRESS" and not any(token in normalized for token in self.ADDRESS_TOKENS):
                 return None
-            if not subject_noun_gate("LOCATION", normalized)[0]:
+            if not SubjectAdmissionGate.passes_subject_shape("LOCATION", normalized)[0]:
                 return None
         if entity_type in {"ORGANIZATION", "COURT"}:
             gate_type = "GOVERNMENT" if entity_type == "COURT" else "ORGANIZATION"
-            if not subject_noun_gate(gate_type, normalized)[0]:
+            if not SubjectAdmissionGate.passes_subject_shape(gate_type, normalized)[0]:
                 return None
         if entity_type == "POSITION" and normalized in self.NON_VALUE_TERMS:
             return None
@@ -577,12 +597,12 @@ class ChineseUIEService:
         if self.DATE_LIKE.fullmatch(normalized):
             return False
         if entity_type == "PERSON":
-            return subject_noun_gate("PERSON", normalized)[0]
+            return SubjectAdmissionGate.passes_subject_shape("PERSON", normalized)[0]
         if entity_type in {"ORGANIZATION", "COURT"}:
             gate_type = "GOVERNMENT" if entity_type == "COURT" else "ORGANIZATION"
-            return subject_noun_gate(gate_type, normalized)[0]
+            return SubjectAdmissionGate.passes_subject_shape(gate_type, normalized)[0]
         if entity_type == "ADDRESS":
-            return any(token in normalized for token in self.ADDRESS_TOKENS) and subject_noun_gate("LOCATION", normalized)[0]
+            return any(token in normalized for token in self.ADDRESS_TOKENS) and SubjectAdmissionGate.passes_subject_shape("LOCATION", normalized)[0]
         return True
 
     def _expected_label_entity_type(self, label: str) -> str:
@@ -669,7 +689,7 @@ class ChineseUIEService:
         end = start + len(value)
 
         if entity_type in {"ORGANIZATION", "COURT"}:
-            if is_non_subject_generic_org_reference(value) or is_non_subject_action_or_function_term(value):
+            if SubjectAdmissionGate.is_non_subject_expression(value):
                 return None
             org_trimmed = self._trim_to_semantic_org_value(value)
             if org_trimmed != value:
@@ -721,7 +741,7 @@ class ChineseUIEService:
         if len(normalized) > 16 and any(token in normalized for token in ("的", "是", "至", "了")):
             return None
         gate_type = "GOVERNMENT" if entity_type == "COURT" else "ORGANIZATION"
-        return (start, end) if len(normalized) >= 2 and subject_noun_gate(gate_type, normalized)[0] else None
+        return (start, end) if len(normalized) >= 2 and SubjectAdmissionGate.passes_subject_shape(gate_type, normalized)[0] else None
 
     def _trim_to_semantic_org_value(self, value: str) -> str:
         cleaned = value.strip(self.TRAILING_PUNCTUATION)

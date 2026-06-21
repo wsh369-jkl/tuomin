@@ -52,6 +52,9 @@ release_layout_pdf/
 release_ocr_pdf/
 release_updated/
 
+# Local macOS launch helper kept outside GitHub releases
+/*.command
+
 # Environment files
 .env
 backend/.env

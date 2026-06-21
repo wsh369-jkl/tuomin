@@ -19,7 +19,17 @@ from app.services.chinese_uie_service import ChineseUIEService
 from app.services.contract_structure_backfill_service import ContractStructureBackfillService
 from app.services.coverage_first import build_passive_coverage_first_metadata
 from app.services.docx_structure_backfill_service import DocxStructureBackfillService
-from app.services.lowmem_entity_utils import NON_ENTITY_ROLE_TERMS
+from app.services.lowmem_entity_utils import (
+    NON_ENTITY_ROLE_TERMS,
+    ORG_SUFFIX_TERMS,
+    docx_structure_unit_inventory,
+    iter_exact_matches,
+    iter_docx_structure_units,
+    looks_like_organization_short_name,
+    normalize_entity_text,
+    build_recognition_view,
+    resolve_docx_unit_spans,
+)
 from app.services.lowmem_model_assets import (
     build_model_asset,
     primary_models_ready,
@@ -34,6 +44,31 @@ logger = logging.getLogger(__name__)
 
 class HighQualityLowMemoryRecognizer(BaseRecognizer):
     """Local recall-first workflow replacing full-document 4B LLM extraction."""
+
+    ORG_ALIAS_BUSINESS_SUFFIX_TERMS = (
+        "科技",
+        "技术",
+        "建设",
+        "工程",
+        "建筑",
+        "贸易",
+        "商贸",
+        "实业",
+        "投资",
+        "管理",
+        "咨询",
+        "服务",
+        "文化",
+        "传媒",
+        "信息",
+        "网络",
+        "电子",
+        "材料",
+        "能源",
+        "地产",
+        "置业",
+        "发展",
+    )
 
     REVIEW_REJECTION_PROTECTED_TYPES = {
         "CN_ID_CARD",
@@ -135,6 +170,9 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
 
         self.last_run_artifacts = {}
         self.last_coverage_first_metadata: Dict[str, object] = {}
+        source_structure = kwargs.get("source_structure") if isinstance(kwargs.get("source_structure"), dict) else None
+        recognition_view_metadata = self._build_recognition_view_metadata(text)
+        docx_unit_metadata = self._build_docx_unit_diagnostic_metadata(text, source_structure)
         seed_results = self._normalize_existing_results(kwargs.get("existing_results"))
         results: list[RecognizerResult] = []
         results.extend(self._canonicalize_default_results(seed_results))
@@ -147,15 +185,26 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
             "primary_uie": 0,
             "primary_ner": 0,
             "secondary_ner": 0,
+            **recognition_view_metadata,
+            **docx_unit_metadata,
             "rule_first_input_candidates": 0,
             "rule_first_format_candidates": 0,
             "rule_first_type_rule_candidates": 0,
             "rule_first_rejected_candidates": 0,
+            "rule_first_rejected_review_only_candidates": 0,
             "rule_first_boundary_repairs": 0,
             "rule_first_output_candidates": 0,
             "pre_review_merged": 0,
             "risk_snippets": 0,
             "review_snippets_selected": 0,
+            "missing_candidate_review_snippets": 0,
+            "missing_candidate_review_snippets_selected": 0,
+            "qwen_discovery_snippets": 0,
+            "qwen_discovery_snippets_selected": 0,
+            "qwen_discovery_raw_candidates": 0,
+            "qwen_discovery_materialized_entities": 0,
+            "qwen_discovery_rejected_by_gate": 0,
+            "qwen_discovery_span_miss": 0,
             "qwen_raw_candidates": 0,
             "qwen_review": 0,
             "qwen_new_after_merge": 0,
@@ -171,7 +220,6 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
 
         quality_flags: list[str] = []
         requires_manual_review = False
-        source_structure = kwargs.get("source_structure") if isinstance(kwargs.get("source_structure"), dict) else None
         coverage_priority_unit_ids: set[str] = set()
 
         if settings.STRUCTURED_BACKFILL:
@@ -216,6 +264,7 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
         if settings.ENABLE_PRIMARY_UIE:
             try:
                 uie_results = self.uie_service.extract(text)
+                stage_counts.update(self._safe_int_metadata(self.uie_service.last_extract_metadata))
                 stage_counts["primary_uie"] = len(uie_results)
                 results.extend(self._canonicalize_default_results(uie_results))
                 docx_uie_results = self._extract_docx_unit_model_results(
@@ -225,6 +274,7 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
                     source_name="docx_structure_uie",
                     priority_unit_ids=coverage_priority_unit_ids,
                 )
+                stage_counts.update(self._consume_docx_unit_model_metadata("docx_structure_uie"))
                 stage_counts["docx_structure_uie"] = len(docx_uie_results)
                 if docx_uie_results:
                     quality_flags.append("docx_structure_uie_applied")
@@ -240,6 +290,7 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
         if settings.ENABLE_PRIMARY_NER:
             try:
                 ner_results = self.ner_service.extract(text)
+                stage_counts.update(self._safe_int_metadata(self.ner_service.last_extract_metadata))
                 stage_counts["primary_ner"] = len(ner_results)
                 results.extend(self._canonicalize_default_results(ner_results))
                 docx_ner_results = self._extract_docx_unit_model_results(
@@ -249,6 +300,7 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
                     source_name="docx_structure_ner",
                     priority_unit_ids=coverage_priority_unit_ids,
                 )
+                stage_counts.update(self._consume_docx_unit_model_metadata("docx_structure_ner"))
                 stage_counts["docx_structure_ner"] = len(docx_ner_results)
                 if docx_ner_results:
                     quality_flags.append("docx_structure_ner_applied")
@@ -264,6 +316,7 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
         if settings.ENABLE_SECONDARY_NER:
             try:
                 secondary_ner_results = self.secondary_ner_service.extract(text)
+                stage_counts.update(self._safe_int_metadata(self.secondary_ner_service.last_extract_metadata))
                 stage_counts["secondary_ner"] = len(secondary_ner_results)
                 results.extend(self._canonicalize_default_results(secondary_ner_results))
             except Exception as exc:
@@ -295,11 +348,29 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
         stage_counts["rule_first_rejected_candidates"] = int(
             self.last_rule_first_metadata.get("rule_first_rejected_candidate_count") or 0
         )
+        stage_counts["rule_first_rejected_review_only_candidates"] = int(
+            self.last_rule_first_metadata.get("rule_first_rejected_review_only_candidate_count") or 0
+        )
         stage_counts["rule_first_boundary_repairs"] = int(
             self.last_rule_first_metadata.get("rule_first_boundary_repair_count") or 0
         )
         stage_counts["rule_first_output_candidates"] = int(
             self.last_rule_first_metadata.get("rule_first_output_candidate_count") or 0
+        )
+        stage_counts["candidate_ledger_entries"] = int(
+            self.last_rule_first_metadata.get("candidate_ledger_entry_count") or 0
+        )
+        stage_counts["candidate_ledger_accepted"] = int(
+            self.last_rule_first_metadata.get("candidate_ledger_accepted") or 0
+        )
+        stage_counts["candidate_ledger_review_only"] = int(
+            self.last_rule_first_metadata.get("candidate_ledger_review_only") or 0
+        )
+        stage_counts["candidate_ledger_rejected"] = int(
+            self.last_rule_first_metadata.get("candidate_ledger_rejected") or 0
+        )
+        stage_counts["candidate_ledger_lost_before_subject_ledger"] = int(
+            self.last_rule_first_metadata.get("candidate_ledger_lost_before_subject_ledger") or 0
         )
         subject_ledger_summary = dict(
             self.last_rule_first_metadata.get("rule_first_subject_ledger_summary") or {}
@@ -362,13 +433,30 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
         pre_review_merged = list(merged)
         self.last_run_artifacts["pre_review_merged"] = [item.to_dict() for item in pre_review_merged]
         stage_counts["pre_review_merged"] = len(pre_review_merged)
+        alias_backscan_candidates = self._build_alias_backscan_review_candidates(text, pre_review_merged)
+        self.last_run_artifacts["alias_backscan_review_candidates"] = [
+            item.to_dict() for item in alias_backscan_candidates
+        ]
+        stage_counts["alias_backscan_review_candidates"] = len(alias_backscan_candidates)
+        review_only_candidates = [
+            *rule_first_result.rejected_results,
+            *alias_backscan_candidates,
+        ]
         snippets = self.snippet_scheduler.build_snippets(
             text,
             pre_review_merged,
             source_structure=source_structure,
+            rejected_entities=review_only_candidates,
             max_snippets=self._ordinary_review_budget(),
         )
+        stage_counts.update(self._safe_int_metadata(getattr(self.snippet_scheduler, "last_metadata", {})))
         stage_counts["risk_snippets"] = len(snippets)
+        stage_counts["missing_candidate_review_snippets"] = sum(
+            1 for snippet in snippets if snippet.snippet_type == "missing_candidate_review"
+        )
+        stage_counts["qwen_discovery_snippets"] = sum(
+            1 for snippet in snippets if str(snippet.snippet_type or "") == "qwen_coverage_discovery"
+        )
         stage_counts["docx_structure_snippets"] = sum(
             1 for snippet in snippets if snippet.risk_reason.startswith("docx_structure:")
         )
@@ -377,6 +465,12 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
         )
         review_snippets = self._select_review_snippets_requiring_semantic_recovery(snippets, pre_review_merged)
         stage_counts["review_snippets_selected"] = len(review_snippets)
+        stage_counts["missing_candidate_review_snippets_selected"] = sum(
+            1 for snippet in review_snippets if str(snippet.snippet_type or "") == "missing_candidate_review"
+        )
+        stage_counts["qwen_discovery_snippets_selected"] = sum(
+            1 for snippet in review_snippets if str(snippet.snippet_type or "") == "qwen_coverage_discovery"
+        )
         stage_counts["docx_structure_snippets_selected"] = sum(
             1 for snippet in review_snippets if str(snippet.risk_reason or "").startswith("docx_structure:")
         )
@@ -470,10 +564,18 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
         else:
             review_skipped_reason = "review_disabled"
 
+        post_review_merge_input_count = len(results)
         merged = self.merge_service.merge(results)
+        stage_counts["post_review_merge_input_count"] = post_review_merge_input_count
         stage_counts["qwen_raw_candidates"] = int(qwen_contribution["qwen_raw_candidates"])
         stage_counts["qwen_review"] = len(review_result.entities) if review_result else 0
         stage_counts["qwen_new_after_merge"] = int(qwen_contribution["qwen_new_entities_after_merge"])
+        stage_counts["qwen_discovery_new_after_merge"] = int(
+            qwen_contribution.get("qwen_discovery_new_entities_after_merge") or 0
+        )
+        stage_counts["qwen_discovery_confirmed_overlaps"] = int(
+            qwen_contribution.get("qwen_discovery_confirmed_overlaps") or 0
+        )
         stage_counts["qwen_rejected"] = int(qwen_contribution.get("qwen_rejected_entities") or 0)
         stage_counts["ledger_conflict_decisions"] = int(
             (review_result.metadata or {}).get("ledger_conflict_decision_count") or 0
@@ -493,6 +595,26 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
             )
             stage_counts["review_scheduled_standard_snippets"] = int(
                 review_metadata.get("review_scheduled_standard_snippet_count") or 0
+            )
+            stage_counts["review_scheduled_missing_candidate_snippets"] = int(
+                review_metadata.get("review_scheduled_missing_candidate_snippet_count") or 0
+            )
+            stage_counts["qwen_discovery_snippets_selected"] = int(
+                review_metadata.get("qwen_discovery_snippet_selected_count")
+                or stage_counts.get("qwen_discovery_snippets_selected")
+                or 0
+            )
+            stage_counts["qwen_discovery_raw_candidates"] = int(
+                review_metadata.get("qwen_discovery_raw_candidate_count") or 0
+            )
+            stage_counts["qwen_discovery_materialized_entities"] = int(
+                review_metadata.get("qwen_discovery_materialized_entity_count") or 0
+            )
+            stage_counts["qwen_discovery_rejected_by_gate"] = int(
+                review_metadata.get("qwen_discovery_rejected_by_gate_count") or 0
+            )
+            stage_counts["qwen_discovery_span_miss"] = int(
+                review_metadata.get("qwen_discovery_span_miss_count") or 0
             )
             stage_counts["review_deterministic_rejections"] = int(
                 review_metadata.get("review_deterministic_rejection_count") or 0
@@ -548,8 +670,39 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
             requires_manual_review = True
             quality_flags.append("quality_anomaly_detected")
 
+        stage_counts.update(
+            self._qwen_discovery_projection_stage_counts(
+                merged,
+                prefix="qwen_discovery_projection_input",
+            )
+        )
+        stage_counts["projection_input_count"] = len(merged)
         final_results = self._project_default_public_results(merged)
+        stage_counts.update(
+            self._qwen_discovery_projection_stage_counts(
+                final_results,
+                prefix="qwen_discovery_projection_output",
+            )
+        )
+        stage_counts["projection_output_count"] = len(final_results)
         final_results = self._filter_entities(final_results, entities)
+        stage_counts.update(
+            self._qwen_discovery_projection_stage_counts(
+                final_results,
+                prefix="qwen_discovery_filter_output",
+            )
+        )
+        stage_counts["qwen_discovery_lost_before_projection"] = max(
+            0,
+            int(stage_counts.get("qwen_discovery_projection_input_count") or 0)
+            - int(stage_counts.get("qwen_discovery_projection_output_count") or 0),
+        )
+        stage_counts["qwen_discovery_lost_before_filter"] = max(
+            0,
+            int(stage_counts.get("qwen_discovery_projection_output_count") or 0)
+            - int(stage_counts.get("qwen_discovery_filter_output_count") or 0),
+        )
+        stage_counts["filter_output_count"] = len(final_results)
         stage_counts["final"] = len(final_results)
         logger.info(
             "High-quality low-memory recognition finished: stage_counts=%s, review_used=%s, review_error=%s",
@@ -573,6 +726,87 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
         return final_results
 
     @staticmethod
+    def _build_recognition_view_metadata(text: str) -> dict[str, int]:
+        recognition_view = build_recognition_view(text or "")
+        return {
+            "recognition_view_original_length": len(recognition_view.original_text),
+            "recognition_view_sanitized_length": len(recognition_view.sanitized_text),
+            "recognition_view_removed_inline_space_count": recognition_view.removed_inline_space_count,
+            "recognition_view_index_map_length": len(recognition_view.sanitized_to_original),
+            "recognition_view_original_to_sanitized_length": len(recognition_view.original_to_sanitized),
+            "recognition_view_span_remap_fail_count": recognition_view.span_remap_fail_count,
+        }
+
+    def _build_docx_unit_diagnostic_metadata(
+        self,
+        text: str,
+        source_structure: dict[str, object] | None,
+    ) -> dict[str, int | dict[str, int]]:
+        if not isinstance(source_structure, dict):
+            return {
+                "docx_unit_count": 0,
+                "docx_unit_raw_count": 0,
+                "docx_unit_page_view_count": 0,
+                "docx_unit_page_duplicate_raw_id_count": 0,
+                "docx_unit_page_unique_extra_count": 0,
+                "docx_unit_raw_duplicate_id_count": 0,
+                "docx_unit_raw_duplicate_key_count": 0,
+                "docx_unit_count_by_container": {},
+                "docx_unit_span_exact_count": 0,
+                "docx_unit_span_mapped_count": 0,
+                "docx_unit_span_mismatch_count": 0,
+                "docx_unit_span_missing_count": 0,
+                "docx_unit_span_duplicate_text_count": 0,
+                "docx_unit_span_unresolved_count": 0,
+            }
+        inventory = docx_structure_unit_inventory(source_structure)
+        units = resolve_docx_unit_spans(text or "", self._iter_docx_units(source_structure))
+        container_counts: dict[str, int] = {}
+        exact_count = 0
+        mapped_count = 0
+        mismatch_count = 0
+        missing_count = 0
+        duplicate_text_count = 0
+        unresolved_count = 0
+        for unit in units:
+            unit_text = str(unit.get("text") or "")
+            container = str(unit.get("container_type") or unit.get("unit_type") or "unknown")
+            container_counts[container] = container_counts.get(container, 0) + 1
+            if not unit_text:
+                missing_count += 1
+                unresolved_count += 1
+                continue
+            resolution = str(unit.get("_span_resolution") or "")
+            if resolution == "exact":
+                exact_count += 1
+                mapped_count += 1
+            elif resolution in {"ordered_forward", "sanitized_ordered_forward"}:
+                mismatch_count += 1
+                mapped_count += 1
+            else:
+                mismatch_count += 1
+                unresolved_count += 1
+            first = (text or "").find(unit_text)
+            if first >= 0 and (text or "").find(unit_text, first + 1) >= 0:
+                duplicate_text_count += 1
+        return {
+            "docx_unit_count": len(units),
+            "docx_unit_raw_count": int(inventory.get("raw_docx_text_unit_count") or 0),
+            "docx_unit_page_view_count": int(inventory.get("page_docx_unit_count") or 0),
+            "docx_unit_page_duplicate_raw_id_count": int(inventory.get("page_docx_unit_duplicate_raw_id_count") or 0),
+            "docx_unit_page_unique_extra_count": int(inventory.get("page_docx_unit_unique_extra_count") or 0),
+            "docx_unit_raw_duplicate_id_count": int(inventory.get("raw_docx_text_unit_duplicate_id_count") or 0),
+            "docx_unit_raw_duplicate_key_count": int(inventory.get("raw_docx_text_unit_duplicate_key_count") or 0),
+            "docx_unit_count_by_container": dict(sorted(container_counts.items())),
+            "docx_unit_span_exact_count": exact_count,
+            "docx_unit_span_mapped_count": mapped_count,
+            "docx_unit_span_mismatch_count": mismatch_count,
+            "docx_unit_span_missing_count": missing_count,
+            "docx_unit_span_duplicate_text_count": duplicate_text_count,
+            "docx_unit_span_unresolved_count": unresolved_count,
+        }
+
+    @staticmethod
     def _canonicalize_default_results(results: List[RecognizerResult]) -> List[RecognizerResult]:
         canonicalized: list[RecognizerResult] = []
         for result in results or []:
@@ -580,6 +814,198 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
             if updated is not None:
                 canonicalized.append(updated)
         return canonicalized
+
+    @staticmethod
+    def _safe_int_metadata(metadata: dict[str, object] | None) -> dict[str, int]:
+        safe: dict[str, int] = {}
+        if not isinstance(metadata, dict):
+            return safe
+        for key, value in metadata.items():
+            if not isinstance(key, str):
+                continue
+            if isinstance(value, bool):
+                safe[key] = int(value)
+                continue
+            if isinstance(value, int):
+                safe[key] = value
+        return safe
+
+    def _consume_docx_unit_model_metadata(self, source_name: str) -> dict[str, int]:
+        metadata = getattr(self, "_last_docx_unit_model_metadata", None)
+        if not isinstance(metadata, dict):
+            return {}
+        source_metadata = metadata.pop(source_name, None)
+        if not isinstance(source_metadata, dict):
+            return {}
+        return self._safe_int_metadata(source_metadata)
+
+    @classmethod
+    def _build_alias_backscan_review_candidates(
+        cls,
+        text: str,
+        confirmed_results: List[RecognizerResult],
+    ) -> List[RecognizerResult]:
+        if not text or not confirmed_results:
+            return []
+        occupied = {
+            (int(result.start), int(result.end), str(result.entity_type or "").upper())
+            for result in confirmed_results
+        }
+        candidates: list[RecognizerResult] = []
+        seen: set[tuple[str, int, int, str]] = set()
+        for source in confirmed_results:
+            public_type = projected_default_subject_type(source)
+            if public_type not in {"ORGANIZATION", "GOVERNMENT"}:
+                continue
+            source_text = str(source.text or "")
+            for alias in cls._alias_backscan_surfaces_for_source(source):
+                for start, end, matched_text in iter_exact_matches(text, alias):
+                    if (start, end, public_type) in occupied:
+                        continue
+                    if source.start <= start and end <= source.end:
+                        continue
+                    if not cls._alias_backscan_context_supports_candidate(text, start, end):
+                        continue
+                    key = (public_type, start, end, matched_text)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    source_metadata = dict(source.metadata or {})
+                    metadata = {
+                        "source_layer": "structure",
+                        "trigger": "alias_backscan_review",
+                        "recognition_channel": "alias_backscan",
+                        "rule_first_rejected": True,
+                        "rule_first_reject_stage": "alias_backscan_review",
+                        "rule_first_reject_reasons": ["alias_backscan_review_only"],
+                        "rule_first_positive_signals": ["confirmed_subject_alias_surface"],
+                        "rule_first_negative_signals": [],
+                        "rule_first_action": "review",
+                        "rule_first_risk_level": "medium",
+                        "rule_first_candidate_id": f"alias_backscan:{public_type}:{start}:{end}",
+                        "rule_first_source": "alias_backscan_review",
+                        "rule_first_source_layer": "structure",
+                        "rule_first_entity_type": public_type,
+                        "rule_first_recognition_channel": "alias_backscan",
+                        "rule_first_review_only_candidate": True,
+                        "rule_first_review_only_reasons": ["alias_backscan_confirmed_subject_surface"],
+                        "rule_first_trigger": "alias_backscan_review",
+                        "missing_candidate_review": True,
+                        "review_only_rejected_candidate": True,
+                        "alias_backscan_source_text": source_text,
+                        "alias_backscan_surface": alias,
+                        "alias_backscan_source_subject_id": source_metadata.get("subject_ledger_subject_id"),
+                        "alias_backscan_source_canonical_text": source_metadata.get("subject_ledger_canonical_text")
+                        or source_metadata.get("canonical_subject_text")
+                        or source_text,
+                        "alias_backscan_source_canonical_key": source_metadata.get("subject_ledger_canonical_key")
+                        or source_metadata.get("canonical_key"),
+                        "normalized_text": normalize_entity_text(matched_text),
+                        "identity_surface": normalize_entity_text(matched_text),
+                        "short_org_candidate": public_type == "ORGANIZATION",
+                        "requires_manual_review": True,
+                    }
+                    if public_type == "GOVERNMENT":
+                        metadata["official_institution"] = True
+                        metadata["official_institution_family"] = (
+                            source_metadata.get("official_institution_family") or "government"
+                        )
+                    candidates.append(
+                        RecognizerResult(
+                            entity_type=public_type,
+                            start=start,
+                            end=end,
+                            score=0.78,
+                            text=matched_text,
+                            source="alias_backscan_review",
+                            metadata=metadata,
+                        )
+                    )
+        return candidates
+
+    @classmethod
+    def _alias_backscan_surfaces_for_source(cls, source: RecognizerResult) -> list[str]:
+        surfaces: set[str] = set()
+        metadata = dict(source.metadata or {})
+        for key in (
+            "definition_alias",
+            "alias_surface",
+        ):
+            value = normalize_entity_text(str(metadata.get(key) or ""))
+            if cls._alias_backscan_surface_is_usable(value):
+                surfaces.add(value)
+        for surface in metadata.get("subject_surfaces") or []:
+            value = normalize_entity_text(str(surface or ""))
+            if cls._alias_backscan_surface_is_usable(value):
+                surfaces.add(value)
+        public_type = projected_default_subject_type(source)
+        if public_type == "ORGANIZATION":
+            core = cls._organization_alias_core(source.text)
+            if cls._alias_backscan_surface_is_usable(core):
+                surfaces.add(core)
+            brand_core = cls._organization_alias_brand_core(core)
+            if cls._alias_backscan_surface_is_usable(brand_core):
+                surfaces.add(brand_core)
+        return sorted(surfaces, key=lambda item: (-len(item), item))[:4]
+
+    @staticmethod
+    def _organization_alias_core(value: str) -> str:
+        normalized = normalize_entity_text(value)
+        if not normalized:
+            return ""
+        for suffix in sorted(ORG_SUFFIX_TERMS, key=len, reverse=True):
+            if normalized.endswith(suffix) and len(normalized) - len(suffix) >= 2:
+                normalized = normalized[: -len(suffix)]
+                break
+        normalized = re.sub(
+            r"^(?:中国|中华人民共和国|全国|中央|北京市|上海市|天津市|重庆市|"
+            r"北京|上海|天津|重庆|河北|山西|辽宁|吉林|黑龙江|江苏|浙江|安徽|福建|江西|山东|"
+            r"河南|湖北|湖南|广东|海南|四川|贵州|云南|陕西|甘肃|青海|台湾|内蒙古|广西|西藏|宁夏|新疆)",
+            "",
+            normalized,
+        )
+        return normalized
+
+    @classmethod
+    def _organization_alias_brand_core(cls, value: str) -> str:
+        core = normalize_entity_text(value)
+        if len(core) < 3:
+            return core
+        for token in cls.ORG_ALIAS_BUSINESS_SUFFIX_TERMS:
+            if core.endswith(token) and len(core) - len(token) >= 2:
+                return core[: -len(token)]
+        return core
+
+    @staticmethod
+    def _alias_backscan_surface_is_usable(value: str) -> bool:
+        normalized = normalize_entity_text(value)
+        if not 2 <= len(normalized) <= 8:
+            return False
+        if not re.fullmatch(r"[\u4e00-\u9fa5A-Za-z0-9]{2,8}", normalized):
+            return False
+        if normalized in NON_ENTITY_ROLE_TERMS:
+            return False
+        if re.fullmatch(r"\d+", normalized):
+            return False
+        if not looks_like_organization_short_name(normalized) and len(normalized) < 4:
+            return True
+        if not looks_like_organization_short_name(normalized):
+            return False
+        return True
+
+    @staticmethod
+    def _alias_backscan_context_supports_candidate(text: str, start: int, end: int) -> bool:
+        left = normalize_entity_text(text[max(0, start - 8) : start])
+        right = normalize_entity_text(text[end : min(len(text), end + 12)])
+        if not left and not right:
+            return False
+        if any(token in right for token in ("履约", "履行", "结算", "付款", "收款", "交付", "供货", "施工", "对账", "盖章", "落款", "签署", "签订", "负责", "承担")):
+            return True
+        if any(token in left for token in ("由", "向", "对", "与", "和", "及", "通过", "经由", "根据", "依据", "甲方", "乙方", "丙方")):
+            return True
+        if any(token in right for token in ("公司", "集团", "单位", "主体", "账户", "材料", "资料", "文件", "信息")):
+            return False
+        return False
 
     @staticmethod
     def _project_default_public_results(results: List[RecognizerResult]) -> List[RecognizerResult]:
@@ -609,6 +1035,26 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
         projected.sort(key=lambda item: (item.start, item.end, item.entity_type))
         return projected
 
+    @staticmethod
+    def _qwen_discovery_projection_stage_counts(
+        results: List[RecognizerResult],
+        *,
+        prefix: str,
+    ) -> dict[str, int]:
+        discovery = [
+            result
+            for result in results or []
+            if bool((result.metadata or {}).get("qwen_coverage_discovery"))
+        ]
+        return {
+            f"{prefix}_count": len(discovery),
+            f"{prefix}_subject_count": sum(
+                1
+                for result in discovery
+                if projected_default_subject_type(result) in DEFAULT_SUBJECT_TYPES
+            ),
+        }
+
     def _extract_docx_unit_model_results(
         self,
         *,
@@ -618,24 +1064,43 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
         source_name: str,
         priority_unit_ids: set[str] | None = None,
     ) -> List[RecognizerResult]:
+        if not hasattr(self, "_last_docx_unit_model_metadata"):
+            self._last_docx_unit_model_metadata = {}
         units = self._select_docx_units_for_local_model_pass(
+            text,
             source_structure,
             priority_unit_ids=priority_unit_ids,
+            source_name=source_name,
         )
+        diagnostic_metadata = dict(getattr(self, "_last_docx_unit_model_metadata", {}).get(source_name) or {})
         if not text or not units:
+            diagnostic_metadata[f"{source_name}_model_result_count"] = 0
+            diagnostic_metadata[f"{source_name}_result_count"] = 0
+            self._last_docx_unit_model_metadata[source_name] = diagnostic_metadata
             return []
         results: list[RecognizerResult] = []
         for unit in units:
             unit_text = str(unit.get("text") or "")
-            start = self._coerce_int(unit.get("start"), -1)
-            end = self._coerce_int(unit.get("end"), -1)
+            start, end = self._resolve_docx_unit_span_for_model(text, unit)
             if start < 0 or end <= start or text[start:end] != unit_text:
+                diagnostic_metadata[f"{source_name}_span_mismatch_skip_count"] = (
+                    int(diagnostic_metadata.get(f"{source_name}_span_mismatch_skip_count") or 0) + 1
+                )
                 continue
             try:
                 local_results = extractor.extract(unit_text)
             except Exception as exc:
                 logger.warning("%s DOCX unit extraction failed: %s", source_name, exc)
+                diagnostic_metadata[f"{source_name}_extract_error_count"] = (
+                    int(diagnostic_metadata.get(f"{source_name}_extract_error_count") or 0) + 1
+                )
                 continue
+            diagnostic_metadata[f"{source_name}_local_extract_call_count"] = (
+                int(diagnostic_metadata.get(f"{source_name}_local_extract_call_count") or 0) + 1
+            )
+            diagnostic_metadata[f"{source_name}_local_result_count"] = (
+                int(diagnostic_metadata.get(f"{source_name}_local_result_count") or 0) + len(local_results)
+            )
             for local in local_results:
                 global_start = start + int(local.start)
                 global_end = start + int(local.end)
@@ -643,8 +1108,8 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
                     continue
                 if text[global_start:global_end] != local.text:
                     continue
-                metadata = dict(local.metadata or {})
-                metadata.update(self._docx_unit_model_metadata(unit, source_name, local.source))
+                entity_metadata = dict(local.metadata or {})
+                entity_metadata.update(self._docx_unit_model_metadata(unit, source_name, local.source))
                 results.append(
                     RecognizerResult(
                         entity_type=local.entity_type,
@@ -653,10 +1118,14 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
                         score=float(local.score or 0.0),
                         text=text[global_start:global_end],
                         source=source_name,
-                        metadata=metadata,
+                        metadata=entity_metadata,
                     )
                 )
-        return self.merge_service.merge(results)
+        merged = self.merge_service.merge(results)
+        diagnostic_metadata[f"{source_name}_model_result_count"] = len(results)
+        diagnostic_metadata[f"{source_name}_result_count"] = len(merged)
+        self._last_docx_unit_model_metadata[source_name] = diagnostic_metadata
+        return merged
 
     def _apply_resolved_subject_ledger_metadata(self, ledger_decisions: List[dict]) -> None:
         if not ledger_decisions:
@@ -672,47 +1141,122 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
 
     def _select_docx_units_for_local_model_pass(
         self,
+        text: str,
         source_structure: dict[str, object] | None,
         *,
         priority_unit_ids: set[str] | None = None,
+        source_name: str = "docx_structure_model",
     ) -> list[dict[str, object]]:
         if not isinstance(source_structure, dict):
+            if not hasattr(self, "_last_docx_unit_model_metadata"):
+                self._last_docx_unit_model_metadata = {}
+            self._last_docx_unit_model_metadata[source_name] = {
+                f"{source_name}_unit_total_count": 0,
+                f"{source_name}_unit_selected_count": 0,
+            }
             return []
         candidates: list[tuple[int, int, dict[str, object]]] = []
         seen: set[str] = set()
         priority_unit_ids = {str(unit_id or "").strip() for unit_id in (priority_unit_ids or set()) if str(unit_id or "").strip()}
-        for order, unit in enumerate(self._iter_docx_units(source_structure)):
+        inventory = docx_structure_unit_inventory(source_structure)
+        units = resolve_docx_unit_spans(text or "", self._iter_docx_units(source_structure))
+        supported_containers = {
+            "paragraph",
+            "table_cell",
+            "textbox",
+            "header",
+            "footer",
+            "footnote",
+            "endnote",
+            "comment",
+            "chart",
+            "diagram",
+            "glossary",
+            "xml_text",
+        }
+        metadata: dict[str, int] = {
+            f"{source_name}_unit_total_count": len(units),
+            f"{source_name}_unit_raw_count": int(inventory.get("raw_docx_text_unit_count") or 0),
+            f"{source_name}_unit_page_view_count": int(inventory.get("page_docx_unit_count") or 0),
+            f"{source_name}_unit_page_duplicate_raw_id_count": int(
+                inventory.get("page_docx_unit_duplicate_raw_id_count") or 0
+            ),
+            f"{source_name}_unit_page_unique_extra_count": int(
+                inventory.get("page_docx_unit_unique_extra_count") or 0
+            ),
+            f"{source_name}_unit_raw_duplicate_id_count": int(
+                inventory.get("raw_docx_text_unit_duplicate_id_count") or 0
+            ),
+            f"{source_name}_unit_raw_duplicate_key_count": int(
+                inventory.get("raw_docx_text_unit_duplicate_key_count") or 0
+            ),
+            f"{source_name}_unit_selected_count": 0,
+            f"{source_name}_unit_priority_selected_count": 0,
+            f"{source_name}_unit_cap_excluded_count": 0,
+            f"{source_name}_unit_skip_empty_count": 0,
+            f"{source_name}_unit_skip_too_short_count": 0,
+            f"{source_name}_unit_long_selected_count": 0,
+            f"{source_name}_unit_skip_unsupported_container_count": 0,
+            f"{source_name}_unit_skip_unresolved_span_count": 0,
+            f"{source_name}_unit_skip_duplicate_count": 0,
+        }
+        for order, unit in enumerate(units):
             unit_text = str(unit.get("text") or "")
             compact = "".join(unit_text.split())
-            if not 2 <= len(compact) <= 1000:
+            if not compact:
+                metadata[f"{source_name}_unit_skip_empty_count"] += 1
+                continue
+            if len(compact) < 2:
+                metadata[f"{source_name}_unit_skip_too_short_count"] += 1
                 continue
             container_type = str(unit.get("container_type") or unit.get("unit_type") or "")
             unit_id = str(unit.get("unit_id") or "")
             priority_selected = bool(unit_id and unit_id in priority_unit_ids)
-            if container_type not in {
-                "table_cell",
-                "textbox",
-                "header",
-                "footer",
-                "footnote",
-                "endnote",
-                "comment",
-                "chart",
-                "diagram",
-                "glossary",
-                "xml_text",
-            }:
+            if container_type not in supported_containers:
+                metadata[f"{source_name}_unit_skip_unsupported_container_count"] += 1
                 continue
-            if not priority_selected and not self._docx_unit_has_sensitive_or_entity_cue(unit_text, container_type):
+            unit_start, unit_end = self._resolve_docx_unit_span_for_model(text, unit)
+            if unit_start < 0 or unit_end <= unit_start:
+                metadata[f"{source_name}_unit_skip_unresolved_span_count"] += 1
                 continue
-            key = unit_id or f"{unit.get('start')}:{unit.get('end')}:{unit_text[:40]}"
+            key = f"{container_type}:{unit_start}:{unit_end}:{unit_text[:40]}"
+            if unit_id:
+                key = f"{unit_id}:{key}"
             if key in seen:
+                metadata[f"{source_name}_unit_skip_duplicate_count"] += 1
                 continue
             seen.add(key)
             priority = self._docx_unit_model_pass_priority(unit, unit_text, priority_selected)
+            if len(compact) > 1000:
+                metadata[f"{source_name}_unit_long_selected_count"] += 1
             candidates.append((priority, order, dict(unit)))
         candidates.sort(key=lambda item: (-item[0], item[1]))
-        return [unit for _priority, _order, unit in candidates[:80]]
+        max_units = max(1, int(getattr(settings, "DOCX_UNIT_MODEL_PASS_MAX_UNITS", 320) or 320))
+        selected = [unit for _priority, _order, unit in candidates[:max_units]]
+        metadata[f"{source_name}_unit_selected_count"] = len(selected)
+        metadata[f"{source_name}_unit_priority_selected_count"] = sum(
+            1
+            for unit in selected
+            if str(unit.get("unit_id") or "").strip() in priority_unit_ids
+        )
+        metadata[f"{source_name}_unit_cap_excluded_count"] = max(0, len(candidates) - len(selected))
+        if not hasattr(self, "_last_docx_unit_model_metadata"):
+            self._last_docx_unit_model_metadata = {}
+        self._last_docx_unit_model_metadata[source_name] = metadata
+        return selected
+
+    @classmethod
+    def _resolve_docx_unit_span_for_model(cls, text: str, unit: dict[str, object]) -> tuple[int, int]:
+        start = cls._coerce_int(unit.get("_resolved_start"), -1)
+        end = cls._coerce_int(unit.get("_resolved_end"), -1)
+        unit_text = str(unit.get("text") or "")
+        if start >= 0 and end > start and (text or "")[start:end] == unit_text:
+            return start, end
+        start = cls._coerce_int(unit.get("start"), -1)
+        end = cls._coerce_int(unit.get("end"), -1)
+        if start >= 0 and end > start and (text or "")[start:end] == unit_text:
+            return start, end
+        return -1, -1
 
     @staticmethod
     def _docx_unit_model_pass_priority(unit: dict[str, object], unit_text: str, priority_selected: bool) -> int:
@@ -796,19 +1340,7 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
         return False
 
     def _iter_docx_units(self, source_structure: dict[str, object]):
-        raw_units = source_structure.get("docx_text_units")
-        if isinstance(raw_units, list):
-            for unit in raw_units:
-                if isinstance(unit, dict):
-                    yield unit
-        pages = source_structure.get("pages")
-        if isinstance(pages, list):
-            for page in pages:
-                if not isinstance(page, dict) or not isinstance(page.get("units"), list):
-                    continue
-                for unit in page["units"]:
-                    if isinstance(unit, dict):
-                        yield unit
+        yield from iter_docx_structure_units(source_structure)
 
     def _docx_unit_model_metadata(
         self,
@@ -884,6 +1416,9 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
         scheduled_ledger_count = int(
             (review_result.metadata or {}).get("review_scheduled_ledger_snippet_count") or 0
         ) if review_result else int(stage_counts.get("review_scheduled_ledger_snippets") or 0)
+        scheduled_missing_candidate_count = int(
+            (review_result.metadata or {}).get("review_scheduled_missing_candidate_snippet_count") or 0
+        ) if review_result else int(stage_counts.get("review_scheduled_missing_candidate_snippets") or 0)
         ledger_completion = self._ledger_adjudication_completion(
             review_enabled=bool(settings.ENABLE_QWEN_REVIEW),
             review_result=review_result,
@@ -982,6 +1517,79 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
             "review_scheduled_standard_snippet_count": int(
                 (review_result.metadata or {}).get("review_scheduled_standard_snippet_count") or 0
             ) if review_result else 0,
+            "missing_candidate_review_snippet_count": int(
+                stage_counts.get("missing_candidate_review_snippets") or 0
+            ),
+            "missing_candidate_review_snippet_selected_count": int(
+                stage_counts.get("missing_candidate_review_snippets_selected") or 0
+            ),
+            "review_scheduled_missing_candidate_snippet_count": scheduled_missing_candidate_count,
+            "qwen_discovery_snippet_count": int(stage_counts.get("qwen_discovery_snippets") or 0),
+            "qwen_discovery_snippet_selected_count": int(stage_counts.get("qwen_discovery_snippets_selected") or 0),
+            "qwen_discovery_unit_count": int(stage_counts.get("qwen_discovery_snippets_selected") or 0),
+            "qwen_discovery_raw_candidate_count": int(stage_counts.get("qwen_discovery_raw_candidates") or 0),
+            "qwen_discovery_materialized_entity_count": int(
+                stage_counts.get("qwen_discovery_materialized_entities") or 0
+            ),
+            "qwen_discovery_new_entity_count": int(stage_counts.get("qwen_discovery_new_after_merge") or 0),
+            "qwen_discovery_confirmed_overlap_count": int(
+                stage_counts.get("qwen_discovery_confirmed_overlaps") or 0
+            ),
+            "qwen_discovery_projection_input_count": int(
+                stage_counts.get("qwen_discovery_projection_input_count") or 0
+            ),
+            "qwen_discovery_projection_input_subject_count": int(
+                stage_counts.get("qwen_discovery_projection_input_subject_count") or 0
+            ),
+            "qwen_discovery_projection_output_count": int(
+                stage_counts.get("qwen_discovery_projection_output_count") or 0
+            ),
+            "qwen_discovery_projection_output_subject_count": int(
+                stage_counts.get("qwen_discovery_projection_output_subject_count") or 0
+            ),
+            "qwen_discovery_filter_output_count": int(
+                stage_counts.get("qwen_discovery_filter_output_count") or 0
+            ),
+            "qwen_discovery_filter_output_subject_count": int(
+                stage_counts.get("qwen_discovery_filter_output_subject_count") or 0
+            ),
+            "qwen_discovery_lost_before_projection_count": int(
+                stage_counts.get("qwen_discovery_lost_before_projection") or 0
+            ),
+            "qwen_discovery_lost_before_filter_count": int(
+                stage_counts.get("qwen_discovery_lost_before_filter") or 0
+            ),
+            "qwen_discovery_rejected_by_gate_count": int(
+                stage_counts.get("qwen_discovery_rejected_by_gate") or 0
+            ),
+            "qwen_discovery_span_miss_count": int(stage_counts.get("qwen_discovery_span_miss") or 0),
+            "coverage_discovery_unit_total_count": int(
+                stage_counts.get("coverage_discovery_unit_total_count") or 0
+            ),
+            "coverage_discovery_signal_unit_count": int(
+                stage_counts.get("coverage_discovery_signal_unit_count") or 0
+            ),
+            "coverage_discovery_fully_covered_unit_count": int(
+                stage_counts.get("coverage_discovery_fully_covered_unit_count") or 0
+            ),
+            "coverage_discovery_partial_unit_count": int(
+                stage_counts.get("coverage_discovery_partial_unit_count") or 0
+            ),
+            "coverage_discovery_uncovered_signal_unit_count": int(
+                stage_counts.get("coverage_discovery_uncovered_signal_unit_count") or 0
+            ),
+            "coverage_discovery_snippet_raw_count": int(
+                stage_counts.get("coverage_discovery_snippet_raw_count") or 0
+            ),
+            "risk_snippet_coverage_discovery_raw_count": int(
+                stage_counts.get("risk_snippet_coverage_discovery_raw_count") or 0
+            ),
+            "risk_snippet_coverage_discovery_deduped_count": int(
+                stage_counts.get("risk_snippet_coverage_discovery_deduped_count") or 0
+            ),
+            "alias_backscan_review_candidate_count": int(
+                stage_counts.get("alias_backscan_review_candidates") or 0
+            ),
             "review_deterministic_rejection_count": int(
                 (review_result.metadata or {}).get("review_deterministic_rejection_count") or 0
             ) if review_result else 0,
@@ -1108,12 +1716,25 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
         existing_results: List[RecognizerResult],
     ) -> list:
         ledger_snippets = []
+        missing_candidate_snippets = []
+        discovery_snippets = []
         standard_required = []
         standard_fallback = []
         for index, snippet in enumerate(snippets):
             if self._is_ledger_review_snippet(snippet):
                 if self._snippet_requires_review(snippet, existing_results):
                     ledger_snippets.append(snippet)
+                continue
+            if str(getattr(snippet, "snippet_type", "") or "") == "missing_candidate_review":
+                if self._snippet_requires_review(snippet, existing_results):
+                    missing_candidate_snippets.append(snippet)
+                continue
+            if (
+                str(getattr(snippet, "snippet_type", "") or "") == "qwen_coverage_discovery"
+                or str(getattr(snippet, "risk_reason", "") or "").startswith("qwen_discovery:")
+            ):
+                if self._snippet_requires_review(snippet, existing_results):
+                    discovery_snippets.append(snippet)
                 continue
             if self._snippet_requires_review(snippet, existing_results):
                 standard_required.append((index, snippet))
@@ -1147,6 +1768,8 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
         remaining_budget = max(1, ordinary_budget - min(structure_limit, len(structure_required)))
         return [
             *ledger_snippets,
+            *missing_candidate_snippets,
+            *discovery_snippets,
             *structure_required[:structure_limit],
             *non_structure_required[:remaining_budget],
         ]
@@ -1167,6 +1790,8 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
             "conflict_block",
             "ocr_anomaly_block",
             "rule_first_review_block",
+            "missing_candidate_review",
+            "qwen_coverage_discovery",
             "docx_table_cell_block",
             "docx_textbox_block",
             "docx_header_block",
@@ -1233,9 +1858,10 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
             "docx_footnote_block",
             "docx_endnote_block",
             "narrative_hotspot",
+            "qwen_coverage_discovery",
         }:
             return True
-        return risk_reason.startswith(("rule_first:", "docx_structure:", "organization_action_cue"))
+        return risk_reason.startswith(("rule_first:", "docx_structure:", "qwen_discovery:", "organization_action_cue"))
 
     def _standard_review_priority(
         self,
@@ -1247,19 +1873,21 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
         risk_reason = str(getattr(snippet, "risk_reason", "") or "")
         if self._snippet_has_suspicious_candidate(snippet, existing_results):
             return (0, index)
-        if snippet_type == "rule_first_review_block":
+        if snippet_type in {"rule_first_review_block", "missing_candidate_review"}:
             return (1, index)
-        if snippet_type in {"conflict_block", "ocr_anomaly_block"}:
+        if snippet_type == "qwen_coverage_discovery" or risk_reason.startswith("qwen_discovery:"):
             return (2, index)
-        if risk_reason.startswith("docx_structure:"):
+        if snippet_type in {"conflict_block", "ocr_anomaly_block"}:
             return (3, index)
-        if snippet_type in {"header_party_block", "legal_party_block", "definition_block"}:
+        if risk_reason.startswith("docx_structure:"):
             return (4, index)
-        if snippet_type in {"address_block", "signature_block"}:
+        if snippet_type in {"header_party_block", "legal_party_block", "definition_block"}:
             return (5, index)
-        if snippet_type == "narrative_hotspot":
+        if snippet_type in {"address_block", "signature_block"}:
             return (6, index)
-        return (7, index)
+        if snippet_type == "narrative_hotspot":
+            return (7, index)
+        return (8, index)
 
     @staticmethod
     def _snippet_has_suspicious_candidate(snippet, existing_results: List[RecognizerResult]) -> bool:
@@ -1324,11 +1952,22 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
         materialized = len(review_entities)
         new_entities = 0
         confirmed_overlaps = 0
+        discovery_materialized = 0
+        discovery_new_entities = 0
+        discovery_confirmed_overlaps = 0
         for entity in review_entities:
-            if HighQualityLowMemoryRecognizer._covered_by_existing(entity, pre_review_results):
+            is_discovery = bool((entity.metadata or {}).get("qwen_coverage_discovery"))
+            if is_discovery:
+                discovery_materialized += 1
+            covered = HighQualityLowMemoryRecognizer._covered_by_existing(entity, pre_review_results)
+            if covered:
                 confirmed_overlaps += 1
+                if is_discovery:
+                    discovery_confirmed_overlaps += 1
             else:
                 new_entities += 1
+                if is_discovery:
+                    discovery_new_entities += 1
         if new_entities >= 3:
             value_level = "material"
         elif confirmed_overlaps >= 3:
@@ -1342,6 +1981,9 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
             "qwen_materialized_entities": materialized,
             "qwen_new_entities_after_merge": new_entities,
             "qwen_confirmed_overlaps": confirmed_overlaps,
+            "qwen_discovery_materialized_entities": discovery_materialized,
+            "qwen_discovery_new_entities_after_merge": discovery_new_entities,
+            "qwen_discovery_confirmed_overlaps": discovery_confirmed_overlaps,
             "qwen_discarded_entities": max(0, int(raw_candidate_count or 0) - materialized),
             "qwen_value_level": value_level,
             "qwen_rejected_entities": 0,

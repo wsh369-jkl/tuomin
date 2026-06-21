@@ -17,6 +17,7 @@ WORD_NAMESPACE = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 DRAWINGML_NAMESPACE = "http://schemas.openxmlformats.org/drawingml/2006/main"
 MATH_NAMESPACE = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 CHART_NAMESPACE = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+MARKUP_COMPATIBILITY_NAMESPACE = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 XML_NAMESPACE = "http://www.w3.org/XML/1998/namespace"
 NAMESPACES = {
     "a": DRAWINGML_NAMESPACE,
@@ -30,6 +31,9 @@ TABLE_TAG = f"{{{WORD_NAMESPACE}}}tbl"
 TABLE_ROW_TAG = f"{{{WORD_NAMESPACE}}}tr"
 TABLE_CELL_TAG = f"{{{WORD_NAMESPACE}}}tc"
 TEXTBOX_CONTENT_TAG = f"{{{WORD_NAMESPACE}}}txbxContent"
+ALTERNATE_CONTENT_TAG = f"{{{MARKUP_COMPATIBILITY_NAMESPACE}}}AlternateContent"
+ALTERNATE_CHOICE_TAG = f"{{{MARKUP_COMPATIBILITY_NAMESPACE}}}Choice"
+ALTERNATE_FALLBACK_TAG = f"{{{MARKUP_COMPATIBILITY_NAMESPACE}}}Fallback"
 TEXT_TAGS = {
     f"{{{WORD_NAMESPACE}}}t",
     f"{{{WORD_NAMESPACE}}}delText",
@@ -283,10 +287,71 @@ def list_docx_text_parts(names: Iterable[str]) -> List[str]:
     return matched
 
 
+def list_docx_visible_text_parts(archive: zipfile.ZipFile) -> List[str]:
+    """Return DOCX package parts that can contribute visible text.
+
+    The static list covers normal Word stories. Complex layouts can place
+    visible text in additional Word XML/VML parts, so discovery must inspect
+    package content instead of relying only on filenames.
+    """
+
+    names = archive.namelist()
+    configured = list_docx_text_parts(names)
+    matched: List[str] = []
+    for name in configured:
+        if name not in matched:
+            matched.append(name)
+
+    for name in sorted(names):
+        if name in matched or not _is_docx_candidate_text_part_name(name):
+            continue
+        if _docx_part_has_visible_text(archive, name):
+            matched.append(name)
+    return matched
+
+
+def _is_docx_candidate_text_part_name(part_name: str) -> bool:
+    name = str(part_name or "")
+    lower = name.lower()
+    if not (lower.endswith(".xml") or lower.endswith(".vml")):
+        return False
+    if not name.startswith("word/"):
+        return False
+    if name.startswith("word/_rels/") or "/_rels/" in name:
+        return False
+    if name.startswith("word/media/") or name.startswith("word/embeddings/"):
+        return False
+    if name.startswith("word/theme/"):
+        return False
+    if name in {
+        "word/settings.xml",
+        "word/styles.xml",
+        "word/stylesWithEffects.xml",
+        "word/fontTable.xml",
+        "word/webSettings.xml",
+        "word/numbering.xml",
+        "word/documentProtection.xml",
+    }:
+        return False
+    return True
+
+
+def _docx_part_has_visible_text(archive: zipfile.ZipFile, part_name: str) -> bool:
+    try:
+        root = ET.fromstring(archive.read(part_name))
+    except Exception:
+        return False
+    parent_map = {child: parent for parent in root.iter() for child in parent}
+    return any(
+        _is_docx_visible_text_node(node, parent_map=parent_map)
+        for node in _iter_docx_effective_descendants(root)
+    )
+
+
 def docx_contains_tracked_changes(file_path: str | Path) -> bool:
     """Quick check for tracked-change nodes inside a DOCX package."""
     with zipfile.ZipFile(file_path) as archive:
-        for part_name in list_docx_text_parts(archive.namelist()):
+        for part_name in list_docx_visible_text_parts(archive):
             xml_bytes = archive.read(part_name)
             if b"<w:ins" in xml_bytes or b"<w:del" in xml_bytes or b"<w:delText" in xml_bytes:
                 return True
@@ -312,7 +377,7 @@ def extract_docx_visible_text_units(
     units: List[DocxVisibleTextUnit] = []
 
     with zipfile.ZipFile(file_path) as archive:
-        part_names = list_docx_text_parts(archive.namelist())
+        part_names = list_docx_visible_text_parts(archive)
         for part_name in part_names:
             root = ET.fromstring(archive.read(part_name))
             tracked_insertions += len(root.findall(".//w:ins", NAMESPACES))
@@ -331,7 +396,7 @@ def extract_docx_visible_text_units(
     coverage_audit = audit_docx_text_coverage(
         file_path,
         estimated_page_count=estimated_page_count,
-        sample_limit=20,
+        sample_limit=0,
     )
     tracked_changes_detected = bool(
         tracked_insertions or tracked_deletions or tracked_deleted_text_nodes
@@ -345,6 +410,14 @@ def extract_docx_visible_text_units(
         "tracked_deleted_text_nodes": tracked_deleted_text_nodes,
         "docx_text_extraction": "ooxml_visible_text_units",
         "docx_text_unit_count": len(units),
+        "docx_coverage_backfill_unit_count": sum(
+            1 for unit in units if "parser_coverage_backfill" in unit.flags
+        ),
+        "docx_coverage_backfill_text_node_count": sum(
+            len([fragment for fragment in unit.fragments if not fragment.virtual])
+            for unit in units
+            if "parser_coverage_backfill" in unit.flags
+        ),
         "docx_parser_virtual_inline_space_removed_count": removed_virtual_space_count,
         "docx_table_unit_count": sum(
             1 for unit in units if unit.container_type in {"table_cell", "table_row"}
@@ -419,7 +492,7 @@ def audit_docx_text_coverage(
         with zipfile.ZipFile(source_path) as archive:
             names = archive.namelist()
             xml_part_names = sorted(name for name in names if name.lower().endswith(".xml"))
-            configured_text_parts = set(list_docx_text_parts(names))
+            configured_text_parts = set(list_docx_visible_text_parts(archive))
             report["xml_part_count"] = len(xml_part_names)
             report["configured_text_part_count"] = len(configured_text_parts)
             for part_name in xml_part_names:
@@ -489,7 +562,7 @@ def _audit_docx_xml_part_text_coverage(
         "unit_count": len(units),
         "configured_text_part": part_name in configured_text_parts,
     }
-    for node_index, node in enumerate(root.iter()):
+    for node_index, node in enumerate(_iter_docx_effective_descendants(root)):
         node_text = str(node.text or "")
         if not node_text.strip():
             continue
@@ -498,6 +571,8 @@ def _audit_docx_xml_part_text_coverage(
             node=node,
             parent_map=parent_map,
         )
+        if category in {"non_visible_xml_text", "package_metadata"}:
+            continue
         covered = id(node) in covered_nodes
         part_report["total_text_node_count"] += 1
         if id(node) in review_required_nodes:
@@ -566,7 +641,7 @@ def _merge_docx_coverage_part_report(
     uncovered_count = int(part_report.get("uncovered_text_node_count", 0) or 0)
     unknown_count = int(part_report.get("unknown_text_node_count", 0) or 0)
     categories = set((part_report.get("uncovered_text_by_category") or {}).keys())
-    if uncovered_count > 0 and categories - {"metadata", "package_metadata", "custom_xml"}:
+    if uncovered_count > 0 and categories - {"metadata", "package_metadata", "custom_xml", "field_instruction"}:
         report["unhandled_text_part_count"] += 1
         report["unhandled_text_parts"].append(part_name)
     if unknown_count > 0:
@@ -599,7 +674,7 @@ def collect_docx_visible_text_units_from_root(
 
     body = root.find(".//w:body", NAMESPACES)
     if body is not None:
-        for child in body:
+        for child in _iter_docx_effective_children(body):
             units.extend(
                 _collect_docx_block_units(
                     child,
@@ -609,9 +684,16 @@ def collect_docx_visible_text_units_from_root(
                     container_override=None,
                 )
             )
+        _append_docx_coverage_backfill_units(
+            root,
+            units=units,
+            state=state,
+            parent_map=parent_map,
+            table_index=table_index,
+        )
         return units
 
-    for child in root:
+    for child in _iter_docx_effective_children(root):
         units.extend(
             _collect_docx_block_units(
                 child,
@@ -631,7 +713,112 @@ def collect_docx_visible_text_units_from_root(
                 container_type=part_container,
             )
         )
+    else:
+        _append_docx_coverage_backfill_units(
+            root,
+            units=units,
+            state=state,
+            parent_map=parent_map,
+            table_index=table_index,
+        )
     return units
+
+
+def _append_docx_coverage_backfill_units(
+    root: ET.Element,
+    *,
+    units: List[DocxVisibleTextUnit],
+    state: _DocxPartBuildState,
+    parent_map: Dict[ET.Element, ET.Element],
+    table_index: Dict[ET.Element, int],
+) -> None:
+    """Append visible text nodes missed by structural traversal.
+
+    Word's complex layouts can hide visible text in wrappers that are not normal
+    body paragraphs/tables, especially compatibility branches, shapes, and
+    drawing containers. The normal traversal remains the primary source of
+    coherent blocks; this pass only backfills still-uncovered visible text nodes
+    so recognition sees every visible subject at least once.
+    """
+
+    covered_nodes = {
+        id(fragment.node)
+        for unit in units
+        for fragment in unit.fragments
+        if fragment.node is not None and not fragment.virtual
+    }
+    for group in _iter_uncovered_visible_text_node_groups(
+        root,
+        parent_map=parent_map,
+        covered_nodes=covered_nodes,
+    ):
+        fragments: List[DocxTextFragment] = []
+        for node in group:
+            _append_text_node_fragment(fragments, node, state=state)
+        text = "".join(fragment.text for fragment in fragments)
+        if not text.strip():
+            continue
+        anchor = group[0]
+        container_type = _container_type_for_node(
+            state.part_name,
+            anchor,
+            parent_map,
+        )
+        table_meta = _table_position_for_node(
+            anchor,
+            parent_map=parent_map,
+            table_index=table_index,
+        )
+        unit_id = state.next_unit_id()
+        flags = _container_flags(container_type)
+        flags.extend(_fragment_source_flags(fragments))
+        flags.append("parser_coverage_backfill")
+        units.append(
+            DocxVisibleTextUnit(
+                unit_id=unit_id,
+                part_name=state.part_name,
+                unit_type="coverage_backfill",
+                container_type=container_type,
+                text=text,
+                order_index=state.order_offset + state.next_unit_index - 1,
+                fragments=fragments,
+                estimated_page_no=_page_for_current_unit(state),
+                table_index=table_meta.get("table_index"),
+                row_index=table_meta.get("row_index"),
+                col_index=table_meta.get("col_index"),
+                flags=_unique_strings(flags),
+                rewrite_policy=_rewrite_policy_for_container(container_type),
+            )
+        )
+        covered_nodes.update(id(fragment.node) for fragment in fragments if fragment.node is not None)
+
+
+def _iter_uncovered_visible_text_node_groups(
+    root: ET.Element,
+    *,
+    parent_map: Dict[ET.Element, ET.Element],
+    covered_nodes: set[int],
+) -> Iterator[List[ET.Element]]:
+    current_group: List[ET.Element] = []
+    current_parent: Optional[ET.Element] = None
+    for node in _iter_docx_effective_descendants(root):
+        if not _is_docx_visible_text_node(node, parent_map=parent_map):
+            continue
+        if id(node) in covered_nodes:
+            if current_group:
+                yield current_group
+                current_group = []
+                current_parent = None
+            continue
+        paragraph_parent = _nearest_ancestor(node, parent_map=parent_map, tag=PARAGRAPH_TAG)
+        group_parent = paragraph_parent if paragraph_parent is not None else parent_map.get(node)
+        if current_group and group_parent is not current_parent:
+            yield current_group
+            current_group = []
+        current_group.append(node)
+        current_parent = group_parent
+    if current_group:
+        yield current_group
 
 
 def _collect_generic_text_units(
@@ -641,7 +828,7 @@ def _collect_generic_text_units(
     container_type: str,
 ) -> List[DocxVisibleTextUnit]:
     units: List[DocxVisibleTextUnit] = []
-    for node in root.iter():
+    for node in _iter_docx_effective_descendants(root):
         if node.tag not in TEXT_TAGS or not node.text:
             continue
         fragments: List[DocxTextFragment] = []
@@ -667,6 +854,45 @@ def _collect_generic_text_units(
             )
         )
     return units
+
+
+def _iter_docx_effective_children(node: ET.Element) -> Iterator[ET.Element]:
+    if node.tag == ALTERNATE_CONTENT_TAG:
+        branch = _select_alternate_content_branch(node)
+        if branch is not None:
+            yield from _iter_docx_effective_children(branch)
+        return
+    for child in node:
+        if child.tag == ALTERNATE_CONTENT_TAG:
+            yield from _iter_docx_effective_children(child)
+        else:
+            yield child
+
+
+def _iter_docx_effective_descendants(node: ET.Element) -> Iterator[ET.Element]:
+    yield node
+    for child in _iter_docx_effective_children(node):
+        yield from _iter_docx_effective_descendants(child)
+
+
+def _select_alternate_content_branch(node: ET.Element) -> Optional[ET.Element]:
+    for child in node:
+        if child.tag == ALTERNATE_CHOICE_TAG and _element_has_visible_text(child):
+            return child
+    for child in node:
+        if child.tag == ALTERNATE_FALLBACK_TAG and _element_has_visible_text(child):
+            return child
+    for child in node:
+        if _element_has_visible_text(child):
+            return child
+    return node[0] if len(node) else None
+
+
+def _element_has_visible_text(node: ET.Element) -> bool:
+    return any(
+        item.tag in TEXT_TAGS and str(item.text or "").strip()
+        for item in node.iter()
+    )
 
 
 def assign_docx_unit_global_offsets(units: Sequence[DocxVisibleTextUnit]) -> str:
@@ -715,11 +941,10 @@ def normalize_docx_chinese_inline_spaces(
     }
     source_path = Path(file_path)
     with zipfile.ZipFile(source_path) as archive:
-        names = archive.namelist()
         part_roots: Dict[str, ET.Element] = {}
         modified_parts: set[str] = set()
         removed_total = 0
-        for part_name in list_docx_text_parts(names):
+        for part_name in list_docx_visible_text_parts(archive):
             root = ET.fromstring(archive.read(part_name))
             removed = _normalize_docx_root_chinese_inline_spaces(root, part_name=part_name)
             if removed > 0:
@@ -825,14 +1050,14 @@ def replace_docx_text_by_ranges_with_report(
 
     source_path = Path(file_path)
     with zipfile.ZipFile(source_path) as archive:
-        names = archive.namelist()
-        target_parts = set(list_docx_text_parts(names))
+        text_parts = list_docx_visible_text_parts(archive)
+        target_parts = set(text_parts)
         if not target_parts:
             report["rejection_reason"] = "no_text_parts"
             return report
         part_roots: Dict[str, ET.Element] = {}
         units: List[DocxVisibleTextUnit] = []
-        for part_name in list_docx_text_parts(names):
+        for part_name in text_parts:
             root = ET.fromstring(archive.read(part_name))
             part_roots[part_name] = root
             units.extend(
@@ -956,7 +1181,7 @@ def _collect_docx_block_units(
         )
 
     units: List[DocxVisibleTextUnit] = []
-    for child in node:
+    for child in _iter_docx_effective_children(node):
         units.extend(
             _collect_docx_block_units(
                 child,
@@ -1029,7 +1254,7 @@ def _collect_docx_textbox_units(
     table_index: Dict[ET.Element, int],
 ) -> List[DocxVisibleTextUnit]:
     units: List[DocxVisibleTextUnit] = []
-    for child in textbox:
+    for child in _iter_docx_effective_children(textbox):
         units.extend(
             _collect_docx_block_units(
                 child,
@@ -1111,7 +1336,7 @@ def _cell_visible_fragments(
 ) -> List[DocxTextFragment]:
     fragments: List[DocxTextFragment] = []
     added = 0
-    for child in cell:
+    for child in _iter_docx_effective_children(cell):
         child_fragments: List[DocxTextFragment] = []
         if child.tag == PARAGRAPH_TAG:
             child_fragments = _paragraph_visible_fragments(child, state=state)
@@ -1130,7 +1355,7 @@ def _cell_visible_fragments(
                 table_index=table_index,
             )
         else:
-            for nested in child:
+            for nested in _iter_docx_effective_children(child):
                 child_fragments.extend(
                     _cell_visible_fragments(
                         nested,
@@ -1191,7 +1416,7 @@ def _textbox_visible_fragments(
 ) -> List[DocxTextFragment]:
     fragments: List[DocxTextFragment] = []
     added = 0
-    for child in textbox:
+    for child in _iter_docx_effective_children(textbox):
         child_fragments: List[DocxTextFragment] = []
         if child.tag == PARAGRAPH_TAG:
             child_fragments = _paragraph_visible_fragments(child, state=state)
@@ -1234,7 +1459,7 @@ def _collect_paragraph_visible_fragments(
     state: _DocxPartBuildState,
     fragments: List[DocxTextFragment],
 ) -> None:
-    for child in node:
+    for child in _iter_docx_effective_children(node):
         if child.tag == PARAGRAPH_TAG:
             continue
         if child.tag == TEXTBOX_CONTENT_TAG:
@@ -1382,6 +1607,32 @@ def _container_type_for_node(
     return "table_cell" if saw_table else "paragraph"
 
 
+def _table_position_for_node(
+    node: ET.Element,
+    *,
+    parent_map: Dict[ET.Element, ET.Element],
+    table_index: Dict[ET.Element, int],
+) -> Dict[str, int]:
+    paragraph = _nearest_ancestor(node, parent_map=parent_map, tag=PARAGRAPH_TAG)
+    if paragraph is not None:
+        return _table_position(paragraph, parent_map=parent_map, table_index=table_index)
+    return {}
+
+
+def _nearest_ancestor(
+    node: ET.Element,
+    *,
+    parent_map: Dict[ET.Element, ET.Element],
+    tag: str,
+) -> Optional[ET.Element]:
+    current: Optional[ET.Element] = node
+    while current is not None:
+        if current.tag == tag:
+            return current
+        current = parent_map.get(current)
+    return None
+
+
 def _table_position(
     paragraph: ET.Element,
     *,
@@ -1437,6 +1688,16 @@ def _classify_docx_text_node(
     node: ET.Element,
     parent_map: Dict[ET.Element, ET.Element],
 ) -> str:
+    if not _is_docx_supported_text_node(node):
+        if part_name.startswith("docProps/"):
+            return "metadata"
+        if part_name.startswith("customXml/"):
+            return "custom_xml"
+        if part_name.startswith("_rels/") or "/_rels/" in part_name:
+            return "package_metadata"
+        if part_name == "[Content_Types].xml":
+            return "package_metadata"
+        return "non_visible_xml_text"
     if _node_is_hidden_text(node, parent_map=parent_map):
         return "hidden_text"
     if node.tag == FIELD_INSTRUCTION_TAG:
@@ -1468,6 +1729,26 @@ def _classify_docx_text_node(
     if part_name == "[Content_Types].xml":
         return "package_metadata"
     return "unknown_xml_text"
+
+
+def _is_docx_visible_text_node(
+    node: ET.Element,
+    *,
+    parent_map: Dict[ET.Element, ET.Element],
+) -> bool:
+    if not _is_docx_supported_text_node(node):
+        return False
+    if not str(node.text or "").strip():
+        return False
+    if node.tag == FIELD_INSTRUCTION_TAG:
+        return False
+    if _node_is_hidden_text(node, parent_map=parent_map):
+        return False
+    return True
+
+
+def _is_docx_supported_text_node(node: ET.Element) -> bool:
+    return node.tag in TEXT_TAGS or node.tag == FIELD_INSTRUCTION_TAG
 
 
 def _node_is_hidden_text(
@@ -1754,7 +2035,7 @@ def extract_block_texts(root: ET.Element) -> List[str]:
     blocks: List[str] = []
     body = root.find(".//w:body", NAMESPACES)
     if body is not None:
-        for child in body:
+        for child in _iter_docx_effective_children(body):
             blocks.extend(_extract_top_level_block_texts(child))
         return blocks
 
@@ -1774,7 +2055,7 @@ def _extract_top_level_block_texts(node: ET.Element) -> List[str]:
         return _extract_textbox_block_texts(node)
 
     blocks: List[str] = []
-    for child in node:
+    for child in _iter_docx_effective_children(node):
         if child.tag == PARAGRAPH_TAG:
             blocks.extend(_extract_paragraph_block_texts(child))
         elif child.tag == TABLE_TAG:
@@ -1798,7 +2079,7 @@ def _extract_paragraph_block_texts(paragraph: ET.Element) -> List[str]:
 
 def _extract_textbox_block_texts(textbox: ET.Element) -> List[str]:
     blocks: List[str] = []
-    for child in textbox:
+    for child in _iter_docx_effective_children(textbox):
         if child.tag == PARAGRAPH_TAG:
             text = extract_paragraph_text(child)
             if text.strip():
@@ -1816,7 +2097,7 @@ def _extract_table_row_texts(table: ET.Element) -> List[str]:
         cells: List[str] = []
         for cell in row.iterfind("./w:tc", NAMESPACES):
             cell_parts: List[str] = []
-            for child in cell:
+            for child in _iter_docx_effective_children(cell):
                 if child.tag == PARAGRAPH_TAG:
                     for paragraph_text in _extract_paragraph_block_texts(child):
                         if paragraph_text.strip():
@@ -1861,7 +2142,7 @@ def count_paragraph_section_page_breaks(paragraph: ET.Element) -> int:
 
 
 def _iter_paragraph_text_fragments(node: ET.Element) -> Iterator[str]:
-    for child in node:
+    for child in _iter_docx_effective_children(node):
         if child.tag == PARAGRAPH_TAG:
             continue
 
@@ -1889,7 +2170,7 @@ def replace_text_in_docx(file_path: str | Path, replacements: Sequence[Tuple[str
 
     source_path = Path(file_path)
     with zipfile.ZipFile(source_path) as archive:
-        target_parts = set(list_docx_text_parts(archive.namelist()))
+        target_parts = set(list_docx_visible_text_parts(archive))
 
     if not target_parts:
         return False

@@ -50,6 +50,67 @@ def iter_legal_text_segments(
         )
 
 
+def build_legal_text_segment_metadata(
+    text: str,
+    *,
+    max_chars: int,
+    overlap_chars: int = 80,
+    min_split_chars: int = 80,
+) -> dict[str, int]:
+    """Return privacy-safe coverage counters for a segmentation pass."""
+
+    source_text = str(text or "")
+    segments = list(
+        iter_legal_text_segments(
+            source_text,
+            max_chars=max_chars,
+            overlap_chars=overlap_chars,
+            min_split_chars=min_split_chars,
+        )
+    )
+    intervals: list[tuple[int, int]] = []
+    total_segment_chars = 0
+    max_segment_chars = 0
+    for segment, offset in segments:
+        length = len(segment)
+        total_segment_chars += length
+        max_segment_chars = max(max_segment_chars, length)
+        if length > 0:
+            intervals.append((max(0, offset), max(0, offset) + length))
+    intervals.sort()
+    unique_covered_chars = 0
+    merged_start = -1
+    merged_end = -1
+    for start, end in intervals:
+        if merged_start < 0:
+            merged_start, merged_end = start, end
+            continue
+        if start <= merged_end:
+            merged_end = max(merged_end, end)
+            continue
+        unique_covered_chars += max(0, merged_end - merged_start)
+        merged_start, merged_end = start, end
+    if merged_start >= 0:
+        unique_covered_chars += max(0, merged_end - merged_start)
+
+    non_empty_line_count = sum(1 for line in source_text.splitlines() if line.strip())
+    blank_line_count = sum(1 for line in source_text.splitlines() if not line.strip())
+    long_segment_count = sum(1 for segment, _offset in segments if len(segment) > max_chars)
+    coverage_ppm = int((unique_covered_chars * 1_000_000) / len(source_text)) if source_text else 0
+    return {
+        "segment_text_length": len(source_text),
+        "segment_count": len(segments),
+        "segment_non_empty_line_count": non_empty_line_count,
+        "segment_blank_line_count": blank_line_count,
+        "segment_total_chars": total_segment_chars,
+        "segment_unique_covered_chars": unique_covered_chars,
+        "segment_overlap_extra_chars": max(0, total_segment_chars - unique_covered_chars),
+        "segment_max_chars": max_segment_chars,
+        "segment_long_segment_count": long_segment_count,
+        "segment_coverage_ppm": coverage_ppm,
+    }
+
+
 def _split_long_line(
     line: str,
     *,

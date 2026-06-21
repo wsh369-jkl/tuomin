@@ -6,6 +6,7 @@ import re
 from typing import Iterable, List, Optional
 
 from app.core.recognizer_base import RecognizerResult
+from app.rules.subject_admission_gate import SubjectAdmissionGate
 from app.services.lowmem_entity_utils import (
     DATE_PATTERN,
     GENERIC_ORGANIZATION_TERMS,
@@ -16,8 +17,6 @@ from app.services.lowmem_entity_utils import (
     has_identity_reference_prefix,
     is_identity_reference_term,
     is_generic_organization_term,
-    is_non_subject_action_or_function_term,
-    is_non_subject_generic_org_reference,
     is_org_like_text,
     is_position_title,
     is_probable_person,
@@ -26,11 +25,11 @@ from app.services.lowmem_entity_utils import (
     remap_results_to_source,
     sanitize_recognition_text,
     strip_identity_reference_prefix,
-    subject_noun_gate,
 )
 from app.services.lowmem_memory import release_runtime_memory
 from app.services.lowmem_model_assets import build_model_asset
 from app.services.hf_token_classifier import HFTokenClassificationPipeline
+from app.services.legal_text_segmenter import build_legal_text_segment_metadata
 from app.services.legal_text_segmenter import iter_legal_text_segments
 
 
@@ -230,6 +229,7 @@ class ChineseNERService:
         self.backend_available = False
         self.backend_error: Optional[str] = None
         self._pipeline = None
+        self.last_extract_metadata: dict[str, object] = {}
 
     @property
     def ready(self) -> bool:
@@ -238,6 +238,19 @@ class ChineseNERService:
     def extract(self, text: str) -> List[RecognizerResult]:
         sanitized_text, index_map = sanitize_recognition_text(text)
         working_text = sanitized_text or text
+        self.last_extract_metadata = {
+            f"{self.source_name}_input_length": len(text or ""),
+            f"{self.source_name}_working_text_length": len(working_text or ""),
+            **{
+                f"{self.source_name}_{key}": value
+                for key, value in build_legal_text_segment_metadata(
+                    working_text,
+                    max_chars=450,
+                    overlap_chars=80,
+                    min_split_chars=60,
+                ).items()
+            },
+        }
         model_results: list[RecognizerResult] = []
         if self.backend.lower() == "deterministic":
             self.backend_available = True
@@ -253,6 +266,13 @@ class ChineseNERService:
 
         fallback_results = self._fallback_extract(working_text)
         remapped = remap_results_to_source([*model_results, *fallback_results], text, index_map)
+        self.last_extract_metadata.update(
+            {
+                f"{self.source_name}_model_result_count": len(model_results),
+                f"{self.source_name}_fallback_result_count": len(fallback_results),
+                f"{self.source_name}_remapped_result_count": len(remapped),
+            }
+        )
         return deduplicate_results(remapped)
 
     def _extract_with_transformers(self, text: str) -> List[RecognizerResult]:
@@ -438,22 +458,22 @@ class ChineseNERService:
         if entity_type == "LOCATION":
             if normalized in self.LOCATION_NOISE_TERMS:
                 return False
-            return subject_noun_gate("LOCATION", normalized)[0]
+            return SubjectAdmissionGate.passes_subject_shape("LOCATION", normalized)[0]
 
         if entity_type == "ADDRESS":
             if normalized in self.LOCATION_NOISE_TERMS:
                 return False
             address_tokens = ["省", "市", "区", "县", "镇", "乡", "村", "路", "街", "道", "号", "栋", "室"]
-            return (len(normalized) >= 6 or any(token in normalized for token in address_tokens)) and subject_noun_gate("LOCATION", normalized)[0]
+            return (len(normalized) >= 6 or any(token in normalized for token in address_tokens)) and SubjectAdmissionGate.passes_subject_shape("LOCATION", normalized)[0]
 
         if entity_type == "PERSON":
-            return normalized not in self.PERSON_NOISE_TERMS and subject_noun_gate("PERSON", normalized)[0]
+            return normalized not in self.PERSON_NOISE_TERMS and SubjectAdmissionGate.passes_subject_shape("PERSON", normalized)[0]
 
         if entity_type in {"ORGANIZATION", "COURT"}:
             prefixed_remainder = strip_identity_reference_prefix(normalized)
             if prefixed_remainder:
                 normalized = prefixed_remainder
-            if is_non_subject_generic_org_reference(normalized) or is_non_subject_action_or_function_term(normalized):
+            if SubjectAdmissionGate.is_non_subject_expression(normalized):
                 return False
             if normalized in {
                 "上诉人",
@@ -481,7 +501,7 @@ class ChineseNERService:
             if len(normalized) > 16 and any(token in normalized for token in ("的", "是", "至", "了")):
                 return False
             gate_type = "GOVERNMENT" if entity_type == "COURT" else "ORGANIZATION"
-            return subject_noun_gate(gate_type, normalized, allow_short_org=False)[0]
+            return SubjectAdmissionGate.passes_subject_shape(gate_type, normalized, allow_short_org=False)[0]
 
         return True
 

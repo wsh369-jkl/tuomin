@@ -30,8 +30,10 @@ def build_coverage_first_final_export_bundle(
     )
     mapping_entities = _mapping_entities_from_rows(directory_rows)
     summary = _summary(
+        prepared_entities=prepared,
         directory_rows=directory_rows,
         rewrite_entries=rewrite_entries,
+        mapping_entities=mapping_entities,
     )
     return {
         "enabled": bool(directory_rows),
@@ -48,7 +50,7 @@ def _group_entities(entities: list[dict[str, Any]]) -> list[list[dict[str, Any]]
         entity_type = _entity_type(entity)
         source_text = str(entity.get("text") or "").strip()
         replacement = _replacement(entity)
-        if not source_text:
+        if not source_text or not _is_desensitized_entity(entity):
             continue
         key = _subject_key(entity=entity, entity_type=entity_type, source_text=source_text, replacement=replacement)
         buckets[key].append(entity)
@@ -76,6 +78,7 @@ def _directory_rows(groups: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
                 "context_role": _first_non_empty(group, "context_role") or "通用上下文",
                 "replacement_family_key": _first_metadata_value(group, "replacement_family_key"),
                 "canonical_key": _first_entity_or_metadata_value(group, "canonical_key"),
+                "qwen_coverage_discovery": any(_is_qwen_discovery(item) for item in group),
             }
         )
     return rows
@@ -113,6 +116,7 @@ def _rewrite_entry(
     input_order: int,
 ) -> dict[str, Any]:
     source = str(occurrence.get("text") or "")
+    occurrence_metadata = dict(occurrence.get("metadata") or {})
     start = _as_int(occurrence.get("start"), -1)
     end = _as_int(occurrence.get("end"), -1)
     entity_type = str(occurrence.get("type") or row.get("subject_type") or "")
@@ -138,6 +142,10 @@ def _rewrite_entry(
         "entity_type": entity_type,
         "start": start,
         "end": end,
+        "metadata": {
+            "qwen_coverage_discovery": bool(occurrence_metadata.get("qwen_coverage_discovery")),
+            "source_layer": str(occurrence_metadata.get("source_layer") or ""),
+        },
         "input_order": input_order,
         "verification_status": status,
         "failure_reason": reason,
@@ -147,36 +155,62 @@ def _rewrite_entry(
 def _mapping_entities_from_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     mapping_entities: list[dict[str, Any]] = []
     for row in rows:
-        first_occurrence = next(
-            (item for item in row.get("occurrences") or [] if isinstance(item, dict)),
-            {},
-        )
-        mapping_entities.append(
-            {
-                "type": row.get("subject_type"),
-                "text": row.get("canonical_text"),
-                "replacement": row.get("replacement"),
-                "start": first_occurrence.get("start", 10**12),
-                "context_label": row.get("context_label"),
-                "context_role": row.get("context_role"),
-                "metadata": {
-                    "coverage_first_subject_id": row.get("subject_id"),
-                    "coverage_first_surfaces": list(row.get("surfaces") or []),
-                    "coverage_first_occurrence_count": int(row.get("occurrence_count") or 0),
-                },
-            }
-        )
+        replacement = str(row.get("replacement") or "").strip()
+        if not replacement:
+            continue
+        occurrences = [item for item in row.get("occurrences") or [] if isinstance(item, dict)]
+        for occurrence in occurrences:
+            source_text = str(occurrence.get("text") or "").strip()
+            if not source_text or source_text == replacement:
+                continue
+            occurrence_metadata = dict(occurrence.get("metadata") or {})
+            mapping_entities.append(
+                {
+                    "type": occurrence.get("type") or row.get("subject_type"),
+                    "text": source_text,
+                    "replacement": replacement,
+                    "start": occurrence.get("start", 10**12),
+                    "end": occurrence.get("end", 10**12),
+                    "context_label": row.get("context_label"),
+                    "context_role": row.get("context_role"),
+                    "metadata": {
+                        **occurrence_metadata,
+                        "coverage_first_subject_id": row.get("subject_id"),
+                        "coverage_first_surfaces": list(row.get("surfaces") or []),
+                        "coverage_first_occurrence_count": int(row.get("occurrence_count") or 0),
+                    },
+                }
+            )
     return mapping_entities
 
 
 def _summary(
     *,
+    prepared_entities: list[dict[str, Any]],
     directory_rows: list[dict[str, Any]],
     rewrite_entries: list[dict[str, Any]],
+    mapping_entities: list[dict[str, Any]],
 ) -> dict[str, Any]:
     replacement_owner: dict[str, set[str]] = defaultdict(set)
     subject_replacements: dict[str, set[str]] = defaultdict(set)
     blocked = [item for item in rewrite_entries if item.get("verification_status") == "blocked"]
+    desensitized_entities = [item for item in prepared_entities if _is_desensitized_entity(item)]
+    directory_occurrence_count = sum(
+        len([item for item in row.get("occurrences") or [] if isinstance(item, dict)])
+        for row in directory_rows
+    )
+    qwen_discovery_desensitized = [item for item in desensitized_entities if _is_qwen_discovery(item)]
+    qwen_discovery_rows = [
+        row for row in directory_rows if bool(row.get("qwen_coverage_discovery"))
+    ]
+    qwen_discovery_rewrite_entries = [
+        item
+        for item in rewrite_entries
+        if _rewrite_entry_has_qwen_discovery(item)
+    ]
+    qwen_discovery_mapping_entities = [
+        item for item in mapping_entities if _mapping_entity_has_qwen_discovery(item)
+    ]
     for row in directory_rows:
         subject_id = str(row.get("subject_id") or "")
         replacement = str(row.get("replacement") or "").strip()
@@ -191,14 +225,29 @@ def _summary(
         and not blocked
         and replacement_reused_count == 0
         and subject_multi_replacement_count == 0
+        and len(desensitized_entities) == directory_occurrence_count
     )
     return {
+        "final_entity_input_count": len(prepared_entities),
+        "final_desensitized_entity_input_count": len(desensitized_entities),
         "final_directory_subject_count": len(directory_rows),
+        "final_directory_occurrence_count": directory_occurrence_count,
+        "final_missing_directory_entity_count": max(0, len(desensitized_entities) - directory_occurrence_count),
+        "final_mapping_entity_count": len(mapping_entities),
         "final_rewrite_entry_count": len(rewrite_entries),
         "final_blocked_rewrite_entry_count": len(blocked),
         "final_rewrite_failure_counts": dict(sorted(failure_counts.items())),
         "final_replacement_reused_by_multi_subject_count": replacement_reused_count,
         "final_subject_multi_replacement_count": subject_multi_replacement_count,
+        "qwen_discovery_final_entity_count": sum(1 for item in prepared_entities if _is_qwen_discovery(item)),
+        "qwen_discovery_desensitized_entity_count": len(qwen_discovery_desensitized),
+        "qwen_discovery_directory_row_count": len(qwen_discovery_rows),
+        "qwen_discovery_directory_occurrence_count": sum(
+            len([item for item in row.get("occurrences") or [] if isinstance(item, dict)])
+            for row in qwen_discovery_rows
+        ),
+        "qwen_discovery_mapping_entity_count": len(qwen_discovery_mapping_entities),
+        "qwen_discovery_rewrite_entry_count": len(qwen_discovery_rewrite_entries),
         "final_export_ready": ready,
     }
 
@@ -220,7 +269,8 @@ def _subject_key(
     ).strip()
     if canonical:
         return (entity_type, "canonical", canonical)
-    return (entity_type, "replacement", replacement or source_text)
+    normalized_text = "".join(source_text.split())
+    return (entity_type, "surface", normalized_text or source_text or replacement)
 
 
 def _group_sort_key(group: list[dict[str, Any]]) -> tuple[int, int, str]:
@@ -245,6 +295,7 @@ def _surfaces(group: list[dict[str, Any]]) -> list[str]:
 
 
 def _occurrence(entity: dict[str, Any], *, index: int) -> dict[str, Any]:
+    metadata = dict(entity.get("metadata") or {})
     return {
         "occurrence_id": f"O{index:04d}",
         "type": _entity_type(entity),
@@ -252,11 +303,49 @@ def _occurrence(entity: dict[str, Any], *, index: int) -> dict[str, Any]:
         "start": _as_int(entity.get("start"), -1),
         "end": _as_int(entity.get("end"), -1),
         "source": str(entity.get("source") or ""),
+        "metadata": {
+            "qwen_coverage_discovery": bool(metadata.get("qwen_coverage_discovery")),
+            "source_layer": str(metadata.get("source_layer") or ""),
+            "subject_ledger_subject_id": str(metadata.get("subject_ledger_subject_id") or ""),
+            "subject_ledger_occurrence_id": str(metadata.get("subject_ledger_occurrence_id") or ""),
+            "replacement_family_key": str(metadata.get("replacement_family_key") or ""),
+        },
     }
 
 
 def _entity_type(entity: dict[str, Any]) -> str:
     return str(entity.get("type") or entity.get("entity_type") or "").strip().upper()
+
+
+def _is_desensitized_entity(entity: dict[str, Any]) -> bool:
+    source_text = str(entity.get("text") or "").strip()
+    replacement = _replacement(entity)
+    if not source_text or not replacement:
+        return False
+    if replacement == source_text:
+        return False
+    if str(entity.get("replacement_method") or "").strip().lower() == "preserve":
+        return False
+    if _entity_type(entity) in NON_REWRITE_TYPES:
+        return False
+    return True
+
+
+def _is_qwen_discovery(entity: dict[str, Any]) -> bool:
+    metadata = dict(entity.get("metadata") or {})
+    return bool(metadata.get("qwen_coverage_discovery"))
+
+
+def _rewrite_entry_has_qwen_discovery(
+    entry: dict[str, Any],
+) -> bool:
+    metadata = dict(entry.get("metadata") or {})
+    return bool(metadata.get("qwen_coverage_discovery"))
+
+
+def _mapping_entity_has_qwen_discovery(entity: dict[str, Any]) -> bool:
+    metadata = dict(entity.get("metadata") or {})
+    return bool(metadata.get("qwen_coverage_discovery"))
 
 
 def _replacement(entity: dict[str, Any]) -> str:

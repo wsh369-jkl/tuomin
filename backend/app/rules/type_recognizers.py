@@ -7,6 +7,7 @@ from typing import Any
 
 from app.core.recognizer_base import RecognizerResult
 from app.rules.default_subject_policy import canonical_default_entity_type
+from app.rules.subject_admission_gate import SubjectAdmissionGate
 from app.services.contract_structure_backfill_service import ContractStructureBackfillService
 from app.services.lowmem_entity_utils import (
     FINANCIAL_INSTITUTION_PATTERN,
@@ -16,21 +17,20 @@ from app.services.lowmem_entity_utils import (
     deduplicate_results,
     find_value_span,
     infer_semantic_type,
+    iter_docx_structure_units,
     is_generic_organization_term,
     is_government_institution_text,
     is_official_institution_text,
-    is_non_subject_action_or_function_term,
-    is_non_subject_generic_org_reference,
     is_probable_person,
-    is_weak_function_stripped_org,
     find_short_org_prefix_before_non_subject_boundary,
+    looks_like_short_org_with_company_suffix,
     looks_like_organization_short_name,
     normalize_entity_text,
     remap_sanitized_span,
+    resolve_docx_unit_spans,
     sanitize_recognition_text,
     short_org_boundary_has_strong_surface,
     strip_leading_subject_function_words,
-    subject_noun_gate,
 )
 
 
@@ -222,13 +222,7 @@ class TypeRuleRecognizers:
         r"^(?:由|并由|后续由|随后由|另由|另行由|同时由|共同由|分别由|"
         r"通过|经过|经由|根据|依据|按照|要求|通知|说明|确认|请求|判令|"
         r"向|对|与|和|及|以及|将|把|被|为|"
-        r"甲方|乙方|丙方|原告|被告|申请人|被申请人|第三人)\s*[:：]?\s*"
-    )
-    ORG_PREFIX_NOISE = re.compile(
-        r"^(?:由|并由|后续由|随后由|另由|另行由|同时由|共同由|分别由|"
-        r"通过|经过|经由|根据|依据|按照|要求|通知|说明|确认|请求|判令|"
-        r"向|对|与|和|及|以及|将|把|被|为|"
-        r"甲方|乙方|丙方|原告|被告|申请人|被申请人|第三人)\s*[:：]?\s*"
+        r"甲方|乙方|丙方|原告|被告|申请人|被申请人|第三人)\s*[:：]?\s*[（(《【]?\s*"
     )
     STRUCTURE_UNIT_CONTAINERS = {
         "table_cell",
@@ -246,17 +240,26 @@ class TypeRuleRecognizers:
         *,
         source_structure: dict[str, Any] | None = None,
     ) -> list[RecognizerResult]:
-        results = self._recognize_text_subjects(text)
+        results = self._recognize_docx_structure_units(text, source_structure)
+        seen_spans = {(item.entity_type, item.start, item.end) for item in results}
+        for result in self._recognize_text_subjects(text):
+            key = (result.entity_type, result.start, result.end)
+            if key in seen_spans:
+                continue
+            seen_spans.add(key)
+            results.append(result)
         sanitized_text, index_map = sanitize_recognition_text(text)
         if sanitized_text and sanitized_text != text:
-            results.extend(
-                self._remap_sanitized_text_results(
-                    source_text=text,
-                    index_map=index_map,
-                    results=self._recognize_text_subjects(sanitized_text),
-                )
-            )
-        results.extend(self._recognize_docx_structure_units(text, source_structure))
+            for result in self._remap_sanitized_text_results(
+                source_text=text,
+                index_map=index_map,
+                results=self._recognize_text_subjects(sanitized_text),
+            ):
+                key = (result.entity_type, result.start, result.end)
+                if key in seen_spans:
+                    continue
+                seen_spans.add(key)
+                results.append(result)
         return deduplicate_results(results)
 
     def _recognize_text_subjects(self, text: str) -> list[RecognizerResult]:
@@ -305,20 +308,27 @@ class TypeRuleRecognizers:
     def _recognize_organizations(self, text: str) -> list[RecognizerResult]:
         results: list[RecognizerResult] = []
         seen_spans: set[tuple[int, int]] = set()
-        for raw_start, raw_end, matched_text, sanitized_match in self._iter_sanitized_pattern_matches(text, OFFICIAL_INSTITUTION_PATTERN):
+        for (
+            raw_start,
+            raw_end,
+            matched_text,
+            sanitized_match,
+            normalized_match_text,
+        ) in self._iter_sanitized_pattern_matches(text, OFFICIAL_INSTITUTION_PATTERN):
             official_spans = self._official_spans_from_match(text, raw_start, raw_end)
             for start, end in official_spans:
                 if (start, end) in seen_spans:
                     continue
                 value = text[start:end]
-                if not is_official_institution_text(value):
+                normalized_value = normalize_entity_text(value)
+                normalized_for_gate = normalized_match_text if sanitized_match else normalized_value
+                if not is_official_institution_text(normalized_for_gate):
                     continue
                 entity_type = "GOVERNMENT"
-                metadata = {"official_institution": True}
+                metadata = {"official_institution": True, "normalized_text": normalized_for_gate}
                 if sanitized_match:
                     metadata["sanitized_rule_match"] = True
-                    metadata["normalized_text"] = normalize_entity_text(value)
-                if is_government_institution_text(value):
+                if is_government_institution_text(normalized_for_gate):
                     metadata["official_institution_family"] = "government"
                 else:
                     metadata["official_institution_family"] = "financial"
@@ -327,7 +337,13 @@ class TypeRuleRecognizers:
                     metadata["official_institution_pollution_repaired"] = True
                 seen_spans.add((start, end))
                 results.append(self._make(start, end, entity_type, text, "rule_official_institution", 0.91, metadata=metadata))
-        for raw_start, raw_end, matched_text, sanitized_match in self._iter_sanitized_pattern_matches(text, ORG_PATTERN):
+        for (
+            raw_start,
+            raw_end,
+            matched_text,
+            sanitized_match,
+            normalized_match_text,
+        ) in self._iter_sanitized_pattern_matches(text, ORG_PATTERN):
             span = self._clean_organization_match(text, raw_start, raw_end)
             if not span:
                 continue
@@ -335,19 +351,23 @@ class TypeRuleRecognizers:
             if (start, end) in seen_spans:
                 continue
             value = text[start:end]
-            entity_type = canonical_default_entity_type("COURT" if "法院" in value else "ORGANIZATION", value) or "ORGANIZATION"
-            if not self._is_strong_rule_organization_value(value, entity_type=entity_type):
+            normalized_value = normalize_entity_text(value)
+            normalized_for_gate = normalized_match_text if sanitized_match and (start, end) == (raw_start, raw_end) else normalized_value
+            entity_type = canonical_default_entity_type(
+                "COURT" if "法院" in normalized_for_gate else "ORGANIZATION",
+                normalized_for_gate,
+            ) or "ORGANIZATION"
+            if not self._is_strong_rule_organization_value(normalized_for_gate, entity_type=entity_type):
                 continue
-            metadata = {}
+            metadata = {"normalized_text": normalized_for_gate}
             if sanitized_match:
                 metadata["sanitized_rule_match"] = True
-                metadata["normalized_text"] = normalize_entity_text(value)
             if entity_type == "GOVERNMENT":
-                if not is_official_institution_text(value):
+                if not is_official_institution_text(normalized_for_gate):
                     continue
                 metadata["official_institution"] = True
                 metadata["official_institution_family"] = (
-                    "government" if is_government_institution_text(value) else "financial"
+                    "government" if is_government_institution_text(normalized_for_gate) else "financial"
                 )
             if (start, end) != (raw_start, raw_end):
                 metadata["boundary_repaired_from"] = matched_text
@@ -357,24 +377,35 @@ class TypeRuleRecognizers:
         for match in label_pattern.finditer(text or ""):
             label = match.group("label")
             value = _BACKFILL_CLEANER._clean_label_value(match.group("value") or "", "ORGANIZATION", label)
-            span = find_value_span(text, value, search_start=match.start("value"), search_end=match.end("value"))
+            cleaned_span = self._clean_label_organization_value_span(
+                text,
+                value,
+                search_start=match.start("value"),
+                search_end=match.end("value"),
+            )
+            if cleaned_span is None:
+                continue
+            value, span = cleaned_span
+            normalized_value = normalize_entity_text(value)
             if not span:
                 continue
-            entity_type = infer_semantic_type(value, label)
-            if not entity_type and looks_like_organization_short_name(value):
+            entity_type = infer_semantic_type(normalized_value, label)
+            if not entity_type and looks_like_organization_short_name(normalized_value):
                 entity_type = "ORGANIZATION"
-            entity_type = canonical_default_entity_type(entity_type, value)
+            entity_type = canonical_default_entity_type(entity_type, normalized_value)
             if entity_type not in {"ORGANIZATION", "GOVERNMENT"}:
                 continue
-            if not subject_noun_gate(
+            if not SubjectAdmissionGate.passes_subject_shape(
                 entity_type,
-                value,
-                allow_short_org=entity_type == "ORGANIZATION" and looks_like_organization_short_name(value),
+                normalized_value,
+                allow_short_org=entity_type == "ORGANIZATION" and looks_like_organization_short_name(normalized_value),
             )[0]:
                 continue
             start, end = span
-            metadata = {"label": label, "source_layer": "structure"}
-            if entity_type == "ORGANIZATION" and looks_like_organization_short_name(value):
+            metadata = {"label": label, "source_layer": "structure", "normalized_text": normalized_value}
+            if value != _BACKFILL_CLEANER._clean_label_value(match.group("value") or "", "ORGANIZATION", label):
+                metadata["boundary_repaired_from"] = match.group("value")
+            if entity_type == "ORGANIZATION" and looks_like_organization_short_name(normalized_value):
                 metadata["short_org_candidate"] = True
                 metadata["requires_manual_review"] = True
             results.append(
@@ -389,6 +420,30 @@ class TypeRuleRecognizers:
                 )
             )
         return results
+
+    def _clean_label_organization_value_span(
+        self,
+        text: str,
+        value: str,
+        *,
+        search_start: int,
+        search_end: int,
+    ) -> tuple[str, tuple[int, int]] | None:
+        span = find_value_span(text, value, search_start=search_start, search_end=search_end)
+        if not span:
+            return None
+        start, end = span
+        cleaned_span = self._clean_organization_match(text, start, end)
+        if cleaned_span is not None:
+            clean_start, clean_end = cleaned_span
+            if clean_end > clean_start:
+                return text[clean_start:clean_end], (clean_start, clean_end)
+        stripped = value.strip(" \t\r\n，,；;。:：、（）()《》【】")
+        if stripped and stripped != value:
+            stripped_span = find_value_span(text, stripped, search_start=start, search_end=end)
+            if stripped_span:
+                return stripped, stripped_span
+        return value, span
 
     def _recognize_function_context_short_orgs(self, text: str) -> list[RecognizerResult]:
         """Recall short organization subjects only when context supplies both boundaries."""
@@ -550,7 +605,10 @@ class TypeRuleRecognizers:
     @staticmethod
     def _is_usable_context_short_org(value: str, *, right_cue: str = "") -> bool:
         normalized = normalize_entity_text(value)
-        if not normalized or not looks_like_organization_short_name(normalized):
+        if not normalized or not (
+            looks_like_organization_short_name(normalized)
+            or looks_like_short_org_with_company_suffix(normalized)
+        ):
             return False
         if TypeRuleRecognizers._looks_like_non_subject_short_context(normalized):
             return False
@@ -560,11 +618,16 @@ class TypeRuleRecognizers:
         )
         if is_probable_person(normalized) and not org_context_right_cue:
             return False
-        if is_non_subject_action_or_function_term(normalized):
+        if SubjectAdmissionGate.is_action_or_function_text(normalized):
             return False
-        if is_non_subject_generic_org_reference(normalized) or is_generic_organization_term(normalized):
+        if SubjectAdmissionGate.is_generic_org_reference(normalized) or is_generic_organization_term(normalized):
             return False
-        return subject_noun_gate("ORGANIZATION", normalized, allow_short_org=True)[0]
+        passed, _reason = SubjectAdmissionGate.passes_subject_shape(
+            "ORGANIZATION",
+            normalized,
+            allow_short_org=looks_like_organization_short_name(normalized),
+        )
+        return passed or looks_like_short_org_with_company_suffix(normalized) or short_org_boundary_has_strong_surface(normalized)
 
     @staticmethod
     def _is_strong_rule_organization_value(value: str, *, entity_type: str) -> bool:
@@ -615,21 +678,23 @@ class TypeRuleRecognizers:
             return []
         results: list[RecognizerResult] = []
         seen: set[tuple[str, int, int]] = set()
-        for unit in self._iter_docx_units(source_structure):
+        units = resolve_docx_unit_spans(text, self._iter_docx_units(source_structure))
+        for result in self._recognize_docx_table_label_neighbors(text, units):
+            key = (result.entity_type, result.start, result.end)
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append(result)
+        for unit in units:
             unit_text = str(unit.get("text") or "")
             if not unit_text.strip():
                 continue
             container_type = str(unit.get("container_type") or unit.get("unit_type") or "").strip()
             if container_type not in self.STRUCTURE_UNIT_CONTAINERS:
                 continue
-            unit_start = self._coerce_int(unit.get("start"), -1)
-            unit_end = self._coerce_int(unit.get("end"), -1)
-            if unit_start < 0 or unit_end <= unit_start or text[unit_start:unit_end] != unit_text:
-                found = text.find(unit_text)
-                if found < 0:
-                    continue
-                unit_start = found
-                unit_end = found + len(unit_text)
+            unit_start, unit_end = self._resolve_docx_unit_span(text, unit)
+            if unit_start < 0 or unit_end <= unit_start:
+                continue
             for local in self._recognize_unit_subject_shapes(unit_text, container_type):
                 start = unit_start + int(local.start)
                 end = unit_start + int(local.end)
@@ -654,50 +719,411 @@ class TypeRuleRecognizers:
                 )
         return results
 
+    def _recognize_docx_table_label_neighbors(
+        self,
+        text: str,
+        units: list[dict[str, Any]],
+    ) -> list[RecognizerResult]:
+        table_units = [unit for unit in units if self._is_docx_table_unit(unit)]
+        if not table_units:
+            return []
+
+        label_specs = {str(spec["label"]): dict(spec) for spec in _BACKFILL_LABEL_SPECS}
+        by_table_row: dict[tuple[str, int, int], list[dict[str, Any]]] = {}
+        for unit in table_units:
+            table_index = self._coerce_int(unit.get("table_index"), 0)
+            row_index = self._coerce_int(unit.get("row_index"), 0)
+            if table_index < 0 or row_index < 0:
+                continue
+            part_name = str(unit.get("part_name") or "")
+            by_table_row.setdefault((part_name, table_index, row_index), []).append(unit)
+
+        results: list[RecognizerResult] = []
+        seen: set[tuple[str, int, int]] = set()
+        row_lookup = {
+            key: self._ordered_docx_row_units(value)
+            for key, value in by_table_row.items()
+        }
+        for row_key in sorted(row_lookup, key=lambda item: (item[0], item[1], item[2])):
+            row_units = row_lookup.get(row_key) or []
+            for result in self._recognize_inline_table_label_neighbors(
+                text=text,
+                row_units=row_units,
+                label_specs=label_specs,
+            ):
+                key = (result.entity_type, result.start, result.end)
+                if key not in seen:
+                    seen.add(key)
+                    results.append(result)
+            for result in self._recognize_adjacent_unit_label_neighbors(
+                text=text,
+                row_units=row_units,
+                label_specs=label_specs,
+                trigger="docx_table_label_neighbor",
+            ):
+                key = (result.entity_type, result.start, result.end)
+                if key not in seen:
+                    seen.add(key)
+                    results.append(result)
+
+            next_row_key = (row_key[0], row_key[1], row_key[2] + 1)
+            next_row_units = row_lookup.get(next_row_key) or []
+            if not next_row_units:
+                continue
+            for result in self._recognize_stacked_unit_label_neighbors(
+                text=text,
+                label_units=row_units,
+                value_units=next_row_units,
+                label_specs=label_specs,
+            ):
+                key = (result.entity_type, result.start, result.end)
+                if key not in seen:
+                    seen.add(key)
+                    results.append(result)
+
+        return deduplicate_results(results)
+
+    def _recognize_inline_table_label_neighbors(
+        self,
+        *,
+        text: str,
+        row_units: list[dict[str, Any]],
+        label_specs: dict[str, dict[str, Any]],
+    ) -> list[RecognizerResult]:
+        results: list[RecognizerResult] = []
+        for unit in row_units:
+            unit_text = str(unit.get("text") or "")
+            if "\t" not in unit_text:
+                continue
+            unit_start, unit_end = self._resolve_docx_unit_span(text, unit)
+            if unit_start < 0 or unit_end <= unit_start:
+                continue
+            cells = self._split_docx_table_cells(unit_text)
+            if len(cells) < 2:
+                continue
+            for index, (cell_text, _cell_start, _cell_end) in enumerate(cells[:-1]):
+                label = self._normalize_table_label(cell_text, label_specs)
+                if not label:
+                    continue
+                value_text, value_start, value_end = cells[index + 1]
+                result = self._make_docx_table_label_neighbor_result(
+                    source_text=text,
+                    unit=unit,
+                    label=label,
+                    raw_value=value_text,
+                    value_start=unit_start + value_start,
+                    value_end=unit_start + value_end,
+                    trigger="docx_table_label_neighbor",
+                )
+                if result:
+                    results.append(result)
+        return results
+
+    def _recognize_adjacent_unit_label_neighbors(
+        self,
+        *,
+        text: str,
+        row_units: list[dict[str, Any]],
+        label_specs: dict[str, dict[str, Any]],
+        trigger: str,
+    ) -> list[RecognizerResult]:
+        results: list[RecognizerResult] = []
+        if len(row_units) < 2:
+            return results
+        for index, unit in enumerate(row_units[:-1]):
+            label = self._normalize_table_label(str(unit.get("text") or ""), label_specs)
+            if not label:
+                continue
+            value_unit = row_units[index + 1]
+            result = self._make_docx_table_label_neighbor_from_unit(
+                text=text,
+                label=label,
+                value_unit=value_unit,
+                trigger=trigger,
+            )
+            if result:
+                results.append(result)
+        return results
+
+    def _recognize_stacked_unit_label_neighbors(
+        self,
+        *,
+        text: str,
+        label_units: list[dict[str, Any]],
+        value_units: list[dict[str, Any]],
+        label_specs: dict[str, dict[str, Any]],
+    ) -> list[RecognizerResult]:
+        results: list[RecognizerResult] = []
+        max_count = min(len(label_units), len(value_units))
+        for index in range(max_count):
+            label = self._normalize_table_label(str(label_units[index].get("text") or ""), label_specs)
+            if not label:
+                continue
+            result = self._make_docx_table_label_neighbor_from_unit(
+                text=text,
+                label=label,
+                value_unit=value_units[index],
+                trigger="docx_table_stacked_label_neighbor",
+            )
+            if result:
+                results.append(result)
+        return results
+
+    def _make_docx_table_label_neighbor_from_unit(
+        self,
+        *,
+        text: str,
+        label: str,
+        value_unit: dict[str, Any],
+        trigger: str,
+    ) -> RecognizerResult | None:
+        unit_text = str(value_unit.get("text") or "")
+        unit_start, unit_end = self._resolve_docx_unit_span(text, value_unit)
+        if unit_start < 0 or unit_end <= unit_start:
+            return None
+        return self._make_docx_table_label_neighbor_result(
+            source_text=text,
+            unit=value_unit,
+            label=label,
+            raw_value=unit_text,
+            value_start=unit_start,
+            value_end=unit_end,
+            trigger=trigger,
+        )
+
+    def _make_docx_table_label_neighbor_result(
+        self,
+        *,
+        source_text: str,
+        unit: dict[str, Any],
+        label: str,
+        raw_value: str,
+        value_start: int,
+        value_end: int,
+        trigger: str,
+    ) -> RecognizerResult | None:
+        spec = next((item for item in _BACKFILL_LABEL_SPECS if str(item.get("label") or "") == label), None)
+        if not spec:
+            return None
+        raw_type = str(spec.get("type") or "")
+        cleaned = _BACKFILL_CLEANER._clean_label_value(raw_value, raw_type, label)
+        if not cleaned and raw_type == "PERSON":
+            compact = re.sub(r"\s+", "", raw_value or "")
+            if is_probable_person(compact):
+                cleaned = compact
+        if not cleaned:
+            return None
+        span = find_value_span(source_text, cleaned, search_start=value_start, search_end=value_end)
+        if not span:
+            span = self._find_compact_span(source_text, re.sub(r"\s+", "", cleaned), value_start, value_end)
+        if not span:
+            return None
+        start, end = span
+        if start < value_start or end > value_end or start < 0 or end <= start:
+            return None
+        value = source_text[start:end]
+        entity_type = self._resolve_table_label_entity_type(value, label, raw_type)
+        if entity_type not in {"PERSON", "ORGANIZATION", "LOCATION", "GOVERNMENT"}:
+            return None
+        allow_short_org = entity_type == "ORGANIZATION" and looks_like_organization_short_name(value)
+        passed, _reason = SubjectAdmissionGate.passes_subject_shape(
+            entity_type,
+            value,
+            allow_short_org=allow_short_org,
+        )
+        if not passed:
+            return None
+        container_type = str(unit.get("container_type") or unit.get("unit_type") or "")
+        metadata = self._unit_metadata(unit, container_type)
+        metadata.update(
+            {
+                "label": label,
+                "role": spec.get("role"),
+                "trigger": trigger,
+                "recognition_channel": self._table_neighbor_channel_for(entity_type),
+                "normalized_text": normalize_entity_text(value),
+                "identity_surface": normalize_entity_text(value),
+            }
+        )
+        if entity_type == "GOVERNMENT":
+            metadata["official_institution"] = True
+            metadata["official_institution_family"] = (
+                "government" if is_government_institution_text(value) else "financial"
+            )
+        if entity_type == "ORGANIZATION" and looks_like_organization_short_name(value):
+            metadata["short_org_candidate"] = True
+            metadata["requires_manual_review"] = True
+        return RecognizerResult(
+            entity_type=entity_type,
+            start=start,
+            end=end,
+            score=0.93 if trigger == "docx_table_label_neighbor" else 0.92,
+            text=value,
+            source="rule_docx_structure",
+            metadata=metadata,
+        )
+
+    @staticmethod
+    def _table_neighbor_channel_for(entity_type: str) -> str:
+        normalized_type = str(entity_type or "").strip().upper()
+        if normalized_type == "PERSON":
+            return "person_table_neighbor"
+        if normalized_type == "LOCATION":
+            return "location_table_neighbor"
+        if normalized_type == "GOVERNMENT":
+            return "government_table_neighbor"
+        return "organization_table_neighbor"
+
+    @staticmethod
+    def _resolve_table_label_entity_type(value: str, label: str, raw_type: str) -> str:
+        resolved = raw_type
+        if raw_type == "ROLE_SUBJECT":
+            resolved = infer_semantic_type(value, label)
+            if not resolved and looks_like_organization_short_name(value):
+                resolved = "ORGANIZATION"
+        elif raw_type == "ORGANIZATION":
+            if is_probable_person(value):
+                resolved = "PERSON"
+            else:
+                inferred = infer_semantic_type(value, label)
+                if inferred in {"ORGANIZATION", "GOVERNMENT", "PERSON", "LOCATION", "ADDRESS"}:
+                    resolved = inferred
+                elif looks_like_organization_short_name(value):
+                    resolved = "ORGANIZATION"
+        elif raw_type == "PERSON":
+            resolved = "PERSON"
+        elif raw_type == "LOCATION":
+            resolved = "LOCATION"
+        if resolved == "ADDRESS":
+            resolved = "LOCATION"
+        return canonical_default_entity_type(resolved, value)
+
+    @staticmethod
+    def _normalize_table_label(text: str, label_specs: dict[str, dict[str, Any]]) -> str:
+        compact = re.sub(r"[\s:：，,。；;（）()《》【】\"“”'`]", "", text or "")
+        compact = re.sub(r"[一二三四五六七八九十甲乙丙丁ABCDEFabcdef\d]{1,3}$", "", compact)
+        if compact in label_specs:
+            return compact
+        for label in sorted(label_specs, key=len, reverse=True):
+            if compact.startswith(label):
+                suffix = compact[len(label):]
+                if not suffix or re.fullmatch(r"[一二三四五六七八九十甲乙丙丁ABCDEFabcdef\d]{1,3}", suffix):
+                    return label
+        return ""
+
+    @staticmethod
+    def _split_docx_table_cells(unit_text: str) -> list[tuple[str, int, int]]:
+        cells: list[tuple[str, int, int]] = []
+        cursor = 0
+        for piece in unit_text.split("\t"):
+            raw_start = cursor
+            raw_end = cursor + len(piece)
+            stripped = piece.strip()
+            if stripped:
+                leading = len(piece) - len(piece.lstrip())
+                start = raw_start + leading
+                cells.append((stripped, start, start + len(stripped)))
+            cursor = raw_end + 1
+        return cells
+
+    @staticmethod
+    def _is_docx_table_unit(unit: dict[str, Any]) -> bool:
+        container_type = str(unit.get("container_type") or unit.get("unit_type") or "").strip()
+        return container_type == "table_cell" or TypeRuleRecognizers._coerce_int(unit.get("table_index"), 0) > 0
+
+    @staticmethod
+    def _ordered_docx_row_units(units: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return sorted(
+            units,
+            key=lambda unit: (
+                TypeRuleRecognizers._coerce_int(unit.get("col_index"), 0),
+                TypeRuleRecognizers._coerce_int(unit.get("order_index"), 0),
+                TypeRuleRecognizers._coerce_int(unit.get("start"), 0),
+            ),
+        )
+
+    @staticmethod
+    def _resolve_docx_unit_span(text: str, unit: dict[str, Any]) -> tuple[int, int]:
+        resolved_start = TypeRuleRecognizers._coerce_int(unit.get("_resolved_start"), -1)
+        resolved_end = TypeRuleRecognizers._coerce_int(unit.get("_resolved_end"), -1)
+        if resolved_start >= 0 and resolved_end > resolved_start:
+            return resolved_start, resolved_end
+        unit_text = str(unit.get("text") or "")
+        unit_start = TypeRuleRecognizers._coerce_int(unit.get("start"), -1)
+        unit_end = TypeRuleRecognizers._coerce_int(unit.get("end"), -1)
+        if unit_start >= 0 and unit_end > unit_start and text[unit_start:unit_end] == unit_text:
+            return unit_start, unit_end
+        return -1, -1
+
     def _recognize_unit_subject_shapes(self, unit_text: str, container_type: str) -> list[RecognizerResult]:
         results: list[RecognizerResult] = []
         seen_spans: set[tuple[int, int]] = set()
-        for raw_start, raw_end, matched_text, sanitized_match in self._iter_sanitized_pattern_matches(unit_text, OFFICIAL_INSTITUTION_PATTERN):
+        for (
+            raw_start,
+            raw_end,
+            matched_text,
+            sanitized_match,
+            normalized_match_text,
+        ) in self._iter_sanitized_pattern_matches(unit_text, OFFICIAL_INSTITUTION_PATTERN):
             span = self._clean_organization_match(unit_text, raw_start, raw_end)
             if not span or span in seen_spans:
                 continue
             start, end = span
             value = unit_text[start:end]
-            if not is_official_institution_text(value):
+            normalized_value = normalize_entity_text(value)
+            normalized_for_gate = normalized_match_text if sanitized_match and span == (raw_start, raw_end) else normalized_value
+            if not is_official_institution_text(normalized_for_gate):
                 continue
             seen_spans.add(span)
             metadata = {
                 "trigger": "docx_structure_unit_rule_pass",
                 "source_layer": "structure",
                 "official_institution": True,
-                "official_institution_family": "government" if is_government_institution_text(value) else "financial",
-                "normalized_text": normalize_entity_text(value),
+                "official_institution_family": "government" if is_government_institution_text(normalized_for_gate) else "financial",
+                "normalized_text": normalized_for_gate,
             }
             if sanitized_match:
                 metadata["sanitized_rule_match"] = True
             if span != (raw_start, raw_end):
                 metadata["boundary_repaired_from"] = matched_text
             results.append(self._make(start, end, "GOVERNMENT", unit_text, "rule_docx_structure", 0.89, metadata=metadata))
-        for raw_start, raw_end, matched_text, sanitized_match in self._iter_sanitized_pattern_matches(unit_text, ORG_PATTERN):
+        for (
+            raw_start,
+            raw_end,
+            matched_text,
+            sanitized_match,
+            normalized_match_text,
+        ) in self._iter_sanitized_pattern_matches(unit_text, ORG_PATTERN):
             span = self._clean_organization_match(unit_text, raw_start, raw_end)
             if not span or span in seen_spans:
                 continue
             start, end = span
             value = unit_text[start:end]
-            entity_type = canonical_default_entity_type("COURT" if "法院" in value else "ORGANIZATION", value)
+            normalized_value = normalize_entity_text(value)
+            normalized_for_gate = normalized_match_text if sanitized_match and span == (raw_start, raw_end) else normalized_value
+            entity_type = canonical_default_entity_type(
+                "COURT" if "法院" in normalized_for_gate else "ORGANIZATION",
+                normalized_for_gate,
+            )
             if entity_type not in {"ORGANIZATION", "GOVERNMENT"}:
                 continue
-            if not subject_noun_gate(entity_type, value)[0]:
-                continue
+            passed, reason = SubjectAdmissionGate.passes_subject_shape(
+                entity_type,
+                normalized_for_gate,
+                allow_short_org=entity_type == "ORGANIZATION" and looks_like_organization_short_name(normalized_for_gate),
+            )
             seen_spans.add(span)
             metadata = {
                 "trigger": "docx_structure_unit_rule_pass",
                 "source_layer": "structure",
-                "normalized_text": normalize_entity_text(value),
+                "normalized_text": normalized_for_gate,
             }
+            if not passed:
+                metadata["requires_manual_review"] = True
+                metadata["subject_admission_prefilter_reason"] = reason
             if entity_type == "GOVERNMENT":
                 metadata["official_institution"] = True
-                metadata["official_institution_family"] = "government" if is_government_institution_text(value) else "financial"
+                metadata["official_institution_family"] = "government" if is_government_institution_text(normalized_for_gate) else "financial"
             if sanitized_match:
                 metadata["sanitized_rule_match"] = True
             if span != (raw_start, raw_end):
@@ -718,7 +1144,7 @@ class TypeRuleRecognizers:
         if prefix and prefix.end() < local_end:
             local_start = prefix.end()
             prefix_consumed = True
-        candidate = value[local_start:local_end].strip(" \t\r\n，,；;。:：、")
+        candidate = value[local_start:local_end].strip(" \t\r\n，,；;。:：、（）()《》【】")
         if not candidate:
             return None
         local_start += value[local_start:local_end].find(candidate)
@@ -726,17 +1152,32 @@ class TypeRuleRecognizers:
         normalized = normalize_entity_text(candidate)
         if not normalized or is_generic_organization_term(normalized):
             return None
-        if prefix_consumed and is_weak_function_stripped_org(candidate):
+        embedded = self._embedded_organization_span_after_boundary(value)
+        if embedded is not None:
+            embedded_start, embedded_end = embedded
+            if embedded_start > local_start:
+                local_start = embedded_start
+                local_end = embedded_end
+                candidate = value[local_start:local_end]
+                normalized = normalize_entity_text(candidate)
+        prefix_stripped_short_subject = bool(
+            prefix_consumed
+            and SubjectAdmissionGate.is_weak_function_stripped_subject(candidate)
+            and looks_like_organization_short_name(normalized)
+        )
+        if SubjectAdmissionGate.is_generic_org_reference(normalized):
             return None
-        if is_non_subject_generic_org_reference(normalized):
-            return None
-        if is_non_subject_action_or_function_term(normalized):
+        if SubjectAdmissionGate.is_action_or_function_text(normalized):
             return None
         if re.search(r"(?:是否|以及|但是|因此|判令|请求|事实与理由)", normalized) and len(normalized) >= 12:
             return None
         entity_type = "GOVERNMENT" if is_official_institution_text(normalized) else "ORGANIZATION"
-        if not subject_noun_gate(entity_type, normalized)[0]:
-            embedded = self._embedded_organization_span_after_boundary(value)
+        passes_shape, _reason = SubjectAdmissionGate.passes_subject_shape(
+            entity_type,
+            normalized,
+            allow_short_org=prefix_stripped_short_subject,
+        )
+        if not passes_shape:
             if embedded is None:
                 return None
             embedded_start, embedded_end = embedded
@@ -745,7 +1186,11 @@ class TypeRuleRecognizers:
             candidate = value[local_start:local_end]
             normalized = normalize_entity_text(candidate)
             entity_type = "GOVERNMENT" if is_official_institution_text(normalized) else "ORGANIZATION"
-            if not subject_noun_gate(entity_type, normalized)[0]:
+            if not SubjectAdmissionGate.passes_subject_shape(
+                entity_type,
+                normalized,
+                allow_short_org=looks_like_organization_short_name(normalized),
+            )[0]:
                 return None
         return start + local_start, start + local_end
 
@@ -757,7 +1202,7 @@ class TypeRuleRecognizers:
             return None
         boundary_pattern = re.compile(
             r"(?:股份有限公司|有限责任公司|集团有限公司|有限公司|分公司|子公司|公司|集团|"
-            r"[ \t\r\n,，;；。:：、]|与|和|及|以及|向|对|由|通过|经过|经由|根据|依据|按照|"
+            r"[ \t\r\n,，;；。:：、（）()《》【】]|与|和|及|以及|向|对|由|通过|经过|经由|根据|依据|按照|"
             r"要求|通知|说明|确认|请求|判令|将|把|被|为)"
         )
         candidates: list[tuple[int, int]] = []
@@ -765,7 +1210,7 @@ class TypeRuleRecognizers:
             offset = boundary.end()
             if offset >= len(value):
                 continue
-            suffix = value[offset:].lstrip(" \t\r\n,，;；。:：、")
+            suffix = value[offset:].lstrip(" \t\r\n,，;；。:：、（）()《》【】")
             if not suffix:
                 continue
             delta = value[offset:].find(suffix)
@@ -776,11 +1221,11 @@ class TypeRuleRecognizers:
                     continue
                 local_end = local_start + match.end()
                 candidate = value[local_start:local_end]
-                if is_weak_function_stripped_org(candidate):
+                if SubjectAdmissionGate.is_weak_function_stripped_subject(candidate):
                     continue
                 normalized = normalize_entity_text(candidate)
                 entity_type = "GOVERNMENT" if is_official_institution_text(normalized) else "ORGANIZATION"
-                if subject_noun_gate(entity_type, normalized)[0]:
+                if SubjectAdmissionGate.passes_subject_shape(entity_type, normalized)[0]:
                     candidates.append((local_start, local_end))
         if not candidates:
             return None
@@ -791,8 +1236,12 @@ class TypeRuleRecognizers:
         value = text[start:end]
         if not value:
             return []
-        if is_official_institution_text(value):
-            return [(start, end)]
+        cleaned_span = TypeRuleRecognizers()._clean_organization_match(text, start, end)
+        if cleaned_span is not None:
+            cleaned_start, cleaned_end = cleaned_span
+            cleaned_value = text[cleaned_start:cleaned_end]
+            if is_official_institution_text(cleaned_value):
+                return [(cleaned_start, cleaned_end)]
 
         spans: list[tuple[int, int]] = []
         embedded = TypeRuleRecognizers._embedded_organization_span_after_boundary(value)
@@ -840,10 +1289,10 @@ class TypeRuleRecognizers:
     def _iter_sanitized_pattern_matches(
         text: str,
         pattern: re.Pattern[str],
-    ) -> list[tuple[int, int, str, bool]]:
+    ) -> list[tuple[int, int, str, bool, str]]:
         if not text:
             return []
-        matches: list[tuple[int, int, str, bool]] = []
+        matches: list[tuple[int, int, str, bool, str]] = []
         seen: set[tuple[int, int, str]] = set()
         for match in pattern.finditer(text):
             start, end = match.span()
@@ -851,7 +1300,7 @@ class TypeRuleRecognizers:
             if key in seen:
                 continue
             seen.add(key)
-            matches.append((start, end, match.group(), False))
+            matches.append((start, end, match.group(), False, normalize_entity_text(match.group())))
 
         sanitized_text, index_map = sanitize_recognition_text(text)
         if sanitized_text == text:
@@ -862,11 +1311,12 @@ class TypeRuleRecognizers:
                 continue
             start, end = span
             matched_text = text[start:end]
+            normalized_match_text = normalize_entity_text(match.group())
             key = (start, end, matched_text)
             if key in seen:
                 continue
             seen.add(key)
-            matches.append((start, end, matched_text, True))
+            matches.append((start, end, matched_text, True, normalized_match_text))
         matches.sort(key=lambda item: (item[0], item[1], item[2]))
         return matches
 
@@ -920,31 +1370,7 @@ class TypeRuleRecognizers:
         return index_map[local], index_map[local + len(compact_value) - 1] + 1
 
     def _iter_docx_units(self, source_structure: dict[str, Any]):
-        seen_unit_ids: set[str] = set()
-        raw_units = source_structure.get("docx_text_units")
-        if isinstance(raw_units, list):
-            for unit in raw_units:
-                if not isinstance(unit, dict):
-                    continue
-                unit_id = str(unit.get("unit_id") or "")
-                if unit_id:
-                    seen_unit_ids.add(unit_id)
-                yield unit
-        pages = source_structure.get("pages")
-        if not isinstance(pages, list):
-            return
-        for page in pages:
-            if not isinstance(page, dict) or not isinstance(page.get("units"), list):
-                continue
-            for unit in page["units"]:
-                if not isinstance(unit, dict):
-                    continue
-                unit_id = str(unit.get("unit_id") or "")
-                if unit_id and unit_id in seen_unit_ids:
-                    continue
-                if unit_id:
-                    seen_unit_ids.add(unit_id)
-                yield unit
+        yield from iter_docx_structure_units(source_structure)
 
     @staticmethod
     def _unit_metadata(unit: dict[str, Any], container_type: str) -> dict[str, Any]:
@@ -962,6 +1388,8 @@ class TypeRuleRecognizers:
             "docx_row_index": unit.get("row_index"),
             "docx_col_index": unit.get("col_index"),
             "docx_rewrite_policy": rewrite_policy,
+            "docx_span_resolution": unit.get("_span_resolution"),
+            "docx_resolved_order_index": unit.get("_resolved_order_index"),
             "docx_review_required": rewrite_policy != "exact",
         }
 

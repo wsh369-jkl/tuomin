@@ -11,9 +11,11 @@ from app.services.lowmem_entity_utils import (
     ORG_PATTERN,
     deduplicate_results,
     infer_semantic_type,
+    iter_docx_structure_units,
     is_probable_person,
     looks_like_organization_short_name,
     remap_sanitized_span,
+    resolve_docx_unit_spans,
 )
 
 
@@ -47,7 +49,7 @@ class DocxStructureBackfillService:
         text: str,
         source_structure: dict[str, Any] | None,
     ) -> List[RecognizerResult]:
-        units = self._extract_units(source_structure)
+        units = resolve_docx_unit_spans(text or "", self._extract_units(source_structure))
         if not text or not units:
             return []
 
@@ -62,11 +64,11 @@ class DocxStructureBackfillService:
         unit_text = str(unit.get("text") or "")
         if not unit_text.strip():
             return []
-        start = self._coerce_int(unit.get("start"), -1)
-        end = self._coerce_int(unit.get("end"), -1)
+        start = self._coerce_int(unit.get("_resolved_start"), -1)
+        end = self._coerce_int(unit.get("_resolved_end"), -1)
         if start < 0 or end <= start:
-            start = source_text.find(unit_text)
-            end = start + len(unit_text) if start >= 0 else -1
+            start = self._coerce_int(unit.get("start"), -1)
+            end = self._coerce_int(unit.get("end"), -1)
         if start < 0 or end <= start or source_text[start:end] != unit_text:
             return []
 
@@ -219,8 +221,7 @@ class DocxStructureBackfillService:
         unit_text = str(value_unit.get("text") or "")
         if not unit_text.strip():
             return None
-        unit_start = self._coerce_int(value_unit.get("start"), -1)
-        unit_end = self._coerce_int(value_unit.get("end"), -1)
+        unit_start, unit_end = self._resolve_unit_span(source_text, value_unit)
         if unit_start < 0 or unit_end <= unit_start or source_text[unit_start:unit_end] != unit_text:
             return None
         local = self._make_label_value_result(
@@ -249,6 +250,19 @@ class DocxStructureBackfillService:
             source=self.SOURCE,
             metadata=metadata,
         )
+
+    @classmethod
+    def _resolve_unit_span(cls, source_text: str, unit: dict[str, Any]) -> tuple[int, int]:
+        unit_text = str(unit.get("text") or "")
+        start = cls._coerce_int(unit.get("_resolved_start"), -1)
+        end = cls._coerce_int(unit.get("_resolved_end"), -1)
+        if start >= 0 and end > start and source_text[start:end] == unit_text:
+            return start, end
+        start = cls._coerce_int(unit.get("start"), -1)
+        end = cls._coerce_int(unit.get("end"), -1)
+        if start >= 0 and end > start and source_text[start:end] == unit_text:
+            return start, end
+        return -1, -1
 
     def _extract_org_suffix_entities(
         self,
@@ -589,27 +603,13 @@ class DocxStructureBackfillService:
             "docx_row_index": unit.get("row_index"),
             "docx_col_index": unit.get("col_index"),
             "docx_rewrite_policy": rewrite_policy,
+            "docx_span_resolution": unit.get("_span_resolution"),
+            "docx_resolved_order_index": unit.get("_resolved_order_index"),
             "docx_review_required": bool(review_required),
         }
 
     def _extract_units(self, source_structure: dict[str, Any] | None) -> List[dict[str, Any]]:
-        if not isinstance(source_structure, dict):
-            return []
-        units: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        raw_units = source_structure.get("docx_text_units")
-        if isinstance(raw_units, list):
-            for unit in raw_units:
-                self._append_unit(units, seen, unit)
-
-        pages = source_structure.get("pages")
-        if isinstance(pages, list):
-            for page in pages:
-                if not isinstance(page, dict) or not isinstance(page.get("units"), list):
-                    continue
-                for unit in page["units"]:
-                    self._append_unit(units, seen, unit)
-        return units
+        return [dict(unit) for unit in iter_docx_structure_units(source_structure)]
 
     def _append_unit(self, units: list[dict[str, Any]], seen: set[str], unit: Any) -> None:
         if not isinstance(unit, dict):

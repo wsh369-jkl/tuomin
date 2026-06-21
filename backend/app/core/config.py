@@ -348,6 +348,7 @@ class Settings(BaseSettings):
     ENABLE_PRIMARY_NER: bool = True
     ENABLE_SECONDARY_NER: bool = False
     ENABLE_QWEN_REVIEW: bool = True
+    DOCX_UNIT_MODEL_PASS_MAX_UNITS: int = 320
     LOWMEM_UNLOAD_PRIMARY_AFTER_STAGE: bool = True
     ANALYSIS_WORKER_PROCESS: bool = True
     ANALYSIS_STAGE_ISOLATION: bool = True

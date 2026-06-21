@@ -65,10 +65,16 @@ async def _run_primary_review_surface(payload: Dict[str, Any]) -> Dict[str, Any]
     review_entities = artifacts.get("pre_review_merged")
     if not isinstance(review_entities, list) or not review_entities:
         review_entities = list(entities)
+    review_only_candidates: list[Dict[str, Any]] = []
+    for key in ("rule_first_rejected_entities", "alias_backscan_review_candidates"):
+        rows = artifacts.get(key)
+        if isinstance(rows, list):
+            review_only_candidates.extend(dict(item) for item in rows if isinstance(item, dict))
 
     return {
         "entities": entities,
         "review_entities": review_entities,
+        "review_only_candidates": review_only_candidates,
         "statistics": engine.get_entity_statistics(entities),
         "analysis_metadata": _get_analysis_metadata(engine, llm_model),
     }

@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 
 from app.core.recognizer_base import RecognizerResult
+from app.rules.subject_admission_gate import SubjectAdmissionGate
 from app.services.contract_structure_backfill_service import ContractStructureBackfillService
 from app.services.lowmem_entity_utils import (
     OFFICIAL_INSTITUTION_PATTERN,
@@ -14,15 +15,11 @@ from app.services.lowmem_entity_utils import (
     find_short_org_prefix_before_non_subject_boundary,
     is_generic_organization_term,
     is_official_institution_text,
-    is_non_subject_action_or_function_term,
-    is_non_subject_generic_org_reference,
     is_probable_person,
     is_org_like_text,
-    is_weak_function_stripped_org,
     looks_like_organization_short_name,
     normalize_entity_text,
     strip_leading_subject_function_words,
-    subject_noun_gate,
 )
 
 
@@ -133,6 +130,7 @@ _ORG_LEFT_POLLUTION_TERMS = (
     "承担",
 )
 _COMMON_REGION_BODY = (
+    r"中华人民共和国|国家|中国|全国|中央|最高|"
     r"北京|上海|天津|重庆|广州|深圳|杭州|南京|苏州|成都|武汉|西安|长沙|郑州|青岛|宁波|佛山|东莞|厦门|福州|济南|合肥|"
     r"[\u4e00-\u9fa5]{2,16}(?:省|自治区|特别行政区|市|地区|自治州|盟|区|县|旗|自治县|自治旗)"
 )
@@ -225,43 +223,21 @@ class BoundaryRepair:
                     if is_official_institution_text(cleaned_normalized)
                     else "ORGANIZATION"
                 )
-                if (
-                    cleaned_normalized
-                    and not is_weak_function_stripped_org(cleaned_inner)
-                    and subject_noun_gate(gate_type, cleaned_inner, allow_short_org=False)[0]
-                    and (
-                        OFFICIAL_INSTITUTION_PATTERN.search(cleaned_normalized)
-                        if gate_type == "GOVERNMENT"
-                        else (ORG_PATTERN.search(cleaned_normalized) or is_org_like_text(cleaned_inner))
+                has_boundary_anchor = (
+                    OFFICIAL_INSTITUTION_PATTERN.search(cleaned_normalized)
+                    if gate_type == "GOVERNMENT"
+                    else (
+                        ORG_PATTERN.search(cleaned_normalized)
+                        or is_org_like_text(cleaned_inner)
+                        or looks_like_organization_short_name(cleaned_normalized)
                     )
-                ):
+                )
+                if cleaned_normalized and has_boundary_anchor:
                     local_start += consumed
                     inner = cleaned_inner
                     repairs.append("strip_leading_function_words")
                 else:
-                    local_start = local_end
-                    repairs.append("reject_leading_function_word_org")
-                    inner = ""
-            if not inner:
-                new_start = start + local_start
-                new_end = start + local_end
-                if new_end <= new_start:
-                    return (
-                        RecognizerResult(
-                            entity_type=result.entity_type,
-                            start=result.start,
-                            end=result.end,
-                            score=result.score,
-                            text=result.text,
-                            source=result.source,
-                            metadata={
-                                **dict(result.metadata or {}),
-                                "boundary_repair_rejected": True,
-                                "boundary_repaired_from": {"start": result.start, "end": result.end, "text": result.text},
-                            },
-                        ),
-                        repairs,
-                    )
+                    repairs.append("leading_function_word_not_boundary_safe")
         if inner:
             org_match = self._best_organization_span(inner)
         else:
@@ -294,24 +270,9 @@ class BoundaryRepair:
             result.entity_type in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME", "ALIAS", "GOVERNMENT", "COURT", "GOVERNMENT_AGENCY", "BANK_NAME"}
             and any(repair in repairs for repair in ("strip_leading_noise", "strip_leading_function_words"))
             and ORG_PATTERN.search(normalized_new_text)
-            and is_weak_function_stripped_org(new_text)
+            and SubjectAdmissionGate.is_weak_function_stripped_subject(new_text)
         ):
-            return (
-                RecognizerResult(
-                    entity_type=result.entity_type,
-                    start=result.start,
-                    end=result.end,
-                    score=result.score,
-                    text=result.text,
-                    source=result.source,
-                    metadata={
-                        **dict(result.metadata or {}),
-                        "boundary_repair_rejected": True,
-                        "boundary_repaired_from": {"start": result.start, "end": result.end, "text": result.text},
-                    },
-                ),
-                [*repairs, "reject_weak_function_stripped_org"],
-            )
+            repairs.append("weak_function_stripped_org_boundary_risk")
         if new_text == result.text and new_start == result.start and new_end == result.end:
             return result, repairs
         metadata = dict(result.metadata or {})
@@ -373,7 +334,7 @@ class BoundaryRepair:
     def _best_org_suffix_anchored_span(value: str) -> tuple[int, int] | None:
         if not value:
             return None
-        candidates: list[tuple[tuple[int, int, int, int, int], tuple[int, int]]] = []
+        candidates: list[tuple[tuple[int, int, int, int, int, int], tuple[int, int]]] = []
         for suffix_match in _ORG_SUFFIX_ANCHOR_SHAPE.finditer(value):
             end = suffix_match.end()
             min_start = max(0, end - 48)
@@ -398,9 +359,9 @@ class BoundaryRepair:
                     continue
                 adjusted_start = start + (len(value[start:end]) - len(value[start:end].lstrip(_TRAILING_PUNCT)))
                 normalized = normalize_entity_text(candidate)
-                if not normalized or is_weak_function_stripped_org(candidate):
+                if not normalized:
                     continue
-                if is_non_subject_action_or_function_term(normalized):
+                if SubjectAdmissionGate.is_action_or_function_text(normalized):
                     continue
                 if not (
                     ORG_PATTERN.fullmatch(normalized)
@@ -411,18 +372,22 @@ class BoundaryRepair:
                 ):
                     continue
                 gate_type = "GOVERNMENT" if is_official_institution_text(normalized) else "ORGANIZATION"
-                if not subject_noun_gate(gate_type, normalized, allow_short_org=False)[0]:
-                    continue
+                passes_shape, _ = SubjectAdmissionGate.passes_subject_shape(
+                    gate_type,
+                    normalized,
+                    allow_short_org=looks_like_organization_short_name(normalized),
+                )
                 left_context = value[max(0, adjusted_start - 12) : adjusted_start]
                 boundary_bonus = 2 if adjusted_start == 0 or not left_context or _ORG_LEFT_BOUNDARY_CUE.search(left_context) else 0
                 region_bonus = 3 if BoundaryRepair._starts_with_region_prefix(normalized) else 0
                 pollution_penalty = BoundaryRepair._left_pollution_penalty(normalized)
-                if pollution_penalty >= 4 and not BoundaryRepair._starts_with_region_prefix(normalized):
-                    continue
+                shape_penalty = 0 if passes_shape else 2
+                weak_trim_penalty = 1 if SubjectAdmissionGate.is_weak_function_stripped_subject(candidate) else 0
                 suffix_bonus = 2 if _ORG_SUFFIX_ANCHOR_SHAPE.search(normalized) else 1
                 score = (
-                    region_bonus + boundary_bonus + suffix_bonus - pollution_penalty,
+                    region_bonus + boundary_bonus + suffix_bonus - pollution_penalty - shape_penalty - weak_trim_penalty,
                     1 if pollution_penalty == 0 else 0,
+                    1 if passes_shape else 0,
                     len(normalized),
                     -adjusted_start,
                     end,
@@ -475,8 +440,8 @@ class BoundaryRepair:
                 or ORG_PATTERN.fullmatch(normalized_inner)
                 or is_org_like_text(inner)
             )
-            and not is_non_subject_action_or_function_term(normalized_inner)
-            and not is_weak_function_stripped_org(inner)
+            and not SubjectAdmissionGate.is_action_or_function_text(normalized_inner)
+            and not SubjectAdmissionGate.is_weak_function_stripped_subject(inner)
         )
         inline_spaced_short_org_shape = bool(
             normalized_inner
@@ -516,8 +481,8 @@ class BoundaryRepair:
 
         candidate = inner[start:end]
         normalized = normalize_entity_text(candidate)
-        if is_non_subject_generic_org_reference(normalized):
-            return len(inner), len(inner), ["reject_generic_org_reference"]
+        if SubjectAdmissionGate.is_generic_org_reference(normalized):
+            return 0, len(inner), ["generic_org_reference_not_boundary_safe"]
         if repairs and not (looks_like_organization_short_name(normalized) or ORG_PATTERN.search(normalized)):
             return 0, len(inner), []
         return start, end, repairs
@@ -640,7 +605,7 @@ class BoundaryRepair:
             return False
         if subject in {"双方", "各方", "一方", "三方", "材料", "资料", "事项", "情况"}:
             return False
-        return not is_non_subject_action_or_function_term(subject) and not is_generic_organization_term(subject)
+        return not SubjectAdmissionGate.is_action_or_function_text(subject) and not is_generic_organization_term(subject)
 
     @staticmethod
     def _short_org_has_parallel_action_context(value: str, start: int, end: int) -> bool:
@@ -804,6 +769,6 @@ class BoundaryRepair:
     def _is_valid_parallel_org_piece(normalized: str) -> bool:
         if not normalized or len(normalized) < 2:
             return False
-        if is_non_subject_action_or_function_term(normalized):
+        if SubjectAdmissionGate.is_action_or_function_text(normalized):
             return False
         return bool(is_org_like_text(normalized) or looks_like_organization_short_name(normalized))

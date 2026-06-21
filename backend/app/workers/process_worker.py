@@ -480,11 +480,22 @@ def _attach_coverage_first_final_export_metadata(
     flags = list(quality.get("quality_flags") or [])
     quality["coverage_first_final_export_used"] = True
     for key in (
+        "final_entity_input_count",
+        "final_desensitized_entity_input_count",
         "final_directory_subject_count",
+        "final_directory_occurrence_count",
+        "final_missing_directory_entity_count",
+        "final_mapping_entity_count",
         "final_rewrite_entry_count",
         "final_blocked_rewrite_entry_count",
         "final_replacement_reused_by_multi_subject_count",
         "final_subject_multi_replacement_count",
+        "qwen_discovery_final_entity_count",
+        "qwen_discovery_desensitized_entity_count",
+        "qwen_discovery_directory_row_count",
+        "qwen_discovery_directory_occurrence_count",
+        "qwen_discovery_mapping_entity_count",
+        "qwen_discovery_rewrite_entry_count",
     ):
         quality[f"coverage_first_{key}"] = _coerce_int(summary.get(key), 0)
     quality["coverage_first_final_export_ready"] = bool(summary.get("final_export_ready"))
@@ -500,6 +511,13 @@ def _attach_coverage_first_final_export_metadata(
         flags.append("coverage_first_final_replacement_reused_by_multi_subject")
     if quality["coverage_first_final_subject_multi_replacement_count"] > 0:
         flags.append("coverage_first_final_subject_multi_replacement")
+    if quality["coverage_first_final_missing_directory_entity_count"] > 0:
+        flags.append("coverage_first_final_missing_directory_entity")
+    if (
+        quality["coverage_first_qwen_discovery_desensitized_entity_count"]
+        > quality["coverage_first_qwen_discovery_mapping_entity_count"]
+    ):
+        flags.append("coverage_first_final_qwen_discovery_mapping_missing")
 
     if any(str(flag).startswith("coverage_first_final_") for flag in flags):
         quality["requires_manual_review"] = True

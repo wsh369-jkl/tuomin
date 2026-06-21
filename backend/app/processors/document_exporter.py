@@ -26,6 +26,7 @@ from app.processors.docx_xml_utils import (
     apply_replacements_to_fragments,
     docx_contains_tracked_changes,
     normalize_docx_chinese_inline_spaces,
+    replace_docx_text_by_ranges_with_report,
     replace_text_in_docx,
 )
 from app.services.default_numeric_masking import mask_default_numeric_text
@@ -126,6 +127,9 @@ class DocumentExporter:
             coverage_first_final_export=coverage_first_final_export,
         )
         replacement_entries = self._build_export_replacement_entries(entities, operator_config)
+        final_rewrite_entries = self._build_final_rewrite_entries(coverage_first_final_export)
+        if final_rewrite_entries:
+            replacement_entries = final_rewrite_entries
 
         if suffix == ".docx":
             try:
@@ -135,6 +139,7 @@ class DocumentExporter:
                     original_filename=original_filename,
                     source_text=source_text,
                     replacement_entries=replacement_entries,
+                    range_rewrite_entries=final_rewrite_entries,
                 )
             except Exception as exc:
                 logger.exception("DOCX export failed, falling back to TXT: %s", exc)
@@ -261,12 +266,19 @@ class DocumentExporter:
         """Build mapping rows from the same occurrence layer used for final rewrite."""
 
         if isinstance(coverage_first_final_export, dict):
-            from_rewrite_entries = self._mapping_entities_from_rewrite_entries(coverage_first_final_export)
-            if from_rewrite_entries:
-                return from_rewrite_entries
+            from_mapping_entities = [
+                dict(item)
+                for item in coverage_first_final_export.get("mapping_entities") or []
+                if isinstance(item, dict)
+            ]
+            if from_mapping_entities:
+                return from_mapping_entities
             from_directory_rows = self._mapping_entities_from_directory_rows(coverage_first_final_export)
             if from_directory_rows:
                 return from_directory_rows
+            from_rewrite_entries = self._mapping_entities_from_rewrite_entries(coverage_first_final_export)
+            if from_rewrite_entries:
+                return from_rewrite_entries
         return [dict(entity) for entity in entities or [] if isinstance(entity, dict)]
 
     def _mapping_entities_from_rewrite_entries(
@@ -428,10 +440,40 @@ class DocumentExporter:
         original_filename: str,
         source_text: str | None,
         replacement_entries: List[Dict[str, Any]],
+        range_rewrite_entries: List[Dict[str, Any]] | None = None,
     ) -> Dict[str, str | bool | None]:
         replacements = self._build_replacements_from_entries(replacement_entries)
         output_path = Path(settings.OUTPUT_DIR) / f"{task_id}_anonymized.docx"
         shutil.copy2(source_path, output_path)
+        range_report: Dict[str, Any] = {
+            "applied": False,
+            "attempted_entry_count": 0,
+            "normalized_entry_count": 0,
+            "applied_entry_count": 0,
+            "unapplied_entry_count": 0,
+            "modified_part_count": 0,
+            "modified_parts": [],
+            "rejection_reason": "",
+            "unapplied_ranges": [],
+        }
+        range_entries = list(range_rewrite_entries or [])
+        if range_entries:
+            try:
+                range_report = replace_docx_text_by_ranges_with_report(
+                    output_path,
+                    range_entries,
+                    source_text=source_text,
+                )
+            except Exception:
+                logger.exception("DOCX final range rewrite failed for %s", output_path)
+        precise_rewrite_complete = (
+            bool(range_entries)
+            and int(range_report.get("normalized_entry_count") or 0) > 0
+            and int(range_report.get("unapplied_entry_count") or 0) == 0
+            and not str(range_report.get("rejection_reason") or "").strip()
+        )
+        if precise_rewrite_complete:
+            replacements = []
         if replacements:
             try:
                 document = Document(output_path)
@@ -463,6 +505,17 @@ class DocumentExporter:
             "media_type": DOCX_MIME_TYPE,
             "preserves_format": True,
             "warning": None,
+            "docx_rewrite_method": "coverage_first_range_then_text" if range_entries else "text_replacement",
+            "docx_precise_rewrite_complete": precise_rewrite_complete if range_entries else None,
+            "docx_range_rewrite_required_count": int(range_report.get("normalized_entry_count") or 0),
+            "docx_range_rewrite_applied_count": int(range_report.get("applied_entry_count") or 0),
+            "docx_range_rewrite_unapplied_count": int(range_report.get("unapplied_entry_count") or 0),
+            "docx_range_rewrite_preflight_blocked_count": int(range_report.get("attempted_entry_count") or 0)
+            - int(range_report.get("normalized_entry_count") or 0),
+            "docx_range_rewrite_rejection_reason": str(range_report.get("rejection_reason") or ""),
+            "docx_range_rewrite_modified_part_count": int(range_report.get("modified_part_count") or 0),
+            "docx_range_rewrite_modified_parts": list(range_report.get("modified_parts") or [])[:20],
+            "docx_range_rewrite_unapplied_ranges": list(range_report.get("unapplied_ranges") or [])[:20],
             "docx_chinese_inline_space_normalized": bool(inline_space_report.get("applied")),
             "docx_chinese_inline_space_removed_count": int(inline_space_report.get("removed_space_count") or 0),
             "docx_chinese_inline_space_modified_part_count": int(inline_space_report.get("modified_part_count") or 0),
@@ -1047,6 +1100,38 @@ class DocumentExporter:
             replacement_map[source_text] = candidate
 
         return list(replacement_map.values())
+
+    def _build_final_rewrite_entries(
+        self,
+        coverage_first_final_export: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(coverage_first_final_export, dict) or not coverage_first_final_export.get("enabled"):
+            return []
+        entries: List[Dict[str, Any]] = []
+        for input_order, raw_entry in enumerate(coverage_first_final_export.get("rewrite_entries") or []):
+            if not isinstance(raw_entry, dict):
+                continue
+            if str(raw_entry.get("verification_status") or "").strip() == "blocked":
+                continue
+            source_text = str(raw_entry.get("source_text") or "").strip()
+            replacement = self._coerce_replacement_text(raw_entry.get("replacement"))
+            if not source_text or not replacement or source_text == replacement:
+                continue
+            entry = dict(raw_entry)
+            entry["source_text"] = source_text
+            entry["replacement"] = replacement
+            entry["entity_type"] = str(raw_entry.get("entity_type") or "").strip()
+            entry["sort_start"] = self._coerce_int(raw_entry.get("start"), 10**12)
+            entry["input_order"] = self._coerce_int(raw_entry.get("input_order"), input_order)
+            entries.append(entry)
+        return sorted(
+            entries,
+            key=lambda item: (
+                self._coerce_int(item.get("sort_start"), 10**12),
+                -len(str(item.get("source_text") or "")),
+                self._coerce_int(item.get("input_order"), 10**12),
+            ),
+        )
 
     def _build_replacements(
         self,

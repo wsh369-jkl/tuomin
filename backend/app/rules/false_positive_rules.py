@@ -6,17 +6,16 @@ import re
 
 from app.core.recognizer_base import RecognizerResult
 from app.rules.default_subject_policy import canonical_default_entity_type
+from app.rules.subject_admission_gate import SubjectAdmissionGate
 from app.services.lowmem_entity_utils import (
     NON_ENTITY_ROLE_TERMS,
     is_generic_organization_term,
     is_identity_reference_term,
-    is_non_subject_action_or_function_term,
     is_org_like_text,
     is_position_title,
     is_probable_person,
     looks_like_organization_short_name,
     normalize_entity_text,
-    subject_noun_gate,
 )
 
 
@@ -75,12 +74,8 @@ class FalsePositiveRules:
         normalized = normalize_entity_text(text)
         positive: list[str] = []
         negative: list[str] = []
-        metadata = dict(result.metadata or {})
-        if metadata.get("boundary_repair_rejected"):
-            return True, positive, ["boundary_repair_rejected"]
         if not normalized:
             return True, positive, ["empty_text"]
-        public_subject_type = canonical_default_entity_type(entity_type, normalized)
         if entity_type in FORMAT_TYPES:
             positive.append("format_entity")
             return False, positive, negative
@@ -90,20 +85,9 @@ class FalsePositiveRules:
             return True, positive, ["field_label_only"]
         if normalized in STATE_OR_SENTENCE_TERMS:
             return True, positive, ["state_or_generic_sentence"]
-        if public_subject_type in SUBJECT_TYPES and is_non_subject_action_or_function_term(normalized):
+        public_subject_type = canonical_default_entity_type(entity_type, normalized)
+        if public_subject_type in SUBJECT_TYPES and SubjectAdmissionGate.is_action_or_function_text(normalized):
             return True, positive, ["non_subject_action_or_function_term"]
-        if public_subject_type in SUBJECT_TYPES:
-            passed, reason = subject_noun_gate(
-                public_subject_type,
-                normalized,
-                allow_short_org=(
-                    public_subject_type == "ORGANIZATION"
-                    and looks_like_organization_short_name(normalized)
-                ),
-            )
-            if not passed:
-                return True, positive, [reason]
-            positive.append(reason)
         if entity_type == "PERSON":
             if is_position_title(normalized):
                 return True, positive, ["position_title_not_person"]
