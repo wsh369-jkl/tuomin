@@ -659,6 +659,14 @@ class TypeRuleRecognizers:
         normalized = normalize_entity_text(value)
         if not normalized:
             return False
+        if TypeRuleRecognizers._looks_like_parallel_short_org_subjects(normalized):
+            return False
+        if any(token in normalized for token in ("和", "与", "及", "以及", "、")):
+            return True
+        if normalized.startswith(("该", "本", "其", "前述", "上述", "相关", "涉案")):
+            return True
+        if "公司" in normalized and not looks_like_short_org_with_company_suffix(normalized):
+            return True
         if normalized in _SHORT_CONTEXT_NON_SUBJECT_TAILS:
             return True
         if any(token in normalized for token in _SHORT_CONTEXT_NON_SUBJECT_INFIXES):
@@ -668,6 +676,28 @@ class TypeRuleRecognizers:
         ):
             return True
         return False
+
+    @staticmethod
+    def _looks_like_parallel_short_org_subjects(value: str) -> bool:
+        normalized = normalize_entity_text(value)
+        if not normalized:
+            return False
+        pieces = [
+            normalize_entity_text(piece)
+            for piece in re.split(r"(?:以及|和|与|及|、)", normalized)
+            if normalize_entity_text(piece)
+        ]
+        if len(pieces) < 2:
+            return False
+        if len("".join(pieces)) != sum(len(piece) for piece in pieces):
+            return False
+        return all(
+            looks_like_organization_short_name(piece)
+            and not SubjectAdmissionGate.is_generic_org_reference(piece)
+            and not SubjectAdmissionGate.is_action_or_function_text(piece)
+            and "公司" not in piece
+            for piece in pieces
+        )
 
     def _recognize_docx_structure_units(
         self,

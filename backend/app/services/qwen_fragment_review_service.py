@@ -577,6 +577,8 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
         self._mlx_model = None
         self._mlx_tokenizer = None
         self._mlx_model_path: Optional[str] = None
+        self._last_materialize_span_miss_count = 0
+        self._last_materialize_gate_reject_count = 0
 
     @property
     def installed(self) -> bool:
@@ -614,6 +616,11 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
         model_attempted = False
         last_error: Optional[str] = None
         raw_candidate_count = 0
+        qwen_discovery_raw_candidate_count = 0
+        qwen_discovery_materialized_entity_count = 0
+        qwen_discovery_rejected_by_gate_count = 0
+        qwen_discovery_span_miss_count = 0
+        missing_candidate_materialized_entity_count = 0
         parsed_snippet_count = 0
         existing_list = list(existing_entities or [])
         global_deterministic_decisions = self._deterministic_review_entity_decisions(
@@ -623,6 +630,9 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
         review_limit = max_snippets or max(1, int(settings.MID_REVIEW_MAX_SNIPPETS or settings.REVIEW_MAX_SNIPPETS))
         scheduled_snippets = self._schedule_review_snippets(list(snippets), review_limit=review_limit)
         scheduled_ledger_count = sum(1 for snippet in scheduled_snippets if self._is_ledger_adjudication_snippet(snippet))
+        scheduled_missing_candidate_count = sum(
+            1 for snippet in scheduled_snippets if self._is_missing_candidate_review_snippet(snippet)
+        )
         scheduled_standard_count = len(scheduled_snippets) - scheduled_ledger_count
         standard_runtime = self._select_review_runtime()
         if not scheduled_snippets:
@@ -846,7 +856,24 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
                 all_rejections.extend(self._ledger_decision_rejections(decisions, snippet_existing))
                 all_rejections.extend(deterministic_rejections)
             else:
-                all_results.extend(self._materialize_candidates(full_text, parsed, snippet))
+                if self._is_qwen_coverage_discovery_snippet(snippet):
+                    qwen_discovery_raw_candidate_count += len(parsed.get("entities") or [])
+                    discovery_results = self._materialize_candidates(full_text, parsed, snippet)
+                    qwen_discovery_materialized_entity_count += len(discovery_results)
+                    qwen_discovery_rejected_by_gate_count += int(self._last_materialize_gate_reject_count or 0)
+                    qwen_discovery_span_miss_count += int(self._last_materialize_span_miss_count or 0)
+                    all_results.extend(discovery_results)
+                elif self._is_missing_candidate_review_snippet(snippet):
+                    missing_payload = self._filter_missing_candidate_payload(full_text, parsed, snippet)
+                    if missing_payload.get("entities"):
+                        missing_results = self._materialize_candidates(
+                            full_text,
+                            missing_payload,
+                            snippet,
+                            source_name="qwen_entity_decision",
+                        )
+                        missing_candidate_materialized_entity_count += len(missing_results)
+                        all_results.extend(missing_results)
                 all_rejections.extend(self._materialize_rejections(parsed, snippet_existing))
                 entity_decisions = self._materialize_entity_decisions(parsed, snippet_existing)
                 all_rejections.extend(entity_decisions["rejections"])
@@ -911,6 +938,15 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
                 "review_scheduled_snippet_count": len(scheduled_snippets),
                 "review_scheduled_ledger_snippet_count": scheduled_ledger_count,
                 "review_scheduled_standard_snippet_count": scheduled_standard_count,
+                "review_scheduled_missing_candidate_snippet_count": scheduled_missing_candidate_count,
+                "qwen_discovery_snippet_selected_count": sum(
+                    1 for snippet in scheduled_snippets if self._is_qwen_coverage_discovery_snippet(snippet)
+                ),
+                "qwen_discovery_raw_candidate_count": qwen_discovery_raw_candidate_count,
+                "qwen_discovery_materialized_entity_count": qwen_discovery_materialized_entity_count,
+                "qwen_discovery_rejected_by_gate_count": qwen_discovery_rejected_by_gate_count,
+                "qwen_discovery_span_miss_count": qwen_discovery_span_miss_count,
+                "missing_candidate_materialized_entity_count": missing_candidate_materialized_entity_count,
                 "review_deterministic_rejection_count": sum(
                     1 for item in self._dedupe_rejections(all_rejections) if item.get("deterministic_review")
                 ),
@@ -945,7 +981,7 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
 
     @staticmethod
     def _schedule_review_snippets(snippets: list[RiskSnippet], *, review_limit: int) -> list[RiskSnippet]:
-        """Never drop ledger conflicts or DOCX structure behind the generic cap."""
+        """Never drop ledger conflicts, discovery coverage, or DOCX structure behind the generic cap."""
         if not snippets:
             return []
         ledger_snippets = [
@@ -966,20 +1002,31 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
             and not QwenFragmentReviewService._is_final_subject_adjudication_snippet(snippet)
             and str(snippet.risk_reason or "").startswith("docx_structure:")
         ]
+        coverage_discovery_snippets = [
+            snippet
+            for snippet in snippets
+            if not QwenFragmentReviewService._is_ledger_adjudication_snippet(snippet)
+            and not QwenFragmentReviewService._is_final_subject_adjudication_snippet(snippet)
+            and not str(snippet.risk_reason or "").startswith("docx_structure:")
+            and QwenFragmentReviewService._is_qwen_coverage_discovery_snippet(snippet)
+        ]
         non_ledger = [
             snippet
             for snippet in snippets
             if not QwenFragmentReviewService._is_ledger_adjudication_snippet(snippet)
             and not QwenFragmentReviewService._is_final_subject_adjudication_snippet(snippet)
             and not str(snippet.risk_reason or "").startswith("docx_structure:")
+            and not QwenFragmentReviewService._is_qwen_coverage_discovery_snippet(snippet)
         ]
         ordinary_limit = max(1, int(review_limit or 1))
         structure_limit = max(2, min(len(structure_snippets), max(ordinary_limit // 2, 6)))
-        remaining_ordinary_limit = max(1, ordinary_limit - min(structure_limit, len(structure_snippets)))
+        priority_count = min(structure_limit, len(structure_snippets)) + len(coverage_discovery_snippets)
+        remaining_ordinary_limit = max(1, ordinary_limit - priority_count)
         return [
             *ledger_snippets,
             *final_subject_snippets,
             *structure_snippets[:structure_limit],
+            *coverage_discovery_snippets,
             *non_ledger[:remaining_ordinary_limit],
         ]
 
@@ -988,6 +1035,77 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
         return (
             snippet.snippet_type == "rule_first_review_block"
             or str(snippet.risk_reason or "").startswith(("rule_first:", "final_subject:"))
+        )
+
+    @staticmethod
+    def _is_qwen_coverage_discovery_snippet(snippet: RiskSnippet) -> bool:
+        return (
+            str(snippet.snippet_type or "") == "qwen_coverage_discovery"
+            or str(snippet.risk_reason or "").startswith("qwen_discovery:")
+        )
+
+    @staticmethod
+    def _is_missing_candidate_review_snippet(snippet: RiskSnippet) -> bool:
+        return str(snippet.snippet_type or "") == "missing_candidate_review"
+
+    def _build_coverage_discovery_prompt(
+        self,
+        snippet: RiskSnippet,
+        *,
+        allow_thinking: bool = False,
+    ) -> str:
+        thinking_prefix = "" if allow_thinking else "/no_think\n"
+        prompt_budget = _review_prompt_char_budget(
+            quality_gate=False,
+            allow_thinking=allow_thinking,
+        )
+        snippet_limit = int(settings.REVIEW_MAX_CHARS_PER_SNIPPET or 1200)
+        snippet_text = _compact_prompt_text(
+            str(snippet.text or ""),
+            min(snippet_limit, max(420, prompt_budget // 2)),
+        )
+        target = getattr(snippet, "target_entity", None)
+        target_metadata = (
+            target.get("metadata")
+            if isinstance(target, dict) and isinstance(target.get("metadata"), dict)
+            else {}
+        )
+        target_json = json.dumps(
+            {
+                key: target_metadata.get(key)
+                for key in (
+                    "docx_unit_id",
+                    "docx_container_type",
+                    "docx_part_name",
+                    "docx_table_index",
+                    "docx_row_index",
+                    "docx_col_index",
+                    "span_resolution",
+                )
+                if target_metadata.get(key) is not None
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        prompt = (
+            thinking_prefix
+            + "你是中文合同脱敏的最终查漏模型。只输出 JSON，不要解释。\n"
+            + "任务：只检查这个结构单元中仍可能漏掉的脱敏主体，并输出 entities。"
+            + "这是查漏任务，不是全文自由抽取；text 必须是片段里的连续原文，不能改写、概括或补字。\n"
+            + "只允许四类主体：PERSON、ORGANIZATION、GOVERNMENT、LOCATION。"
+            + "公司/私人单位按 ORGANIZATION；法院、银行、金融机构、政府机关、仲裁/检察/公安/监管机构等官方或准官方机构按 GOVERNMENT；地名按 LOCATION；人名按 PERSON。\n"
+            + "重点查漏：公司全称、带国家/省/市/区县前缀的公司全称、括号内主体、表格单元格主体、文本框/页眉/页脚主体、甲乙方/原被告/申请人等后面的主体、并列主体中的每一项。\n"
+            + "必须排除：通过/根据/要求/通知/提交/确认/负责等动作词，甲方/乙方/原告/被告等角色标签本身，该公司/本公司/相关公司等泛称，账户/开户行/金额/日期/编号/地址标签/合同期限。\n"
+            + "如果一个短语左侧有动作词或角色标签，只输出后面的真实主体；如果主体在括号中，只输出括号内主体，不带括号。"
+            + "如果没有真实主体，输出空 entities。\n"
+            + f"结构信息：{target_json}\n"
+            + f"片段开始：\n{snippet_text}\n片段结束。\n"
+            + "JSON 格式：{\"entities\":[{\"type\":\"ORGANIZATION\",\"text\":\"北京某某有限公司\"}],\"rejects\":[],\"entity_decisions\":[]}\n"
+        )
+        return self._fit_prompt_to_review_budget(
+            prompt,
+            quality_gate=False,
+            allow_thinking=allow_thinking,
         )
 
     async def generate_text(
@@ -1572,6 +1690,11 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
             return self._build_ledger_adjudication_prompt(
                 snippet,
                 existing_entities=existing_entities,
+                allow_thinking=allow_thinking,
+            )
+        if self._is_qwen_coverage_discovery_snippet(snippet):
+            return self._build_coverage_discovery_prompt(
+                snippet,
                 allow_thinking=allow_thinking,
             )
         return self._build_prompt(
@@ -2198,6 +2321,9 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
         source_name: str = "qwen_fragment_review",
     ) -> List[RecognizerResult]:
         results: list[RecognizerResult] = []
+        self._last_materialize_span_miss_count = 0
+        self._last_materialize_gate_reject_count = 0
+        is_discovery = self._is_qwen_coverage_discovery_snippet(snippet)
         for item in payload.get("entities", []):
             if isinstance(item, str):
                 raw_text = item.strip()
@@ -2226,6 +2352,7 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
                 continue
             entity_type = self._normalize_entity_type(entity_type, raw_text, role=role, snippet=snippet)
             if not entity_type:
+                self._last_materialize_gate_reject_count += 1
                 continue
             materialized_text, span = self._materialize_candidate_span(
                 full_text,
@@ -2234,8 +2361,10 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
                 entity_type,
             )
             if span is None or not materialized_text:
+                self._last_materialize_span_miss_count += 1
                 continue
             if not self._looks_like_review_candidate(entity_type, materialized_text):
+                self._last_materialize_gate_reject_count += 1
                 continue
             gate_passed, _ = subject_noun_gate(entity_type, materialized_text, allow_short_org=True)
             review_short_org = (
@@ -2244,6 +2373,7 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
                 and self._snippet_supports_short_org_resolution(snippet, materialized_text)
             )
             if not gate_passed and not review_short_org:
+                self._last_materialize_gate_reject_count += 1
                 continue
             metadata = {
                 "source": source_name,
@@ -2270,6 +2400,29 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
                 metadata["entity_decision_reason"] = entity_decision_reason
             if materialized_text != raw_text:
                 metadata["materialized_from"] = raw_text
+            if is_discovery:
+                metadata["qwen_coverage_discovery"] = True
+                target = getattr(snippet, "target_entity", None)
+                target_metadata = (
+                    target.get("metadata")
+                    if isinstance(target, dict) and isinstance(target.get("metadata"), dict)
+                    else {}
+                )
+                target_snapshot = {
+                    key: target_metadata.get(key)
+                    for key in (
+                        "docx_unit_id",
+                        "docx_container_type",
+                        "docx_part_name",
+                        "docx_table_index",
+                        "docx_row_index",
+                        "docx_cell_index",
+                        "span_resolution",
+                    )
+                    if target_metadata.get(key) is not None
+                }
+                if target_snapshot:
+                    metadata["qwen_discovery_target"] = target_snapshot
             result = make_entity(
                 text=full_text,
                 start=span[0],
@@ -2291,6 +2444,80 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
             )
         )
         return results
+
+    def _filter_missing_candidate_payload(
+        self,
+        full_text: str,
+        payload: Dict,
+        snippet: RiskSnippet,
+    ) -> Dict[str, list]:
+        target = getattr(snippet, "target_entity", None)
+        if not isinstance(target, dict) or not target:
+            return {"entities": []}
+        target_text = str(target.get("text") or "").strip()
+        target_type = self._normalize_entity_type(
+            str(target.get("type") or target.get("entity_type") or "").upper(),
+            target_text,
+            role=None,
+            snippet=snippet,
+        )
+        try:
+            target_start = int(target.get("start") or 0)
+            target_end = int(target.get("end") or 0)
+        except (TypeError, ValueError):
+            target_start = 0
+            target_end = 0
+        if not target_text or not target_type or target_end <= target_start:
+            return {"entities": []}
+        target_norm = normalize_entity_text(target_text)
+        allowed: list[dict] = []
+        for item in payload.get("entities") or []:
+            if isinstance(item, str):
+                candidate_text = item.strip()
+                candidate_type = target_type
+                role = None
+            elif isinstance(item, dict):
+                candidate_text = str(item.get("text") or "").strip()
+                candidate_type = self._normalize_entity_type(
+                    str(item.get("type") or target_type or "").upper(),
+                    candidate_text,
+                    role=item.get("role"),
+                    snippet=snippet,
+                )
+                role = item.get("role")
+            else:
+                continue
+            if not candidate_text or candidate_type != target_type:
+                continue
+            candidate_norm = normalize_entity_text(candidate_text)
+            if not candidate_norm:
+                continue
+            if not (
+                candidate_norm == target_norm
+                or candidate_norm in target_norm
+                or target_norm in candidate_norm
+            ):
+                continue
+            span = find_value_span(
+                full_text,
+                candidate_text,
+                search_start=max(0, snippet.start),
+                search_end=min(len(full_text), snippet.end),
+            )
+            if span is None:
+                continue
+            if not (span[0] < target_end and span[1] > target_start):
+                continue
+            allowed.append(
+                {
+                    "type": candidate_type,
+                    "text": candidate_text,
+                    "role": role,
+                    "source_decision": "missing_candidate_confirm",
+                    "entity_decision_reason": "missing_candidate_review_target_matched",
+                }
+            )
+        return {"entities": allowed}
 
     def _supplement_missing_short_org_list_entities(
         self,
@@ -2369,6 +2596,8 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
                     "short_org_candidate": True,
                     "identity_surface": normalize_entity_text(materialized_text),
                 }
+                if self._is_qwen_coverage_discovery_snippet(snippet):
+                    metadata["qwen_coverage_discovery"] = True
                 result = make_entity(
                     text=full_text,
                     start=span[0],
@@ -2400,6 +2629,12 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
             )
             if span is None:
                 continue
+            exact_raw_span = find_value_span(
+                full_text,
+                raw_text,
+                search_start=snippet.start,
+                search_end=snippet.end,
+            )
             expanded_span = expand_subject_span_to_containing_shape(
                 full_text,
                 span[0],
@@ -2407,9 +2642,60 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
                 entity_type,
             )
             if expanded_span is not None:
-                span = expanded_span
+                expanded_text = full_text[expanded_span[0] : expanded_span[1]]
+                if exact_raw_span is not None and self._expanded_span_adds_context_noise(
+                    expanded_text,
+                    raw_text,
+                    entity_type,
+                ):
+                    span = exact_raw_span
+                else:
+                    span = expanded_span
             return full_text[span[0] : span[1]], span
         return "", None
+
+    @staticmethod
+    def _expanded_span_adds_context_noise(expanded_text: str, raw_text: str, entity_type: str) -> bool:
+        if str(entity_type or "").upper() not in {"ORGANIZATION", "COMPANY_NAME", "GOVERNMENT", "COURT"}:
+            return False
+        expanded_norm = normalize_entity_text(expanded_text)
+        raw_norm = normalize_entity_text(raw_text)
+        if not expanded_norm or not raw_norm or expanded_norm == raw_norm:
+            return False
+        raw_index = expanded_norm.find(raw_norm)
+        if raw_index <= 0:
+            return False
+        left = expanded_norm[:raw_index]
+        return bool(
+            left
+            and (
+                left[-1] in "（）()《》【】"
+                or left in {
+                    "甲方",
+                    "乙方",
+                    "丙方",
+                    "丁方",
+                    "委托方",
+                    "受托方",
+                    "发包人",
+                    "承包人",
+                    "采购人",
+                    "供应商",
+                    "上诉人",
+                    "被上诉人",
+                    "原告",
+                    "被告",
+                    "第三人",
+                    "申请人",
+                    "被申请人",
+                }
+                or is_non_subject_action_or_function_term(left)
+                or re.search(
+                    r"(?:通过|经过|根据|依据|按照|经由|并由|由|向|对|与|和|及|以及|合同由|协议由|材料由)$",
+                    left,
+                )
+            )
+        )
 
     def _build_materialization_candidates(
         self,

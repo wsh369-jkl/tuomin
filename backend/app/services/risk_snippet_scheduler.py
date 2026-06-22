@@ -731,6 +731,7 @@ class RiskSnippetScheduler:
         seen: set[tuple[object, ...]] = set()
         ledger_snippets: list[RiskSnippet] = []
         final_subject_snippets: list[RiskSnippet] = []
+        discovery_snippets: list[RiskSnippet] = []
         structure_snippets: list[RiskSnippet] = []
         ordinary_snippets: list[RiskSnippet] = []
         for snippet in sorted(enumerate(snippets), key=lambda item: RiskSnippetScheduler._snippet_priority(item[1], item[0])):
@@ -744,7 +745,7 @@ class RiskSnippetScheduler:
             elif RiskSnippetScheduler._is_rule_first_review_snippet(snippet):
                 final_subject_snippets.append(snippet)
             elif RiskSnippetScheduler._is_discovery_snippet(snippet):
-                structure_snippets.append(snippet)
+                discovery_snippets.append(snippet)
             elif RiskSnippetScheduler._is_docx_structure_snippet(snippet):
                 structure_snippets.append(snippet)
             else:
@@ -754,10 +755,12 @@ class RiskSnippetScheduler:
         # leaves the final review with no chance to reject obvious bad spans.
         ordinary_limit = max(1, int(max_count or 1))
         structure_limit = max(2, min(len(structure_snippets), max(ordinary_limit // 2, 6)))
-        remaining_ordinary_limit = max(1, ordinary_limit - min(structure_limit, len(structure_snippets)))
+        priority_count = min(structure_limit, len(structure_snippets)) + len(discovery_snippets)
+        remaining_ordinary_limit = max(1, ordinary_limit - priority_count)
         return [
             *ledger_snippets,
             *final_subject_snippets,
+            *discovery_snippets,
             *structure_snippets[:structure_limit],
             *ordinary_snippets[:remaining_ordinary_limit],
         ]

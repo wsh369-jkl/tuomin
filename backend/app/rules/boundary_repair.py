@@ -136,7 +136,7 @@ _COMMON_REGION_BODY = (
 )
 _COMMON_REGION_PREFIX = re.compile(rf"^(?:{_COMMON_REGION_BODY})")
 _COMMON_REGION_ANYWHERE = re.compile(rf"(?:{_COMMON_REGION_BODY})")
-_TRAILING_PUNCT = " \t\r\n:：,，;；。.!！?？、"
+_TRAILING_PUNCT = " \t\r\n:：,，;；。.!！?？、（）()《》【】"
 
 
 def _field_label_tail_pattern() -> re.Pattern[str]:
@@ -709,6 +709,10 @@ class BoundaryRepair:
         if result.entity_type not in {"PERSON", "PERSON_NAME", "ORGANIZATION", "COMPANY_NAME"}:
             return False
         normalized = normalize_entity_text(result.text)
+        if result.entity_type in {"ORGANIZATION", "COMPANY_NAME"} and re.search(r"(?:和|与|及|以及)", normalized):
+            pieces = [normalize_entity_text(piece) for piece in re.split(r"(?:和|与|及|以及)", str(result.text or ""))]
+            usable = [piece for piece in pieces if BoundaryRepair._is_valid_parallel_org_piece(piece)]
+            return len(usable) >= 2
         if (
             result.entity_type in {"ORGANIZATION", "COMPANY_NAME"}
             and (
@@ -721,10 +725,6 @@ class BoundaryRepair:
             return True
         if result.entity_type in {"PERSON", "PERSON_NAME"}:
             return bool(re.search(r"(?:和|与|及)", normalized))
-        if result.entity_type in {"ORGANIZATION", "COMPANY_NAME"} and re.search(r"(?:和|与|及|以及)", normalized):
-            pieces = [normalize_entity_text(piece) for piece in re.split(r"(?:和|与|及|以及)", str(result.text or ""))]
-            usable = [piece for piece in pieces if BoundaryRepair._is_valid_parallel_org_piece(piece)]
-            return len(usable) >= 2
         return False
 
     @staticmethod

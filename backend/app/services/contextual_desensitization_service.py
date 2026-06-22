@@ -3165,6 +3165,11 @@ class ContextualDesensitizationService:
                     and self._is_low_information_organization_alias(variant_norm)
                 ):
                     continue
+                if (
+                    entity_type in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME"}
+                    and self._is_weak_organization_reference(variant_norm)
+                ):
+                    continue
                 for start, end in self._find_text_spans(text, variant):
                     key = (start, end, entity_type)
                     if key in occupied:
@@ -3225,6 +3230,11 @@ class ContextualDesensitizationService:
                     entity_type in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME"}
                     and self._normalize_group_text(str(variant)) != self._normalize_group_text(str(memory.get("primary_text", "")))
                     and self._is_low_information_organization_alias(str(variant))
+                ):
+                    continue
+                if (
+                    entity_type in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME"}
+                    and self._is_weak_organization_reference(str(variant))
                 ):
                     continue
                 for start, end in self._find_text_spans(text, variant):
@@ -3289,7 +3299,7 @@ class ContextualDesensitizationService:
             memory = entity_memory.get(group_key)
             if not group_key or not memory or not self._supports_company_weak_reference(memory):
                 continue
-            if self._is_weak_organization_reference(str(entity.get("text", ""))) and not self._sanitize_canonical_key(group_key):
+            if self._is_weak_organization_reference(str(entity.get("text", ""))):
                 continue
             support_mentions.append(
                 {
@@ -3622,6 +3632,8 @@ class ContextualDesensitizationService:
         metadata = metadata or {}
         normalized = self._normalize_group_text(text)
         if not looks_like_organization_short_name(normalized):
+            return False
+        if self._is_weak_organization_reference(normalized):
             return False
         if (
             is_identity_reference_term(normalized)
@@ -4908,7 +4920,16 @@ Contract text:
         return True
 
     def _is_weak_organization_reference(self, text: str) -> bool:
-        return self._normalize_group_text(text) in self.WEAK_ORGANIZATION_REFERENCES
+        normalized = self._normalize_group_text(text)
+        if not normalized:
+            return False
+        if normalized in self.WEAK_ORGANIZATION_REFERENCES:
+            return True
+        return any(
+            normalized == token or normalized.startswith(token)
+            for token in self.WEAK_ORGANIZATION_REFERENCES
+            if len(token) >= 2
+        )
 
     def _find_exact_spans(self, text: str, target: str) -> List[int]:
         positions: List[int] = []

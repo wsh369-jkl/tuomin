@@ -599,6 +599,9 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
             stage_counts["review_scheduled_missing_candidate_snippets"] = int(
                 review_metadata.get("review_scheduled_missing_candidate_snippet_count") or 0
             )
+            stage_counts["missing_candidate_materialized_entities"] = int(
+                review_metadata.get("missing_candidate_materialized_entity_count") or 0
+            )
             stage_counts["qwen_discovery_snippets_selected"] = int(
                 review_metadata.get("qwen_discovery_snippet_selected_count")
                 or stage_counts.get("qwen_discovery_snippets_selected")
@@ -1524,6 +1527,9 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
                 stage_counts.get("missing_candidate_review_snippets_selected") or 0
             ),
             "review_scheduled_missing_candidate_snippet_count": scheduled_missing_candidate_count,
+            "missing_candidate_materialized_entity_count": int(
+                stage_counts.get("missing_candidate_materialized_entities") or 0
+            ),
             "qwen_discovery_snippet_count": int(stage_counts.get("qwen_discovery_snippets") or 0),
             "qwen_discovery_snippet_selected_count": int(stage_counts.get("qwen_discovery_snippets_selected") or 0),
             "qwen_discovery_unit_count": int(stage_counts.get("qwen_discovery_snippets_selected") or 0),
@@ -1722,19 +1728,16 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
         standard_fallback = []
         for index, snippet in enumerate(snippets):
             if self._is_ledger_review_snippet(snippet):
-                if self._snippet_requires_review(snippet, existing_results):
-                    ledger_snippets.append(snippet)
+                ledger_snippets.append(snippet)
                 continue
             if str(getattr(snippet, "snippet_type", "") or "") == "missing_candidate_review":
-                if self._snippet_requires_review(snippet, existing_results):
-                    missing_candidate_snippets.append(snippet)
+                missing_candidate_snippets.append(snippet)
                 continue
             if (
                 str(getattr(snippet, "snippet_type", "") or "") == "qwen_coverage_discovery"
                 or str(getattr(snippet, "risk_reason", "") or "").startswith("qwen_discovery:")
             ):
-                if self._snippet_requires_review(snippet, existing_results):
-                    discovery_snippets.append(snippet)
+                discovery_snippets.append(snippet)
                 continue
             if self._snippet_requires_review(snippet, existing_results):
                 standard_required.append((index, snippet))
@@ -2070,6 +2073,7 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
                 )
             )
             rejected_text = str(rejected.get("text") or "")
+            rejected_source = str(rejected.get("source") or "").strip()
             try:
                 rejected_start = int(rejected.get("start"))
             except (TypeError, ValueError):
@@ -2078,6 +2082,8 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
                 rejected_end = int(rejected.get("end"))
             except (TypeError, ValueError):
                 rejected_end = -1
+            if rejected_source and str(result.source or "") != rejected_source:
+                continue
             if rejected_type and result_public_type != rejected_type:
                 continue
             if rejected_start >= 0 and rejected_end >= 0:

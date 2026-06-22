@@ -380,6 +380,9 @@ async def _run(payload: Dict[str, Any]) -> Dict[str, Any]:
             stage_counts["review_scheduled_missing_candidate_snippets"] = int(
                 review_metadata.get("review_scheduled_missing_candidate_snippet_count") or 0
             )
+            stage_counts["missing_candidate_materialized_entities"] = int(
+                review_metadata.get("missing_candidate_materialized_entity_count") or 0
+            )
             stage_counts["qwen_discovery_snippets_selected"] = int(
                 review_metadata.get("qwen_discovery_snippet_selected_count")
                 or stage_counts.get("qwen_discovery_snippets_selected")
@@ -722,6 +725,9 @@ async def _run(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "review_scheduled_missing_candidate_snippet_count": int(
                     review_metadata.get("review_scheduled_missing_candidate_snippet_count") or 0
                 ) if review_result else 0,
+                "missing_candidate_materialized_entity_count": int(
+                    stage_counts.get("missing_candidate_materialized_entities") or 0
+                ),
                 "review_worker_review_only_candidate_count": int(len(review_only_candidates)),
                 "primary_entity_return_count": int(stage_counts.get("primary_entity_return_count") or 0),
                 "primary_review_surface_count": int(stage_counts.get("primary_review_surface_count") or 0),
