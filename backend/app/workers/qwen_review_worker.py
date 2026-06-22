@@ -85,6 +85,43 @@ def _entity_statistics(entities: List[Dict[str, Any]]) -> Dict[str, Dict[str, ob
     return stats
 
 
+def _apply_late_deterministic_adjudication_to_entities(
+    *,
+    text: str,
+    entities: List[Dict[str, Any]],
+    recognizer: HighQualityLowMemoryRecognizer,
+) -> tuple[List[Dict[str, Any]], int, int]:
+    results = _results_from_payload(entities)
+    adjusted, rejected_count, added_count = recognizer._apply_late_deterministic_adjudication(text, results)
+    original_by_key: dict[tuple[str, int, int, str, str], Dict[str, Any]] = {}
+    for entity in entities or []:
+        if not isinstance(entity, dict):
+            continue
+        key = (
+            str(entity.get("type") or entity.get("entity_type") or "").strip().upper(),
+            int(entity.get("start") or 0),
+            int(entity.get("end") or 0),
+            str(entity.get("text") or ""),
+            str(entity.get("source") or ""),
+        )
+        original_by_key[key] = entity
+    rebuilt: List[Dict[str, Any]] = []
+    for result in adjusted:
+        key = (
+            str(result.entity_type or "").strip().upper(),
+            int(result.start),
+            int(result.end),
+            str(result.text or ""),
+            str(result.source or ""),
+        )
+        original = original_by_key.get(key)
+        if original is not None:
+            rebuilt.append(dict(original))
+        else:
+            rebuilt.append(result.to_dict())
+    return rebuilt, rejected_count, added_count
+
+
 def _structure_short_org_counts(entities: Iterable[Dict[str, Any]]) -> Dict[str, int]:
     counts = {
         "total": 0,
@@ -102,7 +139,7 @@ def _structure_short_org_counts(entities: Iterable[Dict[str, Any]]) -> Dict[str,
         trigger = str(metadata.get("trigger") or "").strip()
         if not metadata.get("short_org_candidate"):
             continue
-        if source != "rule_organization_context" and not (source_layer == "structure" and "short_org" in trigger):
+        if source != "rule_organization_context" and not (source_layer == "structure" and "short_org" in trigger) and not metadata.get("bridge_split"):
             continue
         counts["total"] += 1
         status = str(
@@ -165,6 +202,11 @@ def _postprocess_final_entities(
             processed = prune(processed, full_text=text)
         except TypeError:
             processed = prune(processed)
+    processed = [
+        entity
+        for entity in processed
+        if not bool((entity.get("metadata") or {}).get("short_org_publication_review_required"))
+    ]
     if callable(sort_and_dedupe):
         processed = sort_and_dedupe(processed)
     return processed
@@ -510,6 +552,17 @@ async def _run(payload: Dict[str, Any]) -> Dict[str, Any]:
         stage_counts["postprocess_input_count"] = len(final_entities)
         final_entities = _postprocess_final_entities(contextual_service, text, final_entities)
         stage_counts["postprocess_output_count"] = len(final_entities)
+        final_entities, late_rejected_count, late_added_count = _apply_late_deterministic_adjudication_to_entities(
+            text=text,
+            entities=final_entities,
+            recognizer=recognizer,
+        )
+        stage_counts["late_deterministic_adjudication_rejected"] = late_rejected_count
+        stage_counts["late_deterministic_adjudication_entities"] = late_added_count
+        if late_rejected_count:
+            quality_flags.append("late_deterministic_adjudication_applied")
+        if late_added_count:
+            quality_flags.append("late_deterministic_adjudication_entities_applied")
         structure_short_org_after_postprocess = _structure_short_org_counts(final_entities)
         contextual_quality_metadata = contextual_service.get_last_quality_metadata()
         contextual_quality_passed = bool(contextual_quality_metadata.get("quality_gate_passed", True))

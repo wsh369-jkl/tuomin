@@ -75,7 +75,15 @@ class SubjectAdmissionGate:
             else:
                 negatives.add(reason)
 
-        if false_positive_reject:
+        hard_reject_negative_reasons = {
+            "leading_subject_linking_verb",
+            "subject_linking_verb_with_unresolved_left_context",
+            "leading_function_prefix",
+            "previous_subject_prefix",
+            "company_prefix_before_official_institution",
+        }
+
+        if false_positive_reject or bool(negatives & hard_reject_negative_reasons):
             action = "reject"
         elif validator_failures:
             action = "review"

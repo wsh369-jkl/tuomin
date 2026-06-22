@@ -20,10 +20,15 @@ from app.services.lowmem_entity_utils import (
     docx_structure_unit_inventory,
     iter_docx_structure_units,
     resolve_docx_unit_spans,
+    subject_noun_gate,
 )
 from app.processors.docx_xml_utils import extract_docx_visible_text_units
 from app.services.contextual_desensitization_service import ContextualDesensitizationService
-from app.workers.qwen_review_worker import _validate_and_expand
+from app.workers.qwen_review_worker import (
+    _apply_late_deterministic_adjudication_to_entities,
+    _postprocess_final_entities,
+    _validate_and_expand,
+)
 
 
 class _SyntheticUnitExtractor:
@@ -409,6 +414,78 @@ def test_rule_pipeline_splits_person_org_bridge_subjects_without_merging():
     assert "张三" in person_texts
     assert "北京星河科技有限公司" in org_texts
     assert "张三担任北京星河科技有限公司" not in org_texts
+
+
+def test_rule_pipeline_splits_person_org_bridge_subjects_for_short_company_suffixes():
+    pipeline = RuleFirstPipeline()
+    text = "张三担任乙有限公司法定代表人。张三是乙有限公司负责人。"
+
+    result = pipeline.apply(text=text, results=[])
+    person_texts = [item.text for item in result.results if item.entity_type == "PERSON"]
+    org_texts = [item.text for item in result.results if item.entity_type == "ORGANIZATION"]
+
+    assert "张三" in person_texts
+    assert "乙有限公司" in org_texts
+    assert "张三担任乙有限公司" not in org_texts
+    assert "张三是乙有限公司" not in org_texts
+
+
+def test_rule_pipeline_rejects_leading_bridge_verb_organization_pollution():
+    pipeline = RuleFirstPipeline()
+    text = "甲方是乙有限公司负责人。"
+
+    result = pipeline.apply(text=text, results=[])
+    org_texts = [item.text for item in result.results if item.entity_type == "ORGANIZATION"]
+
+    assert "是乙有限公司" not in org_texts
+    assert "甲方是乙有限公司" not in org_texts
+
+
+def test_final_review_rejects_rule_organization_bridge_pollution():
+    for value in ("是乙有限公司", "系乙有限公司", "担任乙有限公司", "张三是乙有限公司"):
+        reason = QwenFragmentReviewService._deterministic_rule_organization_rejection_reason(
+            {
+                "text": value,
+                "type": "ORGANIZATION",
+                "source": "rule_organization",
+                "metadata": {},
+            }
+        )
+        assert reason == "deterministic_rule_org_left_context_pollution"
+
+
+def test_final_review_rejects_bridge_pollution_from_any_organization_source():
+    for source in ("qwen_fragment_review", "uie", "ner", "review_deterministic_decision"):
+        for value in ("是乙有限公司", "张三是乙有限公司", "甲方是乙有限公司"):
+            reason = QwenFragmentReviewService._deterministic_final_subject_rejection_reason(
+                {
+                    "text": value,
+                    "type": "ORGANIZATION",
+                    "source": source,
+                    "metadata": {},
+                }
+            )
+            assert reason == "deterministic_final_subject_left_context_pollution"
+
+
+def test_subject_gate_rejects_strong_left_context_pollution_terms():
+    for value in ("将乙有限公司", "把乙有限公司", "被乙有限公司", "担任乙有限公司", "任职乙有限公司", "是乙有限公司", "系乙有限公司", "为乙有限公司"):
+        passed, reason = subject_noun_gate("ORGANIZATION", value, allow_short_org=True)
+        assert not passed
+        assert reason in {"leading_subject_linking_verb", "leading_function_prefix"}
+
+
+def test_final_review_rejects_government_bridge_pollution_too():
+    for value in ("是北京市朝阳区人民法院", "张三是北京市朝阳区人民法院", "担任北京市朝阳区人民法院"):
+        reason = QwenFragmentReviewService._deterministic_final_subject_rejection_reason(
+            {
+                "text": value,
+                "type": "GOVERNMENT",
+                "source": "qwen_fragment_review",
+                "metadata": {},
+            }
+        )
+        assert reason == "deterministic_final_subject_left_context_pollution"
 
 
 def test_rule_layer_label_value_does_not_emit_parenthesized_polluted_company_candidate():
@@ -1341,6 +1418,39 @@ def test_prune_keeps_ambiguous_structure_short_org_with_review_marker():
     assert pruned[0]["metadata"]["requires_manual_review"] is True
 
 
+def test_postprocess_filters_ambiguous_structure_short_org_from_public_entities():
+    service = ContextualDesensitizationService()
+    entities = [
+        {
+            "type": "ORGANIZATION",
+            "text": "星河",
+            "start": 2,
+            "end": 4,
+            "source": "rule_organization_context",
+            "metadata": {
+                "short_org_candidate": True,
+                "source_layer": "structure",
+                "trigger": "right_boundary_short_org",
+                "subject_ledger_status": "ambiguous_short_subject",
+                "short_org_publication_review_required": True,
+                "requires_manual_review": True,
+            },
+        },
+        {
+            "type": "ORGANIZATION",
+            "text": "北京星河科技有限公司",
+            "start": 10,
+            "end": 20,
+            "source": "rule_organization",
+            "metadata": {},
+        },
+    ]
+
+    processed = _postprocess_final_entities(service, "甲方星河乙方北京星河科技有限公司", entities)
+
+    assert [item["text"] for item in processed] == ["北京星河科技有限公司"]
+
+
 def test_mapping_directory_prefers_final_mapping_layer_over_blocked_rewrite_subset():
     exporter = DocumentExporter()
     coverage_first_final_export = {
@@ -1617,6 +1727,74 @@ def test_review_rejection_keeps_same_span_other_source_entities():
     ]
 
     assert HighQualityLowMemoryRecognizer._matches_review_rejection(result, rejected) is False
+
+
+def test_late_deterministic_adjudication_rejects_qwen_and_propagated_left_pollution():
+    text = "甲方是乙有限公司负责人。"
+    results = [
+        RecognizerResult(
+            entity_type="ORGANIZATION",
+            start=0,
+            end=len("甲方是乙有限公司"),
+            score=0.87,
+            text="甲方是乙有限公司",
+            source="qwen_fragment_review",
+            metadata={"source_layer": "llm_review"},
+        ),
+        RecognizerResult(
+            entity_type="ORGANIZATION",
+            start=2,
+            end=len("甲方是乙有限公司"),
+            score=0.84,
+            text="乙有限公司",
+            source="propagate",
+            metadata={"propagated_from_subject_ledger": True},
+        ),
+    ]
+
+    filtered, rejected_count, added_count = HighQualityLowMemoryRecognizer._apply_late_deterministic_adjudication(
+        text,
+        results,
+    )
+
+    assert rejected_count == 1
+    assert added_count == 0
+    assert [item.text for item in filtered] == ["乙有限公司"]
+
+
+def test_review_worker_late_deterministic_adjudication_rejects_polluted_final_entities():
+    text = "甲方是乙有限公司负责人。"
+    recognizer = HighQualityLowMemoryRecognizer()
+    entities = [
+        {
+            "type": "ORGANIZATION",
+            "text": "甲方是乙有限公司",
+            "start": 0,
+            "end": len("甲方是乙有限公司"),
+            "score": 0.87,
+            "source": "qwen_fragment_review",
+            "metadata": {"source_layer": "llm_review"},
+        },
+        {
+            "type": "ORGANIZATION",
+            "text": "乙有限公司",
+            "start": 2,
+            "end": len("甲方是乙有限公司"),
+            "score": 0.84,
+            "source": "propagate",
+            "metadata": {"propagated_from_subject_ledger": True},
+        },
+    ]
+
+    filtered, rejected_count, added_count = _apply_late_deterministic_adjudication_to_entities(
+        text=text,
+        entities=entities,
+        recognizer=recognizer,
+    )
+
+    assert rejected_count == 1
+    assert added_count == 0
+    assert [item["text"] for item in filtered] == ["乙有限公司"]
 
 
 def test_residual_repair_does_not_materialize_weak_generic_org_reference():

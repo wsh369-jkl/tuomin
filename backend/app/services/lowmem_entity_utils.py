@@ -187,6 +187,20 @@ STRONG_LEADING_SUBJECT_FUNCTION_PREFIXES = tuple(
         )
     )
 )
+SUBJECT_LINKING_VERB_PREFIXES = (
+    "服务于",
+    "担任",
+    "任职",
+    "就职",
+    "供职",
+    "出任",
+    "兼任",
+    "兼为",
+    "加入",
+    "是",
+    "系",
+    "为",
+)
 SUBJECT_SEQUENCE_BOUNDARY_TERMS = (
     "与",
     "和",
@@ -214,7 +228,16 @@ SUBJECT_SEQUENCE_BOUNDARY_TERMS = (
     "为",
 )
 LEADING_SUBJECT_FUNCTION_PATTERN = re.compile(
-    r"^(?:" + "|".join(re.escape(item) for item in sorted(LEADING_SUBJECT_FUNCTION_WORDS, key=len, reverse=True)) + r")+"
+    r"^(?:"
+    + "|".join(
+        re.escape(item)
+        for item in sorted(
+            (*STRONG_LEADING_SUBJECT_FUNCTION_PREFIXES, *SUBJECT_LINKING_VERB_PREFIXES),
+            key=len,
+            reverse=True,
+        )
+    )
+    + r")+"
 )
 ADMIN_REGION_PREFIX_PATTERN = re.compile(
     r"(?:"
@@ -1460,6 +1483,19 @@ def subject_left_pollution_reason(value: str, entity_type: str = "") -> str:
     normalized = normalize_entity_text(value)
     if not normalized:
         return ""
+    for prefix in SUBJECT_LINKING_VERB_PREFIXES:
+        if not normalized.startswith(prefix) or len(normalized) <= len(prefix) + 1:
+            continue
+        remainder = normalized[len(prefix) :]
+        if (
+            ORG_PATTERN.search(remainder)
+            or OFFICIAL_INSTITUTION_PATTERN.search(remainder)
+            or looks_like_organization_short_name(remainder)
+            or is_org_like_text_no_function_guard(remainder)
+        ):
+            return "leading_subject_linking_verb"
+    if _contains_subject_linking_verb_with_unresolved_left_context(normalized):
+        return "subject_linking_verb_with_unresolved_left_context"
     for prefix in sorted(STRONG_LEADING_SUBJECT_FUNCTION_PREFIXES, key=len, reverse=True):
         if normalized.startswith(prefix) and len(normalized) > len(prefix) + 1:
             remainder = normalized[len(prefix) :]
@@ -1476,6 +1512,28 @@ def subject_left_pollution_reason(value: str, entity_type: str = "") -> str:
     if _company_prefix_before_official_marker(normalized):
         return "company_prefix_before_official_institution"
     return ""
+
+
+def _contains_subject_linking_verb_with_unresolved_left_context(normalized: str) -> bool:
+    if not normalized or len(normalized) < 4:
+        return False
+    for verb in SUBJECT_LINKING_VERB_PREFIXES:
+        index = normalized.find(verb)
+        if index <= 0 or index >= len(normalized) - 1:
+            continue
+        left = normalized[:index]
+        right = normalized[index + len(verb) :]
+        if len(right) < 2:
+            continue
+        if not (ORG_PATTERN.search(right) or OFFICIAL_INSTITUTION_PATTERN.search(right) or looks_like_organization_short_name(right)):
+            continue
+        if any(token in left for token in ("公司", "银行", "法院", "集团", "机构", "单位")):
+            continue
+        if looks_like_natural_person_name(left) or is_probable_person(left):
+            return True
+        if re.fullmatch(r"[\u4e00-\u9fa5A-Za-z0-9]{1,4}", left):
+            return True
+    return False
 
 
 def _previous_subject_boundary_index(normalized: str) -> int:
@@ -1666,6 +1724,7 @@ SHORT_ORG_LEADING_FUNCTION_PREFIXES = tuple(
             "把",
             "被",
             "为",
+            *SUBJECT_LINKING_VERB_PREFIXES,
         )
     )
 )

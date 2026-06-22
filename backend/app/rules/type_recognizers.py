@@ -25,6 +25,7 @@ from app.services.lowmem_entity_utils import (
     find_short_org_prefix_before_non_subject_boundary,
     looks_like_short_org_with_company_suffix,
     looks_like_organization_short_name,
+    looks_like_natural_person_name,
     normalize_entity_text,
     remap_sanitized_span,
     resolve_docx_unit_spans,
@@ -155,6 +156,17 @@ _FUNCTION_CONTEXT_SHORT_ORG_PATTERN = re.compile(
     rf"(?P<subject>[\u4e00-\u9fa5A-Za-z0-9]{{2,6}}?)"
     rf"(?P<right>\s*(?:{_SHORT_ORG_RIGHT_CUE_PATTERN}))"
 )
+_PERSON_ORG_BRIDGE_SHORT_PATTERN = re.compile(
+    r"(?P<person>[\u4e00-\u9fa5]{2,8}(?:·[\u4e00-\u9fa5]{2,8})?)"
+    r"(?P<bridge>担任|任职|就职|供职|出任|兼任|兼为|服务于|加入|为|是|系)"
+    r"(?P<subject>[\u4e00-\u9fa5A-Za-z0-9]{1,6}(?:股份有限公司|有限责任公司|集团有限公司|有限公司|分公司|子公司|公司))"
+)
+_PERSON_ORG_BRIDGE_FULL_PATTERN = re.compile(
+    r"(?P<person>[\u4e00-\u9fa5]{2,8}(?:·[\u4e00-\u9fa5]{2,8})?)"
+    r"(?P<bridge>担任|任职|就职|供职|出任|兼任|兼为|服务于|加入|为|是|系)"
+    r"(?P<subject>[\u4e00-\u9fa5A-Za-z0-9（）()·\-]{2,48}?"
+    r"(?:股份有限公司|有限责任公司|集团有限公司|有限公司|分公司|子公司|公司|集团|银行|支行|分行|营业部|事务所|研究院|研究所|服务中心|技术中心|法院|人民法院|检察院|人民检察院|公安局|派出所|委员会|管理委员会))"
+)
 _PARALLEL_CONTEXT_SHORT_ORG_PATTERN = re.compile(
     rf"(?P<left>[\u4e00-\u9fa5A-Za-z0-9]{{2,6}})"
     rf"(?P<sep>和|与|及|以及|、)"
@@ -221,7 +233,7 @@ class TypeRuleRecognizers:
     ORG_PREFIX_NOISE = re.compile(
         r"^(?:由|并由|后续由|随后由|另由|另行由|同时由|共同由|分别由|"
         r"通过|经过|经由|根据|依据|按照|要求|通知|说明|确认|请求|判令|"
-        r"向|对|与|和|及|以及|将|把|被|为|"
+        r"向|对|与|和|及|以及|将|把|被|担任|任职|就职|供职|出任|兼任|兼为|加入|服务于|是|系|为|"
         r"甲方|乙方|丙方|原告|被告|申请人|被申请人|第三人)\s*[:：]?\s*[（(《【]?\s*"
     )
     STRUCTURE_UNIT_CONTAINERS = {
@@ -486,6 +498,70 @@ class TypeRuleRecognizers:
 
         results: list[RecognizerResult] = []
         seen_spans: set[tuple[int, int]] = set()
+        for match in _PERSON_ORG_BRIDGE_FULL_PATTERN.finditer(text or ""):
+            person = match.group("person")
+            subject = match.group("subject")
+            if not (looks_like_natural_person_name(person) and is_probable_person(person)):
+                continue
+            if not (self._is_usable_context_short_org(subject, right_cue=normalize_entity_text(subject)) or self._is_strong_organization_subject(subject)):
+                continue
+            start, end = match.span(0)
+            if (start, end) in seen_spans:
+                continue
+            seen_spans.add((start, end))
+            results.append(
+                self._make(
+                    start,
+                    end,
+                    "ORGANIZATION",
+                    text,
+                    "rule_organization_context",
+                    0.88,
+                    metadata={
+                        "trigger": "person_org_bridge_subject",
+                        "source_layer": "structure",
+                        "short_org_candidate": True,
+                        "requires_manual_review": True,
+                        "identity_surface": normalize_entity_text(subject),
+                        "bridge_split": True,
+                        "bridge_person_surface": normalize_entity_text(person),
+                        "bridge_subject_surface": normalize_entity_text(subject),
+                    },
+                )
+            )
+        for match in _PERSON_ORG_BRIDGE_SHORT_PATTERN.finditer(text or ""):
+            person = match.group("person")
+            bridge = match.group("bridge")
+            subject = match.group("subject")
+            if not (looks_like_natural_person_name(person) and is_probable_person(person)):
+                continue
+            if not self._is_usable_context_short_org(subject, right_cue=normalize_entity_text(subject)):
+                continue
+            start, end = match.span(0)
+            if (start, end) in seen_spans:
+                continue
+            seen_spans.add((start, end))
+            results.append(
+                self._make(
+                    start,
+                    end,
+                    "ORGANIZATION",
+                    text,
+                    "rule_organization_context",
+                    0.87,
+                    metadata={
+                        "trigger": "person_org_bridge_short_org",
+                        "source_layer": "structure",
+                        "short_org_candidate": True,
+                        "requires_manual_review": True,
+                        "identity_surface": normalize_entity_text(subject),
+                        "bridge_split": True,
+                        "bridge_person_surface": normalize_entity_text(person),
+                        "bridge_token": bridge,
+                        "bridge_subject_surface": normalize_entity_text(subject),
+                    },
+                )
+            )
         for match in _FUNCTION_CONTEXT_SHORT_ORG_PATTERN.finditer(text or ""):
             start, end = match.span("subject")
             if (start, end) in seen_spans:
@@ -547,6 +623,11 @@ class TypeRuleRecognizers:
             subject = text[start:end]
             if not self._is_usable_context_short_org(subject, right_cue=boundary_kind):
                 continue
+            if not left_cue:
+                if boundary_kind == "role_tail":
+                    continue
+                if not short_org_boundary_has_strong_surface(subject):
+                    continue
             if not left_cue and not short_org_boundary_has_strong_surface(subject):
                 continue
             seen_spans.add((start, end))
@@ -570,6 +651,17 @@ class TypeRuleRecognizers:
                 )
             )
         return results
+
+    @staticmethod
+    def _is_strong_organization_subject(value: str) -> bool:
+        normalized = normalize_entity_text(value)
+        if not normalized:
+            return False
+        return bool(
+            ORG_PATTERN.search(normalized)
+            or OFFICIAL_INSTITUTION_PATTERN.search(normalized)
+            or looks_like_short_org_with_company_suffix(normalized)
+        )
 
     @staticmethod
     def _iter_right_boundary_short_org_spans(text: str) -> list[tuple[int, int, str, str]]:
@@ -611,6 +703,10 @@ class TypeRuleRecognizers:
         ):
             return False
         if TypeRuleRecognizers._looks_like_non_subject_short_context(normalized):
+            return False
+        if not short_org_boundary_has_strong_surface(normalized) and not right_cue:
+            return False
+        if not right_cue:
             return False
         org_context_right_cue = any(
             token in normalize_entity_text(right_cue)
@@ -1233,10 +1329,25 @@ class TypeRuleRecognizers:
         boundary_pattern = re.compile(
             r"(?:股份有限公司|有限责任公司|集团有限公司|有限公司|分公司|子公司|公司|集团|"
             r"[ \t\r\n,，;；。:：、（）()《》【】]|与|和|及|以及|向|对|由|通过|经过|经由|根据|依据|按照|"
-            r"要求|通知|说明|确认|请求|判令|将|把|被|为)"
+            r"要求|通知|说明|确认|请求|判令|将|把|被|为|是|系|担任|任职|就职|供职|出任|兼任|兼为|加入|服务于)"
         )
+        bridge_tokens = {
+            "为",
+            "是",
+            "系",
+            "担任",
+            "任职",
+            "就职",
+            "供职",
+            "出任",
+            "兼任",
+            "兼为",
+            "加入",
+            "服务于",
+        }
         candidates: list[tuple[int, int]] = []
         for boundary in boundary_pattern.finditer(value):
+            boundary_text = boundary.group(0)
             offset = boundary.end()
             if offset >= len(value):
                 continue
@@ -1251,11 +1362,15 @@ class TypeRuleRecognizers:
                     continue
                 local_end = local_start + match.end()
                 candidate = value[local_start:local_end]
-                if SubjectAdmissionGate.is_weak_function_stripped_subject(candidate):
+                if SubjectAdmissionGate.is_weak_function_stripped_subject(candidate) and boundary_text not in bridge_tokens:
                     continue
                 normalized = normalize_entity_text(candidate)
                 entity_type = "GOVERNMENT" if is_official_institution_text(normalized) else "ORGANIZATION"
                 if SubjectAdmissionGate.passes_subject_shape(entity_type, normalized)[0]:
+                    if boundary_text in bridge_tokens:
+                        left = normalize_entity_text(value[: boundary.start()])
+                        if not (looks_like_natural_person_name(left) or is_probable_person(left)):
+                            continue
                     candidates.append((local_start, local_end))
         if not candidates:
             return None

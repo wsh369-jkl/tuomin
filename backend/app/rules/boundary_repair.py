@@ -178,8 +178,14 @@ class BoundaryRepair:
     def _trim_single(self, text: str, result: RecognizerResult) -> tuple[RecognizerResult, list[str]]:
         start = int(result.start)
         end = int(result.end)
-        expanded_span = expand_subject_span_to_containing_shape(text, start, end, result.entity_type)
-        if expanded_span is None and str(result.entity_type or "").upper() in {"ORGANIZATION", "COMPANY_NAME", "GOVERNMENT", "COURT"}:
+        metadata = dict(result.metadata or {})
+        bridge_split = bool(metadata.get("bridge_split"))
+        expanded_span = None if bridge_split else expand_subject_span_to_containing_shape(text, start, end, result.entity_type)
+        if (
+            expanded_span is None
+            and not bridge_split
+            and str(result.entity_type or "").upper() in {"ORGANIZATION", "COMPANY_NAME", "GOVERNMENT", "COURT"}
+        ):
             expanded_span = expand_org_span_with_left_region_prefix(text, start, end)
         expanded_from = None
         if expanded_span is not None:
@@ -279,7 +285,6 @@ class BoundaryRepair:
             repairs.append("weak_function_stripped_org_boundary_risk")
         if new_text == result.text and new_start == result.start and new_end == result.end:
             return result, repairs
-        metadata = dict(result.metadata or {})
         metadata["boundary_repaired_from"] = {"start": result.start, "end": result.end, "text": result.text}
         metadata["normalized_text"] = normalized_new_text
         if expanded_from is not None:
@@ -560,12 +565,17 @@ class BoundaryRepair:
         normalized = normalize_entity_text(value)
         if not normalized or not re.search(r"(?:担任|任职|就职|供职|出任|为|是|系|兼任|兼为|加入|服务于)", normalized):
             return []
-        if not (ORG_PATTERN.search(normalized) or OFFICIAL_INSTITUTION_PATTERN.search(normalized)):
-            return []
         bridge_candidates = sorted(
             ["担任", "任职", "就职", "供职", "出任", "兼任", "兼为", "服务于", "加入", "为", "是", "系", "在"],
             key=len,
             reverse=True,
+        )
+        short_company_pattern = re.compile(
+            r"[\u4e00-\u9fa5A-Za-z0-9]{1,6}(?:股份有限公司|有限责任公司|集团有限公司|有限公司|分公司|子公司|公司)"
+        )
+        bridge_patterns = (
+            (False, OFFICIAL_INSTITUTION_PATTERN, ORG_PATTERN),
+            (True, None, short_company_pattern),
         )
         for bridge in bridge_candidates:
             bridge_index = value.find(bridge)
@@ -581,60 +591,63 @@ class BoundaryRepair:
             person_text = person_match.group(0)
             if not is_probable_person(person_text):
                 continue
-            subject_tail = value[bridge_index + len(bridge) :].strip(" \t\r\n:：,，;；。.!！?？、")
+            subject_tail = value[bridge_index + len(bridge) :].lstrip(" \t\r\n:：,，;；。.!！?？、")
             if not subject_tail:
                 continue
-            subject_match = None
-            for pattern in (OFFICIAL_INSTITUTION_PATTERN, ORG_PATTERN):
-                match = pattern.search(subject_tail)
-                if match:
-                    subject_match = match
-                    break
-            if subject_match is None:
-                continue
-            candidate_subject = subject_tail[subject_match.start() : subject_match.end()]
-            candidate_subject = candidate_subject.strip(" \t\r\n:：,，;；。.!！?？、")
-            if not candidate_subject:
-                continue
-            subject_entity_type = "GOVERNMENT" if is_official_institution_text(candidate_subject) else "ORGANIZATION"
-            if not SubjectAdmissionGate.passes_subject_shape(
-                subject_entity_type,
-                candidate_subject,
-                allow_short_org=looks_like_organization_short_name(candidate_subject),
-            )[0]:
-                continue
-            person_start = value.rfind(person_text, 0, bridge_index)
-            if person_start < 0:
-                continue
-            person_end = person_start + len(person_text)
-            subject_start = bridge_index + len(bridge) + subject_match.start()
-            subject_end = bridge_index + len(bridge) + subject_match.end()
-            return [
-                (
-                    RecognizerResult(
-                        entity_type="PERSON",
-                        start=int(result.start) + person_start,
-                        end=int(result.start) + person_end,
-                        score=max(float(result.score or 0.0), 0.84),
-                        text=person_text,
-                        source=result.source,
-                        metadata={**dict(result.metadata or {}), "boundary_split_from": result.text, "bridge_split": True},
+            for short_company_mode, official_pattern, org_pattern in bridge_patterns:
+                subject_match = None
+                if short_company_mode:
+                    subject_match = short_company_pattern.match(subject_tail)
+                else:
+                    for pattern in (official_pattern, org_pattern):
+                        match = pattern.search(subject_tail) if pattern is not None else None
+                        if match:
+                            subject_match = match
+                            break
+                if subject_match is None:
+                    continue
+                candidate_subject = subject_tail[subject_match.start() : subject_match.end()].strip(" \t\r\n:：,，;；。.!！?？、")
+                if not candidate_subject:
+                    continue
+                subject_entity_type = "GOVERNMENT" if is_official_institution_text(candidate_subject) else "ORGANIZATION"
+                if not SubjectAdmissionGate.passes_subject_shape(
+                    subject_entity_type,
+                    candidate_subject,
+                    allow_short_org=looks_like_organization_short_name(candidate_subject) or short_company_mode,
+                )[0]:
+                    continue
+                person_start = value.rfind(person_text, 0, bridge_index)
+                if person_start < 0:
+                    continue
+                person_end = person_start + len(person_text)
+                subject_start = bridge_index + len(bridge) + subject_match.start()
+                subject_end = bridge_index + len(bridge) + subject_match.end()
+                return [
+                    (
+                        RecognizerResult(
+                            entity_type="PERSON",
+                            start=int(result.start) + person_start,
+                            end=int(result.start) + person_end,
+                            score=max(float(result.score or 0.0), 0.84),
+                            text=person_text,
+                            source=result.source,
+                            metadata={**dict(result.metadata or {}), "boundary_split_from": result.text, "bridge_split": True},
+                        ),
+                        ["split_person_org_bridge_subject"],
                     ),
-                    ["split_person_org_bridge_subject"],
-                ),
-                (
-                    RecognizerResult(
-                        entity_type=subject_entity_type,
-                        start=int(result.start) + subject_start,
-                        end=int(result.start) + subject_end,
-                        score=max(float(result.score or 0.0), 0.84),
-                        text=candidate_subject,
-                        source=result.source,
-                        metadata={**dict(result.metadata or {}), "boundary_split_from": result.text, "bridge_split": True},
+                    (
+                        RecognizerResult(
+                            entity_type=subject_entity_type,
+                            start=int(result.start) + subject_start,
+                            end=int(result.start) + subject_end,
+                            score=max(float(result.score or 0.0), 0.84),
+                            text=candidate_subject,
+                            source=result.source,
+                            metadata={**dict(result.metadata or {}), "boundary_split_from": result.text, "bridge_split": True},
+                        ),
+                        ["split_person_org_bridge_subject"],
                     ),
-                    ["split_person_org_bridge_subject"],
-                ),
-            ]
+                ]
         return []
 
     def _find_subject_spans_in_narrative(self, value: str, entity_type: str) -> list[tuple[int, int]]:

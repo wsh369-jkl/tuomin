@@ -3210,7 +3210,20 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
         if entity_type == "GOVERNMENT":
             if not is_official_institution_text(normalized) and not subject_noun_gate("GOVERNMENT", normalized)[0]:
                 return "deterministic_final_subject_weak_government_shape"
-        if entity_type == "ORGANIZATION":
+        if entity_type in {"ORGANIZATION", "GOVERNMENT"}:
+            left_reason = subject_noun_gate(
+                entity_type,
+                normalized,
+                allow_short_org=entity_type == "ORGANIZATION" and looks_like_organization_short_name(normalized),
+            )[1]
+            if left_reason in {
+                "leading_subject_linking_verb",
+                "subject_linking_verb_with_unresolved_left_context",
+                "leading_function_prefix",
+                "previous_subject_prefix",
+                "company_prefix_before_official_institution",
+            }:
+                return "deterministic_final_subject_left_context_pollution"
             if is_generic_organization_term(normalized):
                 return "deterministic_final_subject_generic_organization_term"
             if is_probable_person(normalized) and not is_org_like_text(normalized):
@@ -3264,6 +3277,23 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
             return "deterministic_rule_org_role_or_title"
         if is_generic_organization_term(normalized):
             return "deterministic_rule_org_generic_term"
+        if subject_noun_gate("ORGANIZATION", normalized, allow_short_org=looks_like_organization_short_name(normalized))[1] in {
+            "leading_subject_linking_verb",
+            "subject_linking_verb_with_unresolved_left_context",
+            "leading_function_prefix",
+            "previous_subject_prefix",
+            "company_prefix_before_official_institution",
+        }:
+            return "deterministic_rule_org_left_context_pollution"
+        if entity_type == "GOVERNMENT":
+            if subject_noun_gate("GOVERNMENT", normalized, allow_short_org=False)[1] in {
+                "leading_subject_linking_verb",
+                "subject_linking_verb_with_unresolved_left_context",
+                "leading_function_prefix",
+                "previous_subject_prefix",
+                "company_prefix_before_official_institution",
+            }:
+                return "deterministic_rule_org_left_context_pollution"
 
         strong_suffix = any(normalized.endswith(suffix) for suffix in RULE_ORG_REVIEW_STRONG_SUFFIXES)
         if source == "rule_organization_context" and not strong_suffix:

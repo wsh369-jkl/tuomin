@@ -3627,6 +3627,7 @@ class ContextualDesensitizationService:
             or (source_layer == "structure" and trigger.endswith("short_org"))
             or (source_layer == "structure" and trigger.endswith("short_org_candidate"))
             or (source_layer == "structure" and "short_org" in trigger)
+            or bool(metadata.get("bridge_split"))
         )
 
     def _should_keep_reviewed_short_org_candidate(

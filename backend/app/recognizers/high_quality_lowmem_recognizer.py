@@ -669,6 +669,14 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
             if alias_added:
                 quality_flags.append("alias_propagation_applied")
 
+        merged, late_rejected_count, late_added_count = self._apply_late_deterministic_adjudication(text, merged)
+        stage_counts["late_deterministic_adjudication_rejected"] = late_rejected_count
+        stage_counts["late_deterministic_adjudication_entities"] = late_added_count
+        if late_rejected_count:
+            quality_flags.append("late_deterministic_adjudication_applied")
+        if late_added_count:
+            quality_flags.append("late_deterministic_adjudication_entities_applied")
+
         if self._needs_quality_review(text, merged):
             requires_manual_review = True
             quality_flags.append("quality_anomaly_detected")
@@ -2038,6 +2046,37 @@ class HighQualityLowMemoryRecognizer(BaseRecognizer):
     def _final_deterministic_adjudication_rejections(results: List[RecognizerResult]) -> List[dict]:
         decisions = HighQualityLowMemoryRecognizer._final_deterministic_adjudication_decisions(results)
         return list(decisions.get("rejections") or [])
+
+    @classmethod
+    def _apply_late_deterministic_adjudication(
+        cls,
+        text: str,
+        results: List[RecognizerResult],
+    ) -> tuple[List[RecognizerResult], int, int]:
+        if not results:
+            return list(results), 0, 0
+        decisions = cls._final_deterministic_adjudication_decisions(results)
+        rejections = list(decisions.get("rejections") or [])
+        filtered = cls._apply_review_rejections(results, rejections) if rejections else list(results)
+        rejected_count = max(0, len(results) - len(filtered))
+        entity_rows = list(decisions.get("entities") or [])
+        added_entities: list[RecognizerResult] = []
+        if entity_rows:
+            added_entities = QwenFragmentReviewService()._materialize_candidates(
+                text,
+                {"entities": entity_rows},
+                RiskSnippet(
+                    "final_subject_adjudication",
+                    "final_subject:deterministic_late",
+                    0,
+                    len(text),
+                    text,
+                ),
+                source_name="review_deterministic_decision",
+            )
+        if added_entities:
+            filtered.extend(cls._canonicalize_default_results(added_entities))
+        return filtered, rejected_count, len(added_entities)
 
     @staticmethod
     def _apply_review_rejections(
