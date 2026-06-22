@@ -3474,6 +3474,13 @@ class ContextualDesensitizationService:
                 source=str(entity.get("source", "")),
                 metadata=organization_metadata,
             ):
+                metadata = dict(entity.get("metadata") or {})
+                metadata["short_org_publication_review_required"] = True
+                metadata["requires_manual_review"] = True
+                entity["metadata"] = metadata
+                filtered.append(entity)
+                continue
+            if entity_type in {"ORGANIZATION", "COMPANY_NAME"} and self._is_weak_organization_reference(entity_text):
                 removed += 1
                 continue
             if (
@@ -3633,8 +3640,6 @@ class ContextualDesensitizationService:
         normalized = self._normalize_group_text(text)
         if not looks_like_organization_short_name(normalized):
             return False
-        if self._is_weak_organization_reference(normalized):
-            return False
         if (
             is_identity_reference_term(normalized)
             or is_position_title(normalized)
@@ -3755,8 +3760,6 @@ class ContextualDesensitizationService:
         normalized = self._normalize_group_text(text)
         if len(normalized) < 2:
             return False
-        if metadata.get("weak_reference") and self._sanitize_canonical_key(metadata.get("canonical_key")):
-            return self._is_weak_organization_reference(normalized)
         prefixed_remainder = strip_identity_reference_prefix(normalized)
         if prefixed_remainder:
             return False
@@ -4110,6 +4113,8 @@ class ContextualDesensitizationService:
         occupied_ranges = [(int(item["start"]), int(item["end"])) for item in existing_entities]
         additions: List[Dict] = []
         for hit in residual_hits[:max_added]:
+            if hit.get("weak_reference"):
+                continue
             entity_type = str(hit.get("type", ""))
             start = int(hit.get("start", 0))
             end = int(hit.get("end", 0))
@@ -4920,16 +4925,7 @@ Contract text:
         return True
 
     def _is_weak_organization_reference(self, text: str) -> bool:
-        normalized = self._normalize_group_text(text)
-        if not normalized:
-            return False
-        if normalized in self.WEAK_ORGANIZATION_REFERENCES:
-            return True
-        return any(
-            normalized == token or normalized.startswith(token)
-            for token in self.WEAK_ORGANIZATION_REFERENCES
-            if len(token) >= 2
-        )
+        return self._normalize_group_text(text) in self.WEAK_ORGANIZATION_REFERENCES
 
     def _find_exact_spans(self, text: str, target: str) -> List[int]:
         positions: List[int] = []

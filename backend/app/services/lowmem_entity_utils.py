@@ -1306,6 +1306,7 @@ def iter_docx_structure_units(source_structure: dict[str, Any] | None) -> Iterat
         return
 
     raw_unit_ids: set[str] = set()
+    raw_unit_keys: set[tuple[str, str, int, int, str, str]] = set()
     raw_units = source_structure.get("docx_text_units")
     if isinstance(raw_units, list):
         for unit in raw_units:
@@ -1314,6 +1315,7 @@ def iter_docx_structure_units(source_structure: dict[str, Any] | None) -> Iterat
             unit_id = str(unit.get("unit_id") or "").strip()
             if unit_id:
                 raw_unit_ids.add(unit_id)
+            raw_unit_keys.add(_docx_structure_unit_identity_key(unit))
             yield unit
 
     pages = source_structure.get("pages")
@@ -1331,7 +1333,26 @@ def iter_docx_structure_units(source_structure: dict[str, Any] | None) -> Iterat
             unit_id = str(unit.get("unit_id") or "").strip()
             if unit_id and unit_id in raw_unit_ids:
                 continue
+            if not unit_id and _docx_structure_unit_identity_key(unit) in raw_unit_keys:
+                continue
             yield unit
+
+
+def _docx_structure_unit_identity_key(unit: dict[str, Any]) -> tuple[str, str, int, int, str, str]:
+    try:
+        start = int(unit.get("start"))
+        end = int(unit.get("end"))
+    except (TypeError, ValueError):
+        start = -1
+        end = -1
+    return (
+        str(unit.get("unit_id") or "").strip(),
+        str(unit.get("part_name") or "").strip(),
+        start,
+        end,
+        "".join(str(unit.get("text") or "").split()),
+        str(unit.get("container_type") or "").strip(),
+    )
 
 
 def docx_structure_unit_inventory(source_structure: dict[str, Any] | None) -> dict[str, int]:
@@ -1348,6 +1369,7 @@ def docx_structure_unit_inventory(source_structure: dict[str, Any] | None) -> di
         }
 
     raw_unit_ids: set[str] = set()
+    raw_unit_keys: set[tuple[str, str, int, int, str, str]] = set()
     duplicate_raw_ids = 0
     raw_count = 0
     raw_units = source_structure.get("docx_text_units")
@@ -1358,10 +1380,12 @@ def docx_structure_unit_inventory(source_structure: dict[str, Any] | None) -> di
             raw_count += 1
             unit_id = str(unit.get("unit_id") or "").strip()
             if not unit_id:
+                raw_unit_keys.add(_docx_structure_unit_identity_key(unit))
                 continue
             if unit_id in raw_unit_ids:
                 duplicate_raw_ids += 1
             raw_unit_ids.add(unit_id)
+            raw_unit_keys.add(_docx_structure_unit_identity_key(unit))
 
     page_count = 0
     duplicate_page_ids = 0
@@ -1379,7 +1403,9 @@ def docx_structure_unit_inventory(source_structure: dict[str, Any] | None) -> di
                     continue
                 page_count += 1
                 unit_id = str(unit.get("unit_id") or "").strip()
-                if unit_id and unit_id in raw_unit_ids:
+                if (unit_id and unit_id in raw_unit_ids) or (
+                    not unit_id and _docx_structure_unit_identity_key(unit) in raw_unit_keys
+                ):
                     duplicate_page_ids += 1
                 else:
                     unique_page_extra += 1

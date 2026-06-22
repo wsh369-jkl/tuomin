@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from collections import Counter
 from typing import Any, Iterable
@@ -13,6 +14,7 @@ from app.rules.evidence import source_layer_for_result, with_rule_metadata
 from app.rules.false_positive_rules import FalsePositiveRules
 from app.rules.format_recognizer import FormatRecognizer
 from app.rules.directory_quality_gate import DirectoryQualityGate
+from app.rules.subject_admission_gate import SubjectAdmissionGate
 from app.rules.subject_ledger import SubjectLedgerBuilder
 from app.rules.type_recognizers import TypeRuleRecognizers
 from app.rules.types import RuleEvidence
@@ -39,6 +41,7 @@ class RuleFirstPipeline:
         self.type_recognizers = TypeRuleRecognizers()
         self.boundary_repair = BoundaryRepair()
         self.false_positive_rules = FalsePositiveRules()
+        self.subject_admission_gate = SubjectAdmissionGate()
         self.subject_ledger = SubjectLedgerBuilder()
         self.directory_quality_gate = DirectoryQualityGate()
 
@@ -68,7 +71,23 @@ class RuleFirstPipeline:
         validator_pass_count = 0
         validator_fail_count = 0
 
-        for raw_result in [*input_results, *format_results, *type_rule_results]:
+        raw_results = [*input_results, *format_results, *type_rule_results]
+        canonicalized_count = 0
+        boundary_candidate_count = 0
+        boundary_repair_reason_counts: Counter[str] = Counter()
+        subject_admission_action_counts: Counter[str] = Counter()
+        subject_admission_negative_reason_counts: Counter[str] = Counter()
+        subject_admission_positive_reason_counts: Counter[str] = Counter()
+        gate_action_source_counts: Counter[str] = Counter()
+        candidate_after_boundary: list[RecognizerResult] = []
+        candidate_after_gate: list[RecognizerResult] = []
+        candidate_ledger_entries: list[dict[str, Any]] = []
+        for raw_result in raw_results:
+            self._record_candidate_ledger_entry(
+                candidate_ledger_entries,
+                state="raw",
+                result=raw_result,
+            )
             result = canonicalize_default_result(raw_result)
             if result is None:
                 rejected = self._annotate_rejected_result(
@@ -99,9 +118,20 @@ class RuleFirstPipeline:
                     rejected_review_only_candidate_count += 1
                 action_counts["reject"] = action_counts.get("reject", 0) + 1
                 continue
+            canonicalized_count += 1
             normalized_result, type_changed = self._repair_type(result)
             type_change_count += int(type_changed)
             for repaired, repairs in self.boundary_repair.repair(text, normalized_result):
+                boundary_candidate_count += 1
+                candidate_after_boundary.append(repaired)
+                for repair in self._clean_strings(repairs):
+                    boundary_repair_reason_counts[repair] += 1
+                self._record_candidate_ledger_entry(
+                    candidate_ledger_entries,
+                    state="boundary_normalized",
+                    result=repaired,
+                    reasons=repairs,
+                )
                 if repairs:
                     boundary_repair_count += 1
                 reject, positive, negative = self.false_positive_rules.assess(repaired)
@@ -110,8 +140,23 @@ class RuleFirstPipeline:
                 validators_failed = tuple({*validation.failed, *self._metadata_list(repaired, "validators_failed")})
                 validator_pass_count += len(validators_passed)
                 validator_fail_count += len(validators_failed)
-                action = "reject" if reject else self._action_for(repaired, negative, validators_failed)
-                risk_level = self._risk_level_for(repaired, negative, validators_failed, action)
+                admission = self.subject_admission_gate.decide(
+                    repaired,
+                    false_positive_reject=reject,
+                    positive_signals=positive,
+                    negative_signals=negative,
+                    validators_failed=validators_failed,
+                )
+                action = admission.action
+                risk_level = admission.risk_level
+                positive = list(admission.positive_signals)
+                negative = list(admission.negative_signals)
+                subject_admission_action_counts[action] += 1
+                gate_action_source_counts[f"{action}:{repaired.source or 'unknown'}"] += 1
+                for reason in negative:
+                    subject_admission_negative_reason_counts[reason] += 1
+                for reason in positive:
+                    subject_admission_positive_reason_counts[reason] += 1
                 confidence = max(float(repaired.score or 0.0), float(validation.confidence or 0.0))
                 evidence = RuleEvidence(
                     candidate_id=self._candidate_id(repaired),
@@ -127,8 +172,19 @@ class RuleFirstPipeline:
                     action=action,
                 )
                 action_counts[action] = action_counts.get(action, 0) + 1
-                updated = with_rule_metadata(repaired, evidence=evidence)
-                if reject:
+                updated = with_rule_metadata(
+                    repaired,
+                    evidence=evidence,
+                    extra={"subject_admission": admission.to_metadata()},
+                )
+                self._record_candidate_ledger_entry(
+                    candidate_ledger_entries,
+                    state="gate",
+                    result=updated,
+                    action=action,
+                    reasons=(*negative, *validators_failed, *repairs),
+                )
+                if action == "reject":
                     reasons = self._reject_reasons(
                         positive=positive,
                         negative=negative,
@@ -163,17 +219,73 @@ class RuleFirstPipeline:
                     if self._is_review_only_rejected_candidate(rejected):
                         rejected_review_only_candidate_count += 1
                 else:
+                    candidate_after_gate.append(updated)
                     repaired_results.append(updated)
 
         deduped = deduplicate_results(repaired_results)
+        for result in deduped:
+            self._record_candidate_ledger_entry(
+                candidate_ledger_entries,
+                state="subject_ledger_input",
+                result=result,
+                action=str((result.metadata or {}).get("rule_first", {}).get("action") or ""),
+            )
         ledger_result = self.subject_ledger.build(deduped)
         with_subjects = ledger_result.results
         directory_quality = self.directory_quality_gate.evaluate(with_subjects)
+        candidate_ledger = self._build_rule_first_candidate_ledger(candidate_ledger_entries)
+        candidate_ledger_state_counts = Counter(str(item.get("state") or "") for item in candidate_ledger_entries)
+        candidate_ledger_action_counts = Counter(
+            str(item.get("action") or "unknown") for item in candidate_ledger_entries if item.get("action")
+        )
+        candidate_ledger_reason_counts: Counter[str] = Counter()
+        for entry in candidate_ledger_entries:
+            for reason in entry.get("reasons") or ():
+                candidate_ledger_reason_counts[str(reason)] += 1
+        raw_count_by_source, raw_count_by_type, raw_count_by_source_layer = self._candidate_count_groups(raw_results)
+        boundary_count_by_source, boundary_count_by_type, boundary_count_by_source_layer = self._candidate_count_groups(
+            candidate_after_boundary
+        )
+        gate_count_by_source, gate_count_by_type, gate_count_by_source_layer = self._candidate_count_groups(
+            candidate_after_gate
+        )
         metadata = {
             "rule_first_enabled": True,
+            "rule_first_raw_candidate_count": len(raw_results),
             "rule_first_input_candidate_count": len(input_results),
             "rule_first_format_candidate_count": len(format_results),
             "rule_first_type_rule_candidate_count": len(type_rule_results),
+            "candidate_raw_count_by_source": raw_count_by_source,
+            "candidate_raw_count_by_type": raw_count_by_type,
+            "candidate_raw_count_by_source_layer": raw_count_by_source_layer,
+            "rule_first_canonicalized_candidate_count": canonicalized_count,
+            "rule_first_boundary_candidate_count": boundary_candidate_count,
+            "candidate_after_boundary_count_by_source": boundary_count_by_source,
+            "candidate_after_boundary_count_by_type": boundary_count_by_type,
+            "candidate_after_boundary_count_by_source_layer": boundary_count_by_source_layer,
+            "candidate_after_gate_count_by_source": gate_count_by_source,
+            "candidate_after_gate_count_by_type": gate_count_by_type,
+            "candidate_after_gate_count_by_source_layer": gate_count_by_source_layer,
+            "rule_first_gate_action_source_counts": dict(sorted(gate_action_source_counts.items())),
+            "subject_admission_action_counts": dict(sorted(subject_admission_action_counts.items())),
+            "subject_admission_negative_reason_counts": dict(sorted(subject_admission_negative_reason_counts.items())),
+            "subject_admission_positive_reason_counts": dict(sorted(subject_admission_positive_reason_counts.items())),
+            "rule_first_boundary_repair_reason_counts": dict(sorted(boundary_repair_reason_counts.items())),
+            "rule_first_deduped_candidate_count": len(deduped),
+            "rule_first_dedupe_removed_candidate_count": max(0, len(repaired_results) - len(deduped)),
+            "subject_ledger_input_candidate_count": len(deduped),
+            "candidate_ledger_total": boundary_candidate_count,
+            "candidate_ledger_accepted": int(candidate_ledger_action_counts.get("keep") or 0),
+            "candidate_ledger_review_only": int(candidate_ledger_action_counts.get("review") or 0),
+            "candidate_ledger_rejected": int(candidate_ledger_action_counts.get("reject") or 0),
+            "candidate_ledger_rejected_total": len(rejected_results),
+            "candidate_ledger_lost_before_subject_ledger": max(0, boundary_candidate_count - len(deduped)),
+            "candidate_ledger": candidate_ledger,
+            "candidate_ledger_summary": candidate_ledger["summary"],
+            "candidate_ledger_entry_count": len(candidate_ledger_entries),
+            "candidate_ledger_state_counts": dict(sorted(candidate_ledger_state_counts.items())),
+            "candidate_ledger_action_counts": dict(sorted(candidate_ledger_action_counts.items())),
+            "candidate_ledger_reason_counts": dict(sorted(candidate_ledger_reason_counts.items())),
             "rule_first_output_candidate_count": len(with_subjects),
             "rule_first_rejected_candidate_count": len(rejected_results),
             "rule_first_rejected_review_only_candidate_count": rejected_review_only_candidate_count,
@@ -206,6 +318,81 @@ class RuleFirstPipeline:
             metadata=metadata,
             rejected_results=rejected_results,
         )
+
+    @classmethod
+    def _candidate_count_groups(
+        cls,
+        results: Iterable[RecognizerResult],
+    ) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+        by_source: Counter[str] = Counter()
+        by_type: Counter[str] = Counter()
+        by_source_layer: Counter[str] = Counter()
+        for result in results or ():
+            by_source[str(result.source or "unknown")] += 1
+            by_type[str(result.entity_type or "UNKNOWN").upper()] += 1
+            by_source_layer[source_layer_for_result(result)] += 1
+        return (
+            dict(sorted(by_source.items())),
+            dict(sorted(by_type.items())),
+            dict(sorted(by_source_layer.items())),
+        )
+
+    @classmethod
+    def _record_candidate_ledger_entry(
+        cls,
+        entries: list[dict[str, Any]],
+        *,
+        state: str,
+        result: RecognizerResult,
+        action: str = "",
+        reasons: Iterable[Any] = (),
+    ) -> None:
+        metadata = dict(result.metadata or {})
+        normalized = normalize_entity_text(result.text)
+        entry = {
+            "candidate_id": str(metadata.get("candidate_id") or f"C{len(entries) + 1:05d}"),
+            "state": state,
+            "entity_type": str(result.entity_type or "UNKNOWN").upper(),
+            "start": int(result.start),
+            "end": int(result.end),
+            "source": str(result.source or "unknown"),
+            "source_layer": source_layer_for_result(result),
+            "score": float(result.score or 0.0),
+            "text_hash": cls._text_hash(str(result.text or "")),
+            "normalized_text_hash": cls._text_hash(normalized),
+            "action": action,
+            "reasons": list(cls._clean_strings(reasons)),
+        }
+        trigger = str(metadata.get("trigger") or "")
+        if trigger:
+            entry["trigger"] = trigger
+        entries.append(entry)
+
+    @staticmethod
+    def _text_hash(value: str) -> str:
+        return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()[:16]
+
+    @classmethod
+    def _build_rule_first_candidate_ledger(cls, entries: list[dict[str, Any]]) -> dict[str, Any]:
+        state_counts: Counter[str] = Counter(str(item.get("state") or "unknown") for item in entries)
+        action_counts: Counter[str] = Counter(str(item.get("action") or "") for item in entries if item.get("action"))
+        source_counts: Counter[str] = Counter(str(item.get("source") or "unknown") for item in entries)
+        type_counts: Counter[str] = Counter(str(item.get("entity_type") or "UNKNOWN") for item in entries)
+        sanitized_entries = [
+            {key: value for key, value in entry.items() if key not in {"text", "normalized_text"}}
+            for entry in entries
+        ]
+        return {
+            "version": "candidate_ledger.v1",
+            "entries": sanitized_entries,
+            "summary": {
+                "entry_count": len(entries),
+                "state_counts": dict(sorted(state_counts.items())),
+                "action_counts": dict(sorted(action_counts.items())),
+                "source_counts": dict(sorted(source_counts.items())),
+                "type_counts": dict(sorted(type_counts.items())),
+            },
+        }
 
     @staticmethod
     def _candidate_id(result: RecognizerResult) -> str:
