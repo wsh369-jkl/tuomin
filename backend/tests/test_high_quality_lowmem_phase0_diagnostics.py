@@ -398,6 +398,19 @@ def test_rule_pipeline_splits_parallel_org_subjects_instead_of_merging():
     assert "星河和景岳" not in org_texts
 
 
+def test_rule_pipeline_splits_person_org_bridge_subjects_without_merging():
+    pipeline = RuleFirstPipeline()
+    text = "张三担任北京星河科技有限公司法定代表人。"
+
+    result = pipeline.apply(text=text, results=[])
+    person_texts = [item.text for item in result.results if item.entity_type == "PERSON"]
+    org_texts = [item.text for item in result.results if item.entity_type == "ORGANIZATION"]
+
+    assert "张三" in person_texts
+    assert "北京星河科技有限公司" in org_texts
+    assert "张三担任北京星河科技有限公司" not in org_texts
+
+
 def test_rule_layer_label_value_does_not_emit_parenthesized_polluted_company_candidate():
     recognizer = TypeRuleRecognizers()
     text = "甲方：（广东省星河科技有限公司）签署合同。"
