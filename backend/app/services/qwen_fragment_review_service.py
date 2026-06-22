@@ -28,6 +28,7 @@ from app.services.lowmem_entity_utils import (
     expand_subject_span_to_containing_shape,
     find_short_org_prefix_before_non_subject_boundary,
     find_value_span,
+    has_official_region_prefix,
     infer_semantic_type,
     is_generic_organization_term,
     is_government_institution_text,
@@ -39,6 +40,7 @@ from app.services.lowmem_entity_utils import (
     is_position_title,
     is_probable_person,
     is_weak_function_stripped_org,
+    looks_like_admin_region_prefix,
     looks_like_organization_short_name,
     normalize_entity_text,
     make_entity,
@@ -2635,12 +2637,14 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
                 search_start=snippet.start,
                 search_end=snippet.end,
             )
-            expanded_span = expand_subject_span_to_containing_shape(
-                full_text,
-                span[0],
-                span[1],
-                entity_type,
-            )
+            expanded_span = None
+            if not self._materialized_subject_has_complete_anchor(raw_text, entity_type):
+                expanded_span = expand_subject_span_to_containing_shape(
+                    full_text,
+                    span[0],
+                    span[1],
+                    entity_type,
+                )
             if expanded_span is not None:
                 expanded_text = full_text[expanded_span[0] : expanded_span[1]]
                 if exact_raw_span is not None and self._expanded_span_adds_context_noise(
@@ -2653,6 +2657,44 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
                     span = expanded_span
             return full_text[span[0] : span[1]], span
         return "", None
+
+    @staticmethod
+    def _materialized_subject_has_complete_anchor(text: str, entity_type: str) -> bool:
+        normalized = normalize_entity_text(text)
+        normalized_type = str(entity_type or "").upper()
+        if not normalized:
+            return False
+        if normalized_type in {"GOVERNMENT", "COURT"}:
+            return is_official_institution_text(normalized)
+        if normalized_type not in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME", "ALIAS"}:
+            return False
+        if is_official_institution_text(normalized):
+            return True
+        if not is_org_like_text(normalized):
+            return False
+        if normalized.startswith(("中国", "国家", "中华人民共和国")):
+            return True
+        if looks_like_admin_region_prefix(normalized) or has_official_region_prefix(normalized):
+            return True
+        return any(
+            normalized.endswith(suffix)
+            for suffix in (
+                "股份有限公司",
+                "有限责任公司",
+                "集团有限公司",
+                "有限公司",
+                "分公司",
+                "子公司",
+                "集团",
+                "公司",
+                "律师事务所",
+                "会计师事务所",
+                "研究院",
+                "研究所",
+                "服务中心",
+                "技术中心",
+            )
+        )
 
     @staticmethod
     def _expanded_span_adds_context_noise(expanded_text: str, raw_text: str, entity_type: str) -> bool:
@@ -3222,6 +3264,7 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
                 "leading_function_prefix",
                 "previous_subject_prefix",
                 "company_prefix_before_official_institution",
+                "narrative_shell_before_company_core",
             }:
                 return "deterministic_final_subject_left_context_pollution"
             if is_generic_organization_term(normalized):
@@ -3283,6 +3326,7 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
             "leading_function_prefix",
             "previous_subject_prefix",
             "company_prefix_before_official_institution",
+            "narrative_shell_before_company_core",
         }:
             return "deterministic_rule_org_left_context_pollution"
         if entity_type == "GOVERNMENT":
@@ -3292,6 +3336,7 @@ JSON 格式：{{"entities":[{{"type":"ORGANIZATION","text":"某某公司","role"
                 "leading_function_prefix",
                 "previous_subject_prefix",
                 "company_prefix_before_official_institution",
+                "narrative_shell_before_company_core",
             }:
                 return "deterministic_rule_org_left_context_pollution"
 

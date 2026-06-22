@@ -17,6 +17,7 @@ from app.services.lowmem_entity_utils import (
     is_official_institution_text,
     is_probable_person,
     is_org_like_text,
+    looks_like_admin_region_prefix,
     looks_like_organization_short_name,
     looks_like_natural_person_name,
     normalize_entity_text,
@@ -130,14 +131,81 @@ _ORG_LEFT_POLLUTION_TERMS = (
     "交付",
     "承担",
 )
+_NARRATIVE_SHELL_TOKENS = (
+    "伙同",
+    "假借",
+    "冒充",
+    "谎称",
+    "中间人身份",
+    "身份",
+    "人员",
+    "员工",
+    "工作人员",
+    "代理人",
+    "代表人",
+    "负责人",
+    "联系人",
+    "原告",
+    "被告",
+    "申请人",
+    "被申请人",
+    "第三人",
+    "上述",
+    "前述",
+    "相关",
+    "涉案",
+)
+_NARRATIVE_SHELL_ACTION_TOKENS = (
+    "负责",
+    "提交",
+    "确认",
+    "要求",
+    "请求",
+    "签署",
+    "签订",
+    "对账",
+    "付款",
+    "收款",
+    "结算",
+    "办理",
+    "协助",
+    "配合",
+    "通过",
+    "根据",
+    "依据",
+    "按照",
+    "经过",
+    "经由",
+)
 _COMMON_REGION_BODY = (
     r"中华人民共和国|国家|中国|全国|中央|最高|"
     r"北京|上海|天津|重庆|广州|深圳|杭州|南京|苏州|成都|武汉|西安|长沙|郑州|青岛|宁波|佛山|东莞|厦门|福州|济南|合肥|"
-    r"[\u4e00-\u9fa5]{2,16}(?:省|自治区|特别行政区|市|地区|自治州|盟|区|县|旗|自治县|自治旗)"
+    r"(?:"
+    r"[\u4e00-\u9fa5]{2,12}(?:省|自治区|特别行政区)"
+    r"(?:[\u4e00-\u9fa5]{2,12}(?:市|地区|自治州|盟))?"
+    r"(?:[\u4e00-\u9fa5]{1,12}(?:区|县|旗|自治县|自治旗))?"
+    r"|[\u4e00-\u9fa5]{2,12}(?:市|地区|自治州|盟)"
+    r"(?:[\u4e00-\u9fa5]{1,12}(?:区|县|旗|自治县|自治旗))?"
+    r"|[\u4e00-\u9fa5]{2,12}(?:区|县|旗|自治县|自治旗)"
+    r")"
 )
 _COMMON_REGION_PREFIX = re.compile(rf"^(?:{_COMMON_REGION_BODY})")
 _COMMON_REGION_ANYWHERE = re.compile(rf"(?:{_COMMON_REGION_BODY})")
 _TRAILING_PUNCT = " \t\r\n:：,，;；。.!！?？、（）()《》【】"
+_STRICT_REGION_HEAD = re.compile(
+    r"^(?:中华人民共和国|国家|中国|全国|中央|最高|"
+    r"(?:北京|上海|天津|重庆|广州|深圳|杭州|南京|苏州|成都|武汉|西安|长沙|郑州|青岛|宁波|佛山|东莞|厦门|福州|济南|合肥|"
+    r"乌鲁木齐|呼和浩特|石家庄|太原|沈阳|长春|哈尔滨|昆明|南宁|贵阳|南昌|海口|兰州|西宁|银川|拉萨)(?:市|区)?"
+    r"|(?:[\u4e00-\u9fa5]{2,12}(?:省|自治区|特别行政区)"
+    r"(?:[\u4e00-\u9fa5]{2,12}(?:市|地区|自治州|盟))?"
+    r"(?:[\u4e00-\u9fa5]{1,12}(?:区|县|旗|自治县|自治旗))?)"
+    r"|(?:[\u4e00-\u9fa5]{2,12}(?:地区|自治州|盟)"
+    r"(?:[\u4e00-\u9fa5]{1,12}(?:区|县|旗|自治县|自治旗))?)"
+    r"|(?:[\u4e00-\u9fa5]{2,4}市"
+    r"(?:[\u4e00-\u9fa5]{1,12}(?:区|县|旗|自治县|自治旗))?)"
+    r"|(?:[\u4e00-\u9fa5]{2,12}(?:区|县|旗|自治县|自治旗)))"
+)
+_STRICT_REGION_ANYWHERE = re.compile(_STRICT_REGION_HEAD.pattern[1:])
 
 
 def _field_label_tail_pattern() -> re.Pattern[str]:
@@ -343,6 +411,29 @@ class BoundaryRepair:
     def _best_org_suffix_anchored_span(value: str) -> tuple[int, int] | None:
         if not value:
             return None
+        direct_region_core: tuple[int, int] | None = None
+        for region_match in _STRICT_REGION_ANYWHERE.finditer(value):
+            candidate = value[region_match.start() :].strip(_TRAILING_PUNCT)
+            if not candidate:
+                continue
+            normalized_candidate = normalize_entity_text(candidate)
+            if not normalized_candidate:
+                continue
+            if not (
+                ORG_PATTERN.fullmatch(normalized_candidate)
+                or OFFICIAL_INSTITUTION_PATTERN.fullmatch(normalized_candidate)
+                or is_org_like_text(candidate)
+            ):
+                continue
+            prefix = normalize_entity_text(value[: region_match.start()])
+            if prefix and (
+                is_probable_person(prefix)
+                or looks_like_natural_person_name(prefix)
+                or any(token in prefix for token in _NARRATIVE_SHELL_TOKENS)
+                or any(token in prefix for token in _NARRATIVE_SHELL_ACTION_TOKENS)
+            ):
+                direct_region_core = (region_match.start(), region_match.start() + len(candidate))
+                break
         candidates: list[tuple[tuple[int, int, int, int, int, int], tuple[int, int]]] = []
         for suffix_match in _ORG_SUFFIX_ANCHOR_SHAPE.finditer(value):
             end = suffix_match.end()
@@ -370,6 +461,16 @@ class BoundaryRepair:
                 normalized = normalize_entity_text(candidate)
                 if not normalized:
                     continue
+                strict_region = _STRICT_REGION_ANYWHERE.search(normalized)
+                if strict_region and strict_region.start() > 0:
+                    strict_prefix = normalized[: strict_region.start()]
+                    if strict_prefix and (
+                        is_probable_person(strict_prefix)
+                        or looks_like_natural_person_name(strict_prefix)
+                        or any(token in strict_prefix for token in _NARRATIVE_SHELL_TOKENS)
+                        or any(token in strict_prefix for token in _NARRATIVE_SHELL_ACTION_TOKENS)
+                    ):
+                        continue
                 if SubjectAdmissionGate.is_action_or_function_text(normalized):
                     continue
                 if not (
@@ -397,7 +498,7 @@ class BoundaryRepair:
                     region_bonus + boundary_bonus + suffix_bonus - pollution_penalty - shape_penalty - weak_trim_penalty,
                     1 if pollution_penalty == 0 else 0,
                     1 if passes_shape else 0,
-                    len(normalized),
+                    -len(normalized),
                     -adjusted_start,
                     end,
                 )
@@ -408,13 +509,17 @@ class BoundaryRepair:
 
     @staticmethod
     def _starts_with_region_prefix(normalized: str) -> bool:
-        return bool(_COMMON_REGION_PREFIX.match(normalized or ""))
+        match = _STRICT_REGION_HEAD.match(normalized or "")
+        if not match:
+            return False
+        return looks_like_admin_region_prefix(match.group(0))
 
     @staticmethod
     def _region_starts(value: str) -> list[int]:
         starts: list[int] = []
         for index in range(len(value or "")):
-            if _COMMON_REGION_PREFIX.match(value[index:]):
+            match = _STRICT_REGION_HEAD.match(value[index:])
+            if match and looks_like_admin_region_prefix(match.group(0)):
                 starts.append(index)
         return starts
 
@@ -426,9 +531,21 @@ class BoundaryRepair:
         if normalized.startswith(tuple(_ORG_LEFT_POLLUTION_TERMS)):
             penalty += 4
         if not BoundaryRepair._starts_with_region_prefix(normalized):
-            first_region = _COMMON_REGION_PREFIX.search(normalized)
+            first_region = None
+            for match in _STRICT_REGION_ANYWHERE.finditer(normalized):
+                if looks_like_admin_region_prefix(match.group(0)):
+                    first_region = match
+                    break
             if first_region and first_region.start() > 0:
                 penalty += 3
+                prefix = normalized[: first_region.start()]
+                if prefix and not any(token in prefix for token in ("公司", "集团", "银行", "法院", "检察院", "公安局", "委员会")):
+                    if is_probable_person(prefix) or looks_like_natural_person_name(prefix):
+                        penalty += 5
+                    if any(token in prefix for token in _NARRATIVE_SHELL_TOKENS):
+                        penalty += 5
+                    if any(token in prefix for token in _NARRATIVE_SHELL_ACTION_TOKENS):
+                        penalty += 4
         for token in _ORG_LEFT_POLLUTION_TERMS:
             index = normalized.find(token)
             if 0 <= index <= 8:

@@ -6,6 +6,7 @@ import re
 from typing import Any
 
 from app.core.recognizer_base import RecognizerResult
+from app.rules.boundary_repair import BoundaryRepair
 from app.rules.default_subject_policy import canonical_default_entity_type
 from app.rules.subject_admission_gate import SubjectAdmissionGate
 from app.services.contract_structure_backfill_service import ContractStructureBackfillService
@@ -22,6 +23,7 @@ from app.services.lowmem_entity_utils import (
     is_government_institution_text,
     is_official_institution_text,
     is_probable_person,
+    looks_like_admin_region_prefix,
     find_short_org_prefix_before_non_subject_boundary,
     looks_like_short_org_with_company_suffix,
     looks_like_organization_short_name,
@@ -224,6 +226,128 @@ _SHORT_CONTEXT_NON_SUBJECT_INFIXES = (
     "事项说明",
     "账户处理",
     "业务办理",
+)
+_EMBEDDED_CORE_LEFT_BOUNDARIES = (
+    " ",
+    "\t",
+    "\r",
+    "\n",
+    "：",
+    ":",
+    "，",
+    ",",
+    "；",
+    ";",
+    "。",
+    "!",
+    "！",
+    "?",
+    "？",
+    "、",
+    "（",
+    "(",
+    "《",
+    "【",
+    "由",
+    "并由",
+    "后续由",
+    "随后由",
+    "另由",
+    "另行由",
+    "同时由",
+    "共同由",
+    "分别由",
+    "通过",
+    "经过",
+    "经由",
+    "根据",
+    "依据",
+    "按照",
+    "要求",
+    "通知",
+    "说明",
+    "确认",
+    "请求",
+    "判令",
+    "向",
+    "对",
+    "与",
+    "和",
+    "及",
+    "以及",
+    "是",
+    "系",
+    "为",
+    "担任",
+    "任职",
+    "就职",
+    "供职",
+    "出任",
+    "兼任",
+    "兼为",
+    "加入",
+    "服务于",
+    "负责",
+    "提交",
+    "签署",
+    "签订",
+    "对账",
+    "付款",
+    "收款",
+    "结算",
+    "办理",
+    "协助",
+    "配合",
+)
+_ORG_CORE_SHELL_TOKENS = (
+    "伙同",
+    "假借",
+    "冒充",
+    "谎称",
+    "中间人身份",
+    "身份",
+    "人员",
+    "员工",
+    "工作人员",
+    "代理人",
+    "代表人",
+    "负责人",
+    "联系人",
+    "原告",
+    "被告",
+    "申请人",
+    "被申请人",
+    "第三人",
+    "上述",
+    "前述",
+    "相关",
+    "涉案",
+    "与",
+    "和",
+    "及",
+    "以及",
+)
+_ORG_CORE_SHELL_ACTIONS = (
+    "负责",
+    "提交",
+    "确认",
+    "要求",
+    "请求",
+    "签署",
+    "签订",
+    "对账",
+    "付款",
+    "收款",
+    "结算",
+    "办理",
+    "协助",
+    "配合",
+    "通过",
+    "根据",
+    "依据",
+    "按照",
+    "经过",
+    "经由",
 )
 
 
@@ -497,35 +621,61 @@ class TypeRuleRecognizers:
         """Recall short organization subjects on a single already-normalized text view."""
 
         results: list[RecognizerResult] = []
-        seen_spans: set[tuple[int, int]] = set()
+        seen_spans: set[tuple[int, int, str]] = set()
         for match in _PERSON_ORG_BRIDGE_FULL_PATTERN.finditer(text or ""):
             person = match.group("person")
             subject = match.group("subject")
             if not (looks_like_natural_person_name(person) and is_probable_person(person)):
                 continue
-            if not (self._is_usable_context_short_org(subject, right_cue=normalize_entity_text(subject)) or self._is_strong_organization_subject(subject)):
+            subject_normalized = normalize_entity_text(subject)
+            subject_entity_type = "GOVERNMENT" if is_official_institution_text(subject_normalized) else "ORGANIZATION"
+            if not (
+                self._is_usable_context_short_org(subject, right_cue=subject_normalized)
+                or self._is_strong_organization_subject(subject)
+            ):
                 continue
-            start, end = match.span(0)
-            if (start, end) in seen_spans:
+            person_start, person_end = match.span("person")
+            subject_start, subject_end = match.span("subject")
+            person_key = (person_start, person_end, "PERSON")
+            subject_key = (subject_start, subject_end, subject_entity_type)
+            if person_key in seen_spans or subject_key in seen_spans:
                 continue
-            seen_spans.add((start, end))
+            seen_spans.add(person_key)
+            seen_spans.add(subject_key)
             results.append(
                 self._make(
-                    start,
-                    end,
-                    "ORGANIZATION",
+                    person_start,
+                    person_end,
+                    "PERSON",
+                    text,
+                    "rule_organization_context",
+                    0.88,
+                    metadata={
+                        "trigger": "person_org_bridge_person",
+                        "source_layer": "structure",
+                        "requires_manual_review": False,
+                        "bridge_split": True,
+                        "bridge_subject_surface": normalize_entity_text(subject),
+                    },
+                )
+            )
+            results.append(
+                self._make(
+                    subject_start,
+                    subject_end,
+                    subject_entity_type,
                     text,
                     "rule_organization_context",
                     0.88,
                     metadata={
                         "trigger": "person_org_bridge_subject",
                         "source_layer": "structure",
-                        "short_org_candidate": True,
-                        "requires_manual_review": True,
-                        "identity_surface": normalize_entity_text(subject),
+                        "short_org_candidate": subject_entity_type == "ORGANIZATION",
+                        "requires_manual_review": subject_entity_type == "ORGANIZATION",
+                        "identity_surface": subject_normalized,
                         "bridge_split": True,
                         "bridge_person_surface": normalize_entity_text(person),
-                        "bridge_subject_surface": normalize_entity_text(subject),
+                        "bridge_subject_surface": subject_normalized,
                     },
                 )
             )
@@ -537,14 +687,36 @@ class TypeRuleRecognizers:
                 continue
             if not self._is_usable_context_short_org(subject, right_cue=normalize_entity_text(subject)):
                 continue
-            start, end = match.span(0)
-            if (start, end) in seen_spans:
+            person_start, person_end = match.span("person")
+            subject_start, subject_end = match.span("subject")
+            person_key = (person_start, person_end, "PERSON")
+            subject_key = (subject_start, subject_end, "ORGANIZATION")
+            if person_key in seen_spans or subject_key in seen_spans:
                 continue
-            seen_spans.add((start, end))
+            seen_spans.add(person_key)
+            seen_spans.add(subject_key)
             results.append(
                 self._make(
-                    start,
-                    end,
+                    person_start,
+                    person_end,
+                    "PERSON",
+                    text,
+                    "rule_organization_context",
+                    0.87,
+                    metadata={
+                        "trigger": "person_org_bridge_person",
+                        "source_layer": "structure",
+                        "requires_manual_review": False,
+                        "bridge_split": True,
+                        "bridge_token": bridge,
+                        "bridge_subject_surface": normalize_entity_text(subject),
+                    },
+                )
+            )
+            results.append(
+                self._make(
+                    subject_start,
+                    subject_end,
                     "ORGANIZATION",
                     text,
                     "rule_organization_context",
@@ -564,13 +736,13 @@ class TypeRuleRecognizers:
             )
         for match in _FUNCTION_CONTEXT_SHORT_ORG_PATTERN.finditer(text or ""):
             start, end = match.span("subject")
-            if (start, end) in seen_spans:
+            if (start, end, "ORGANIZATION") in seen_spans:
                 continue
             subject = text[start:end]
             right_cue = normalize_entity_text(match.group("right"))
             if not self._is_usable_context_short_org(subject, right_cue=right_cue):
                 continue
-            seen_spans.add((start, end))
+            seen_spans.add((start, end, "ORGANIZATION"))
             results.append(
                 self._make(
                     start,
@@ -593,12 +765,12 @@ class TypeRuleRecognizers:
         for match in _PARALLEL_CONTEXT_SHORT_ORG_PATTERN.finditer(text or ""):
             for group_name in ("left", "right"):
                 start, end = match.span(group_name)
-                if (start, end) in seen_spans:
+                if (start, end, "ORGANIZATION") in seen_spans:
                     continue
                 subject = text[start:end]
                 if not self._is_usable_context_short_org(subject, right_cue="parallel_action"):
                     continue
-                seen_spans.add((start, end))
+                seen_spans.add((start, end, "ORGANIZATION"))
                 results.append(
                     self._make(
                         start,
@@ -618,7 +790,7 @@ class TypeRuleRecognizers:
                     )
                 )
         for start, end, boundary_kind, left_cue in self._iter_right_boundary_short_org_spans(text or ""):
-            if (start, end) in seen_spans:
+            if (start, end, "ORGANIZATION") in seen_spans:
                 continue
             subject = text[start:end]
             if not self._is_usable_context_short_org(subject, right_cue=boundary_kind):
@@ -630,7 +802,7 @@ class TypeRuleRecognizers:
                     continue
             if not left_cue and not short_org_boundary_has_strong_surface(subject):
                 continue
-            seen_spans.add((start, end))
+            seen_spans.add((start, end, "ORGANIZATION"))
             results.append(
                 self._make(
                     start,
@@ -1263,6 +1435,22 @@ class TypeRuleRecognizers:
         value = text[start:end]
         if not value:
             return None
+        embedded_clean_core = self._best_embedded_clean_organization_core_span(value)
+        if embedded_clean_core is not None:
+            core_start, core_end = embedded_clean_core
+            return start + core_start, start + core_end
+        anchored_span = self._best_suffix_anchored_organization_core_span(value)
+        if anchored_span is not None:
+            local_start, local_end = anchored_span
+            candidate = value[local_start:local_end]
+            normalized = normalize_entity_text(candidate)
+            entity_type = "GOVERNMENT" if is_official_institution_text(normalized) else "ORGANIZATION"
+            if SubjectAdmissionGate.passes_subject_shape(
+                entity_type,
+                normalized,
+                allow_short_org=entity_type == "ORGANIZATION" and looks_like_organization_short_name(normalized),
+            )[0]:
+                return start + local_start, start + local_end
         local_start = 0
         local_end = len(value)
         prefix = self.ORG_PREFIX_NOISE.match(value)
@@ -1319,6 +1507,74 @@ class TypeRuleRecognizers:
             )[0]:
                 return None
         return start + local_start, start + local_end
+
+    @staticmethod
+    def _best_suffix_anchored_organization_core_span(value: str) -> tuple[int, int] | None:
+        return BoundaryRepair._best_org_suffix_anchored_span(value)
+
+    @staticmethod
+    def _prefix_looks_like_org_shell(prefix: str) -> bool:
+        normalized = normalize_entity_text(prefix)
+        if not normalized:
+            return False
+        if is_probable_person(normalized) or looks_like_natural_person_name(normalized):
+            return True
+        if SubjectAdmissionGate.is_action_or_function_text(normalized):
+            return True
+        if any(token in normalized for token in _ORG_CORE_SHELL_TOKENS):
+            return True
+        if any(token in normalized for token in _ORG_CORE_SHELL_ACTIONS):
+            return True
+        return False
+
+    def _best_embedded_clean_organization_core_span(self, value: str) -> tuple[int, int] | None:
+        if not value:
+            return None
+        trailing = " \t\r\n:：,，;；。.!！?？、（）()《》【】"
+        candidates: list[tuple[tuple[int, int, int, int], tuple[int, int]]] = []
+        for candidate_start in range(1, len(value) - 1):
+            prefix = value[:candidate_start]
+            if not self._prefix_looks_like_org_shell(prefix):
+                continue
+            if not any(
+                prefix.endswith(boundary)
+                for boundary in _EMBEDDED_CORE_LEFT_BOUNDARIES
+            ):
+                continue
+            raw_candidate = value[candidate_start:]
+            candidate = raw_candidate.strip(trailing)
+            if not candidate:
+                continue
+            left_trim = len(raw_candidate) - len(raw_candidate.lstrip(trailing))
+            right_trim = len(raw_candidate) - len(raw_candidate.rstrip(trailing))
+            adjusted_start = candidate_start + left_trim
+            adjusted_end = len(value) - right_trim
+            normalized = normalize_entity_text(candidate)
+            if not normalized:
+                continue
+            entity_type = "GOVERNMENT" if is_official_institution_text(normalized) else "ORGANIZATION"
+            if not SubjectAdmissionGate.passes_subject_shape(
+                entity_type,
+                normalized,
+                allow_short_org=entity_type == "ORGANIZATION" and looks_like_organization_short_name(normalized),
+            )[0]:
+                continue
+            if not (
+                ORG_PATTERN.fullmatch(normalized)
+                or OFFICIAL_INSTITUTION_PATTERN.fullmatch(normalized)
+                or BoundaryRepair._starts_with_region_prefix(normalized)
+            ):
+                continue
+            score = (
+                1 if BoundaryRepair._starts_with_region_prefix(normalized) else 0,
+                1 if is_official_institution_text(normalized) else 0,
+                -len(normalized),
+                -adjusted_start,
+            )
+            candidates.append((score, (adjusted_start, adjusted_end)))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: item[0])[1]
 
     @staticmethod
     def _embedded_organization_span_after_boundary(value: str) -> tuple[int, int] | None:

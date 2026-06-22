@@ -25,6 +25,7 @@ from app.core.llm_strategy import (
     get_runtime_llm_strategy_profile,
     parse_model_size_in_b,
 )
+from app.rules.boundary_repair import BoundaryRepair
 from app.rules.default_subject_policy import DEFAULT_SUBJECT_TYPES, canonical_default_entity_type
 from app.services.docx_entity_locator import annotate_entities_with_docx_units
 from app.services.lowmem_entity_utils import (
@@ -36,6 +37,7 @@ from app.services.lowmem_entity_utils import (
     is_position_title,
     is_probable_person,
     looks_like_organization_short_name,
+    subject_noun_gate,
     strip_identity_reference_prefix,
 )
 
@@ -3630,6 +3632,27 @@ class ContextualDesensitizationService:
             or bool(metadata.get("bridge_split"))
         )
 
+    def _is_non_publishable_structure_short_org_candidate(
+        self,
+        text: str,
+        *,
+        source: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        metadata = metadata or {}
+        normalized = self._normalize_group_text(text)
+        if not normalized or not metadata.get("short_org_candidate"):
+            return False
+        if not self._is_structure_rule_short_org_candidate(source=source, metadata=metadata):
+            return False
+        if bool(metadata.get("bridge_split")):
+            return False
+        if self._has_external_short_org_identity_anchor(metadata=metadata):
+            return False
+        if self._has_strong_short_org_publication_evidence(source=source, metadata=metadata):
+            return False
+        return True
+
     def _should_keep_reviewed_short_org_candidate(
         self,
         text: str,
@@ -3640,6 +3663,12 @@ class ContextualDesensitizationService:
         metadata = metadata or {}
         normalized = self._normalize_group_text(text)
         if not looks_like_organization_short_name(normalized):
+            return False
+        if self._is_non_publishable_structure_short_org_candidate(
+            text,
+            source=source,
+            metadata=metadata,
+        ):
             return False
         if (
             is_identity_reference_term(normalized)
@@ -3655,6 +3684,16 @@ class ContextualDesensitizationService:
             or ""
         ).strip()
         if status in {"confirmed_subject", "confirmed_separate_subject"}:
+            if (
+                self._is_structure_rule_short_org_candidate(source=source, metadata=metadata)
+                and not bool(metadata.get("bridge_split"))
+                and not self._has_external_short_org_identity_anchor(metadata=metadata)
+                and not self._has_strong_short_org_publication_evidence(
+                    source=source,
+                    metadata=metadata,
+                )
+            ):
+                return False
             return True
         if status == "ambiguous_short_subject" and self._has_external_short_org_identity_anchor(metadata=metadata):
             return True
@@ -3778,6 +3817,24 @@ class ContextualDesensitizationService:
             return False
         if any(fragment in normalized for fragment in self.ORGANIZATION_NOISE_FRAGMENTS):
             return False
+        if self._has_non_subject_shell_around_company_core(normalized):
+            return False
+        gate_type = "GOVERNMENT" if self._is_official_institution_name(normalized) else "ORGANIZATION"
+        gate_passed, gate_reason = subject_noun_gate(
+            gate_type,
+            normalized,
+            allow_short_org=gate_type == "ORGANIZATION" and looks_like_organization_short_name(normalized),
+        )
+        if gate_reason in {
+            "leading_subject_linking_verb",
+            "subject_linking_verb_with_unresolved_left_context",
+            "leading_function_prefix",
+            "previous_subject_prefix",
+            "company_prefix_before_official_institution",
+            "non_subject_action_or_function_term",
+            "generic_org_reference",
+        }:
+            return False
 
         core = self._strip_organization_suffix(normalized)
         if self._looks_like_organization_name(normalized):
@@ -3797,7 +3854,7 @@ class ContextualDesensitizationService:
                 return False
             if any(core.startswith(prefix) and len(core) > len(prefix) for prefix in self.ORGANIZATION_STOP_PREFIXES):
                 return False
-            return True
+            return gate_passed or gate_type == "GOVERNMENT"
 
         if re.fullmatch(r"[\u4e00-\u9fa5]{2,6}", normalized) is None:
             return False
@@ -3813,7 +3870,31 @@ class ContextualDesensitizationService:
         if primary_normalized and normalized not in primary_normalized and primary_normalized not in normalized:
             if not (metadata.get("definition_alias") or metadata.get("definition_full_text")):
                 return False
-        return True
+        return gate_passed
+
+    def _has_non_subject_shell_around_company_core(self, normalized: str) -> bool:
+        if not normalized or not self._looks_like_organization_name(normalized):
+            return False
+        core_span = BoundaryRepair._best_org_suffix_anchored_span(normalized)
+        if not core_span:
+            return False
+        core_start, core_end = core_span
+        if core_start == 0 and core_end == len(normalized):
+            return False
+        core = normalized[core_start:core_end]
+        if core == normalized:
+            return False
+        prefix = normalized[:core_start]
+        suffix = normalized[core_end:]
+        if prefix and is_probable_person(prefix):
+            return True
+        if prefix and any(prefix.endswith(token) for token in ("负责", "配合", "协助", "办理", "提交", "确认", "通知", "要求", "请求", "判令", "签署", "签订", "对账", "付款", "收款", "结算")):
+            return True
+        if prefix and any(token in prefix for token in ("与", "和", "及", "以及", "通过", "经过", "经由", "根据", "依据", "按照", "由", "向", "对", "原告", "被告", "申请人", "被申请人", "第三人")):
+            return True
+        if suffix and any(token in suffix for token in ("负责", "配合", "协助", "办理", "提交", "确认", "通知", "要求", "请求", "判令", "签署", "签订", "对账", "付款", "收款", "结算")):
+            return True
+        return False
 
     def _collect_consistency_issues(
         self,

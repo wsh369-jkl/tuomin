@@ -163,11 +163,8 @@ LEADING_SUBJECT_FUNCTION_WORDS = (
     "同时由",
     "共同由",
     "分别由",
-)
-NON_SUBJECT_GENERIC_REFERENCE_PREFIXES = (
-    *LEADING_SUBJECT_FUNCTION_WORDS,
-    "经",
     "由",
+    "经",
     "向",
     "对",
     "与",
@@ -175,6 +172,9 @@ NON_SUBJECT_GENERIC_REFERENCE_PREFIXES = (
     "及",
     "以及",
     "同",
+)
+NON_SUBJECT_GENERIC_REFERENCE_PREFIXES = (
+    *LEADING_SUBJECT_FUNCTION_WORDS,
 )
 STRONG_LEADING_SUBJECT_FUNCTION_PREFIXES = tuple(
     dict.fromkeys(
@@ -241,9 +241,17 @@ LEADING_SUBJECT_FUNCTION_PATTERN = re.compile(
 )
 ADMIN_REGION_PREFIX_PATTERN = re.compile(
     r"(?:"
-    r"(?:[\u4e00-\u9fa5]{2,12}(?:省|自治区|特别行政区))?"
+    r"(?:北京|上海|天津|重庆|广州|深圳|杭州|南京|苏州|成都|武汉|西安|长沙|郑州|青岛|宁波|佛山|东莞|厦门|福州|济南|合肥|"
+    r"乌鲁木齐|呼和浩特|石家庄|太原|沈阳|长春|哈尔滨|昆明|南宁|贵阳|南昌|海口|兰州|西宁|银川|拉萨)"
+    r"(?:市|区)?"
+    r"|(?:[\u4e00-\u9fa5]{2,12}(?:省|自治区|特别行政区)"
     r"(?:[\u4e00-\u9fa5]{2,12}(?:市|地区|自治州|盟))?"
-    r"(?:[\u4e00-\u9fa5]{1,12}(?:区|县|旗|市|自治县))?"
+    r"(?:[\u4e00-\u9fa5]{1,12}(?:区|县|旗|自治县|自治旗))?)"
+    r"|(?:[\u4e00-\u9fa5]{2,12}(?:地区|自治州|盟)"
+    r"(?:[\u4e00-\u9fa5]{1,12}(?:区|县|旗|自治县|自治旗))?)"
+    r"|(?:[\u4e00-\u9fa5]{2,6}市"
+    r"(?:[\u4e00-\u9fa5]{1,12}(?:区|县|旗|自治县|自治旗))?)"
+    r"|(?:[\u4e00-\u9fa5]{2,12}(?:区|县|旗|自治县|自治旗))"
     r")$"
 )
 PERSON_PATTERN = re.compile(r"(?<![\u4e00-\u9fa5])[\u4e00-\u9fa5]{2,8}(?:·[\u4e00-\u9fa5]{2,8})?(?![\u4e00-\u9fa5])")
@@ -772,6 +780,36 @@ NON_SUBJECT_GENERIC_ORG_REFERENCE_TAILS = (
     "事项",
     "情况",
 )
+REGION_HEAD_SHELL_TOKENS = (
+    "身份",
+    "人员",
+    "员工",
+    "负责人",
+    "联系人",
+    "代理人",
+    "代表人",
+    "原告",
+    "被告",
+    "申请人",
+    "被申请人",
+    "第三人",
+    "上述",
+    "前述",
+    "相关",
+    "涉案",
+    "伙同",
+    "假借",
+    "冒充",
+    "谎称",
+)
+KNOWN_LONG_CITY_NAMES = {
+    "乌鲁木齐市",
+    "呼和浩特市",
+    "石家庄市",
+    "齐齐哈尔市",
+    "克拉玛依市",
+    "呼伦贝尔市",
+}
 SHORT_ORG_BOUNDARY_ROLE_TAILS = (
     "工作人员",
     "经办人员",
@@ -930,12 +968,16 @@ def has_official_region_prefix(value: str) -> bool:
     normalized = normalize_entity_text(value)
     if not normalized:
         return False
-    return bool(
-        re.match(
-            rf"^(?:{_OFFICIAL_REGION_PREFIX}|国务院|中央)",
-            normalized,
-        )
+    match = re.match(
+        rf"^(?:{_OFFICIAL_REGION_PREFIX}|国务院|中央)",
+        normalized,
     )
+    if not match:
+        return False
+    prefix = match.group(0)
+    if prefix in {"中国", "国家", "中华人民共和国", "国务院", "中央"}:
+        return True
+    return looks_like_admin_region_prefix(prefix)
 
 
 def is_government_institution_text(value: str) -> bool:
@@ -1077,9 +1119,33 @@ def looks_like_admin_region_prefix(value: str) -> bool:
         return False
     if is_non_subject_action_or_function_term(normalized):
         return False
-    return bool(ADMIN_REGION_PREFIX_PATTERN.fullmatch(normalized)) and any(
-        token in normalized for token in ("省", "自治区", "市", "区", "县", "旗", "州", "盟")
-    )
+    region_match = ADMIN_REGION_PREFIX_PATTERN.fullmatch(normalized)
+    has_region_marker = any(token in normalized for token in ("省", "自治区", "市", "区", "县", "旗", "州", "盟"))
+    if not (bool(region_match) and has_region_marker):
+        return False
+    if any(token in normalized for token in ("身份", "人员", "员工", "负责人", "联系人", "代理人", "代表人", "原告", "被告", "申请人", "被申请人", "第三人", "上述", "前述", "相关", "涉案")):
+        return False
+    # Region-form strings such as "广东省" or "朝阳区" must not be rejected
+    # just because their first character can also be a surname.
+    if not has_region_marker and (is_probable_person(normalized) or looks_like_natural_person_name(normalized)):
+        return False
+    for direct_city in ("北京市", "上海市", "天津市", "重庆市", "北京", "上海", "天津", "重庆"):
+        if normalized.endswith(direct_city) and len(normalized) > len(direct_city):
+            prefix = normalized[: -len(direct_city)]
+            if prefix and (
+                is_probable_person(prefix)
+                or looks_like_natural_person_name(prefix)
+                or any(token in prefix for token in REGION_HEAD_SHELL_TOKENS)
+                or any(token in prefix for token in NON_SUBJECT_ACTION_VERBS)
+            ):
+                return False
+    if len(normalized) > 6 and normalized.endswith("市") and not any(token in normalized for token in ("省", "自治区", "特别行政区", "地区", "自治州", "盟")):
+        return False
+    if len(normalized) > 4 and normalized.endswith("市") and normalized not in KNOWN_LONG_CITY_NAMES and not any(
+        token in normalized for token in ("省", "自治区", "特别行政区", "地区", "自治州", "盟")
+    ):
+        return False
+    return True
 
 
 def expand_org_span_with_left_region_prefix(
@@ -1483,6 +1549,8 @@ def subject_left_pollution_reason(value: str, entity_type: str = "") -> str:
     normalized = normalize_entity_text(value)
     if not normalized:
         return ""
+    if _contains_narrative_shell_before_company_core(normalized):
+        return "narrative_shell_before_company_core"
     for prefix in SUBJECT_LINKING_VERB_PREFIXES:
         if not normalized.startswith(prefix) or len(normalized) <= len(prefix) + 1:
             continue
@@ -1533,6 +1601,49 @@ def _contains_subject_linking_verb_with_unresolved_left_context(normalized: str)
             return True
         if re.fullmatch(r"[\u4e00-\u9fa5A-Za-z0-9]{1,4}", left):
             return True
+    return False
+
+
+def _contains_narrative_shell_before_company_core(normalized: str) -> bool:
+    if not normalized or len(normalized) < 8:
+        return False
+    company_endings = (
+        "股份有限公司",
+        "有限责任公司",
+        "集团有限公司",
+        "有限公司",
+        "分公司",
+        "子公司",
+        "集团",
+        "公司",
+    )
+    company_end = -1
+    company_suffix = ""
+    for suffix in company_endings:
+        index = normalized.rfind(suffix)
+        if index < 0:
+            continue
+        end = index + len(suffix)
+        if end > company_end:
+            company_end = end
+            company_suffix = suffix
+    if company_end <= 0:
+        return False
+    prefix = normalized[:company_end - len(company_suffix)]
+    if not prefix or len(prefix) < 2:
+        return False
+    if any(token in prefix for token in ("银行", "法院", "检察院", "公安局", "委员会")):
+        return False
+    if is_probable_person(prefix):
+        return True
+    if re.search(r"(?:身份|人员|员工|代理人|代表人|负责人|联系人)$", prefix):
+        return True
+    if any(token in prefix for token in NON_SUBJECT_ACTION_VERBS):
+        return True
+    if any(token in prefix for token in ("伙同", "假借", "冒充", "谎称", "作为", "以", "上述", "前述", "相关", "涉案", "原告", "被告", "申请人", "被申请人", "第三人")):
+        return True
+    if len(prefix) >= 4 and re.search(r"[\u4e00-\u9fa5]{2,4}", prefix[:4]) and re.search(r"(?:身份|人员|伙同|假借)", prefix):
+        return True
     return False
 
 
@@ -2205,10 +2316,68 @@ def expand_subject_span_to_containing_shape(
         and span[1] >= end
         and span[1] - span[0] > original_len
         and normalize_entity_text(source_text[span[0] : span[1]])
+        and _is_safe_subject_expansion(
+            source_text=source_text,
+            original_start=start,
+            original_end=end,
+            expanded_start=span[0],
+            expanded_end=span[1],
+            entity_type=normalized_type,
+        )
     ]
     if not valid:
         return None
     return max(valid, key=lambda span: (span[1] - span[0], -span[0]))
+
+
+def _is_safe_subject_expansion(
+    *,
+    source_text: str,
+    original_start: int,
+    original_end: int,
+    expanded_start: int,
+    expanded_end: int,
+    entity_type: str,
+) -> bool:
+    """Allow only semantic completion, never narrative-shell re-expansion."""
+
+    normalized_type = str(entity_type or "").upper()
+    if expanded_start == original_start and expanded_end == original_end:
+        return True
+    if expanded_start > original_start or expanded_end < original_end:
+        return False
+
+    original_text = source_text[original_start:original_end]
+    expanded_text = source_text[expanded_start:expanded_end]
+    normalized_original = normalize_entity_text(original_text)
+    normalized_expanded = normalize_entity_text(expanded_text)
+    if not normalized_original or not normalized_expanded:
+        return False
+    if normalized_original == normalized_expanded:
+        return True
+    if not normalized_expanded.endswith(normalized_original):
+        return False
+
+    added_left = normalized_expanded[: len(normalized_expanded) - len(normalized_original)]
+    if not added_left:
+        return True
+
+    if normalized_type in {"GOVERNMENT", "COURT"}:
+        return has_official_region_prefix(added_left + normalized_original)
+
+    if normalized_type not in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME", "ALIAS"}:
+        return False
+
+    if added_left in {"中国", "国家", "中华人民共和国"}:
+        return True
+
+    if looks_like_admin_region_prefix(added_left):
+        return True
+
+    if has_official_region_prefix(added_left + normalized_original):
+        return True
+
+    return False
 
 
 def _clean_containing_subject_span(

@@ -206,6 +206,14 @@ def _postprocess_final_entities(
         entity
         for entity in processed
         if not bool((entity.get("metadata") or {}).get("short_org_publication_review_required"))
+        and not (
+            hasattr(contextual_service, "_is_non_publishable_structure_short_org_candidate")
+            and contextual_service._is_non_publishable_structure_short_org_candidate(
+                str(entity.get("text") or ""),
+                source=str(entity.get("source") or ""),
+                metadata=dict(entity.get("metadata") or {}),
+            )
+        )
     ]
     if callable(sort_and_dedupe):
         processed = sort_and_dedupe(processed)

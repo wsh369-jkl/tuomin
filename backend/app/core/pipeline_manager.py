@@ -16,11 +16,14 @@ from app.services.lowmem_entity_utils import (
     IDENTITY_REFERENCE_TERMS,
     NON_ENTITY_ROLE_TERMS,
     expand_subject_span_to_containing_shape,
+    has_official_region_prefix,
     is_identity_reference_term,
     is_official_institution_text,
     is_org_like_text,
     is_position_title,
+    looks_like_admin_region_prefix,
     looks_like_organization_short_name,
+    normalize_entity_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -508,6 +511,8 @@ class PipelineManager:
         result: RecognizerResult,
         text: str,
     ) -> RecognizerResult:
+        if PipelineManager._has_complete_subject_anchor(result):
+            return result
         expanded_span = expand_subject_span_to_containing_shape(
             text,
             result.start,
@@ -539,6 +544,44 @@ class PipelineManager:
             text=expanded_text,
             source=result.source,
             metadata=metadata,
+        )
+
+    @staticmethod
+    def _has_complete_subject_anchor(result: RecognizerResult) -> bool:
+        normalized = normalize_entity_text(result.text)
+        entity_type = str(result.entity_type or "").upper()
+        if not normalized:
+            return False
+        if entity_type in {"GOVERNMENT", "COURT"}:
+            return is_official_institution_text(normalized)
+        if entity_type not in {"ORGANIZATION", "COMPANY_NAME", "ACCOUNT_NAME", "ALIAS"}:
+            return False
+        if is_official_institution_text(normalized):
+            return True
+        if not is_org_like_text(normalized):
+            return False
+        if normalized.startswith(("中国", "国家", "中华人民共和国")):
+            return True
+        if looks_like_admin_region_prefix(normalized) or has_official_region_prefix(normalized):
+            return True
+        return any(
+            normalized.endswith(suffix)
+            for suffix in (
+                "股份有限公司",
+                "有限责任公司",
+                "集团有限公司",
+                "有限公司",
+                "分公司",
+                "子公司",
+                "集团",
+                "公司",
+                "律师事务所",
+                "会计师事务所",
+                "研究院",
+                "研究所",
+                "服务中心",
+                "技术中心",
+            )
         )
 
     def _get_default_operator_config(self) -> Dict[str, Dict]:
